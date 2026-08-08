@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
     Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
-    HttpMethod, HttpRequest, PortError, PortErrorKind, ProviderRequest, ScanContext, ScanError,
-    ScanErrorKind, Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsHandshakeKind,
-    TlsObservation, TlsRequest, UdpRequest,
+    HttpMethod, HttpRequest, LocalInputPort, LocalInputRequest, PortError, PortErrorKind,
+    ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner, ScannerRegistry,
+    ServiceBundle, TcpRequest, TlsHandshakeKind, TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -332,11 +332,7 @@ impl BuiltinScanner {
             return Err(ScanError::new(ScanErrorKind::Transport, message));
         }
         Ok(ScanResult {
-            status: if diagnostics.is_empty() {
-                ExecutionStatus::Completed
-            } else {
-                ExecutionStatus::Partial
-            },
+            status: completion_status(&diagnostics),
             findings,
             evidence,
             diagnostics,
@@ -350,7 +346,14 @@ impl BuiltinScanner {
     ) -> Result<ScanResult, ScanError> {
         let base = base_url(&request.target)?;
         let id = self.descriptor.id.as_str();
-        let plan = plan_for(id, &base, &request.options, request.budget, &request.scope)
+        let options = hydrate_web_options(
+            id,
+            &request.options,
+            request.budget,
+            self.services.local_input.as_ref(),
+        )
+        .await?;
+        let plan = plan_for(id, &base, &options, request.budget, &request.scope)
             .ok_or_else(|| ScanError::new(ScanErrorKind::Internal, "web probe plan is missing"))?;
         let limit = plan.max_pages.min(request.budget.max_requests);
         let crawl = plan.crawl;
@@ -423,7 +426,7 @@ impl BuiltinScanner {
                 }),
             }
         }
-        findings.extend(aggregate_web_findings(id, &samples, &request.options));
+        findings.extend(aggregate_web_findings(id, &samples, &options));
         if evidence.is_empty() {
             let first = diagnostics
                 .first()
@@ -433,11 +436,7 @@ impl BuiltinScanner {
             return Err(ScanError::new(ScanErrorKind::Transport, first));
         }
         Ok(ScanResult {
-            status: if diagnostics.is_empty() {
-                ExecutionStatus::Completed
-            } else {
-                ExecutionStatus::Partial
-            },
+            status: completion_status(&diagnostics),
             findings,
             evidence,
             diagnostics,
@@ -858,6 +857,14 @@ impl BuiltinScanner {
             }],
             Vec::new(),
         ))
+    }
+}
+
+fn completion_status(diagnostics: &[Diagnostic]) -> ExecutionStatus {
+    if diagnostics.is_empty() {
+        ExecutionStatus::Completed
+    } else {
+        ExecutionStatus::Partial
     }
 }
 
@@ -1467,6 +1474,47 @@ fn base_url(target: &Target) -> Result<Url, ScanError> {
         ));
     }
     Ok(url)
+}
+
+async fn hydrate_web_options(
+    scanner_id: &str,
+    options: &BTreeMap<String, Value>,
+    budget: sugra_domain::Budget,
+    local_input: &dyn LocalInputPort,
+) -> Result<BTreeMap<String, Value>, ScanError> {
+    let mapping = match scanner_id {
+        "directory-finder" => Some(("wordlist", "wordlist")),
+        "login-page-brute-identifier" => Some(("paths_file", "paths")),
+        "hidden-parameter-discovery" => Some(("params_file", "params")),
+        _ => None,
+    };
+    let Some((source_key, destination_key)) = mapping else {
+        return Ok(options.clone());
+    };
+    let Some(path) = options.get(source_key).and_then(Value::as_str) else {
+        return Ok(options.clone());
+    };
+    let response = local_input
+        .read_lines(LocalInputRequest {
+            path: path.into(),
+            budget,
+        })
+        .await
+        .map_err(scan_error_from_port)?;
+    let mut values = options
+        .get(destination_key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|value| Value::String(value.into()))
+        .collect::<Vec<_>>();
+    values.extend(response.lines.into_iter().map(Value::String));
+    values.truncate(budget.max_requests);
+
+    let mut hydrated = options.clone();
+    hydrated.insert(destination_key.into(), Value::Array(values));
+    Ok(hydrated)
 }
 
 fn discover_links(
@@ -2836,6 +2884,168 @@ mod tests {
         ) -> Result<LocalInputResponse, PortError> {
             Ok(LocalInputResponse { lines: Vec::new() })
         }
+    }
+
+    struct StaticLocalInput(Vec<String>);
+
+    #[async_trait]
+    impl LocalInputPort for StaticLocalInput {
+        async fn read_lines(
+            &self,
+            _request: LocalInputRequest,
+        ) -> Result<LocalInputResponse, PortError> {
+            Ok(LocalInputResponse {
+                lines: self.0.clone(),
+            })
+        }
+    }
+
+    struct FailingLocalInput;
+
+    #[async_trait]
+    impl LocalInputPort for FailingLocalInput {
+        async fn read_lines(
+            &self,
+            _request: LocalInputRequest,
+        ) -> Result<LocalInputResponse, PortError> {
+            Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "local input is unavailable",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_path_file_lines_merge_with_explicit_paths_without_exceeding_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = BTreeMap::from([
+            ("paths".into(), json!(["/explicit"])),
+            ("paths_file".into(), json!("/operator/paths.txt")),
+        ]);
+        let budget = Budget {
+            max_requests: 3,
+            ..Budget::DEFAULT
+        };
+
+        let hydrated = hydrate_web_options(
+            "login-page-brute-identifier",
+            &options,
+            budget,
+            &StaticLocalInput(vec![
+                "/from-file".into(),
+                "/third".into(),
+                "/ignored".into(),
+            ]),
+        )
+        .await?;
+
+        assert_eq!(
+            hydrated.get("paths"),
+            Some(&json!(["/explicit", "/from-file", "/third"]))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wordlist_and_parameter_files_map_to_in_memory_planner_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (scanner_id, source_key, destination_key) in [
+            ("directory-finder", "wordlist", "wordlist"),
+            ("hidden-parameter-discovery", "params_file", "params"),
+        ] {
+            let options = BTreeMap::from([(
+                source_key.into(),
+                json!(format!("/operator/{source_key}.txt")),
+            )]);
+            let hydrated = hydrate_web_options(
+                scanner_id,
+                &options,
+                Budget::DEFAULT,
+                &StaticLocalInput(vec!["from-file".into()]),
+            )
+            .await?;
+            assert_eq!(hydrated.get(destination_key), Some(&json!(["from-file"])));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_file_options_skip_the_boundary_and_failures_remain_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let untouched = BTreeMap::from([("paths".into(), json!(["/login"]))]);
+        let hydrated = hydrate_web_options(
+            "login-page-brute-identifier",
+            &untouched,
+            Budget::DEFAULT,
+            &FailingLocalInput,
+        )
+        .await?;
+        assert_eq!(hydrated, untouched);
+
+        let sensitive_path = "/operator/private/customer-paths.txt";
+        let options = BTreeMap::from([("paths_file".into(), json!(sensitive_path))]);
+        let result = hydrate_web_options(
+            "login-page-brute-identifier",
+            &options,
+            Budget::DEFAULT,
+            &FailingLocalInput,
+        )
+        .await;
+        let Err(error) = result else {
+            return Err("local input failure must propagate".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::DependencyUnavailable);
+        assert_eq!(error.message, "local input is unavailable");
+        assert!(!error.message.contains(sensitive_path));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_scanner_consumes_wordlist_lines_through_the_injected_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut scanner_services = services();
+        scanner_services.local_input = Arc::new(StaticLocalInput(vec![
+            "from-file".into(),
+            "https://outside.example/private".into(),
+        ]));
+        let builtins = build_builtins(&scanner_services)?;
+        let descriptor = builtins
+            .catalog
+            .iter()
+            .find(|descriptor| descriptor.id.as_str() == "directory-finder")
+            .ok_or("directory scanner is missing")?;
+        let scanner = builtins
+            .registry
+            .get(&descriptor.id)
+            .ok_or("directory implementation is missing")?;
+        let target = Target::parse(TargetKind::Url, "https://example.com/")?;
+        let request = ScanRequest {
+            scanner_id: descriptor.id.clone(),
+            target: target.clone(),
+            options: BTreeMap::from([("wordlist".into(), json!("/operator/wordlist.txt"))]),
+            budget: Budget {
+                max_requests: 2,
+                ..Budget::DEFAULT
+            },
+            scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+        };
+        let context = ScanContext {
+            run_id: sugra_domain::RunId::new(),
+            cancellation: CancellationToken::new(),
+            clock: Arc::new(FixedClock),
+        };
+
+        let result = scanner.scan(&request, &context).await?;
+
+        assert_eq!(result.evidence.len(), 1);
+        assert_eq!(result.evidence[0].source, "https://example.com/from-file");
+        assert!(
+            result
+                .evidence
+                .iter()
+                .all(|evidence| !evidence.source.contains("outside.example"))
+        );
+        Ok(())
     }
 
     fn services() -> ServiceBundle {

@@ -180,17 +180,7 @@ fn exposure_plan(
             false,
             max_pages,
         ),
-        "directory-finder" => paths_plan(
-            base,
-            vec![
-                "/admin/".into(),
-                "/backup/".into(),
-                "/config/".into(),
-                "/uploads/".into(),
-            ],
-            false,
-            max_pages,
-        ),
+        "directory-finder" => paths_plan(base, wordlist_paths(options), false, max_pages),
         "file-upload-surface-finder" => paths_plan(
             base,
             vec!["/".into(), "/upload".into(), "/uploads".into()],
@@ -251,16 +241,7 @@ fn active_plan(
         "cache-behavior-analyzer" => repeated_plan(base, 2, max_pages),
         "performance-monitoring" => repeated_plan(base, 3, max_pages),
         "redirect-chain" => redirect_plan(base, max_pages),
-        "hidden-parameter-discovery" => paths_plan(
-            base,
-            vec![
-                "/".into(),
-                "/?debug=sugra-check".into(),
-                "/?preview=sugra-check".into(),
-            ],
-            false,
-            max_pages,
-        ),
+        "hidden-parameter-discovery" => parameter_plan(base, options, max_pages),
         _ => return None,
     };
     Some(plan)
@@ -458,6 +439,35 @@ fn repeated_plan(base: &Url, repetitions: usize, max_pages: usize) -> WebPlan {
     )
 }
 
+fn parameter_plan(base: &Url, options: &BTreeMap<String, Value>, max_pages: usize) -> WebPlan {
+    let mut names = option_strings(options, "params")
+        .map(|(_, value)| value)
+        .filter(|value| safe_parameter_name(value))
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        names = vec!["debug".into(), "preview".into()];
+    }
+    let parameter_limit = integer_option(options, "max_params", 25)
+        .max(1)
+        .min(max_pages.saturating_sub(1));
+    let Some(root) = same_origin_url(base, "/") else {
+        return web_plan(Vec::new(), false, max_pages);
+    };
+    let mut probes = vec![WebProbe::get("parameter-baseline", root.clone())];
+    probes.extend(
+        names
+            .into_iter()
+            .take(parameter_limit)
+            .enumerate()
+            .map(|(index, name)| {
+                let mut url = root.clone();
+                url.query_pairs_mut().append_pair(&name, "sugra-check");
+                WebProbe::get(format!("parameter-{index}:{name}"), url)
+            }),
+    );
+    web_plan(probes, false, max_pages)
+}
+
 fn redirect_plan(base: &Url, max_pages: usize) -> WebPlan {
     let mut probe = WebProbe::get("redirect-chain", base.clone());
     probe.max_redirects = 10;
@@ -488,6 +498,29 @@ fn option_paths(options: &BTreeMap<String, Value>, key: &str, defaults: &[&str])
     }
 }
 
+fn wordlist_paths(options: &BTreeMap<String, Value>) -> Vec<String> {
+    let paths = option_strings(options, "wordlist")
+        .map(|(_, value)| value)
+        .filter(|value| !value.starts_with("//") && !value.contains("://"))
+        .map(|value| {
+            if value.starts_with('/') {
+                value
+            } else {
+                format!("/{value}")
+            }
+        })
+        .filter(|value| safe_relative_path(value))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        ["/admin/", "/backup/", "/config/", "/uploads/"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        paths
+    }
+}
+
 fn option_strings<'a>(
     options: &'a BTreeMap<String, Value>,
     key: &str,
@@ -506,6 +539,14 @@ fn option_strings<'a>(
 
 fn safe_relative_path(value: &str) -> bool {
     value.starts_with('/') && !value.starts_with("//") && !value.contains(['\r', '\n'])
+}
+
+fn safe_parameter_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+        })
 }
 
 fn same_origin_url(base: &Url, path: &str) -> Option<Url> {
@@ -950,6 +991,69 @@ mod tests {
                 .probes
                 .iter()
                 .all(|probe| !probe.url.path().contains("params.txt"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn injected_wordlist_lines_create_only_same_origin_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = Url::parse("https://example.com/")?;
+        let scope = scope_for(&base)?;
+        let options = BTreeMap::from([(
+            "wordlist".into(),
+            serde_json::json!([
+                "admin",
+                "/api",
+                "//outside.example",
+                "https://outside.example"
+            ]),
+        )]);
+
+        let plan = plan_for("directory-finder", &base, &options, Budget::DEFAULT, &scope)
+            .ok_or("directory plan is missing")?;
+        let urls: Vec<_> = plan.probes.iter().map(|probe| probe.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            vec!["https://example.com/admin", "https://example.com/api"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn injected_parameter_lines_are_validated_encoded_and_budget_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = Url::parse("https://example.com/")?;
+        let scope = scope_for(&base)?;
+        let options = BTreeMap::from([
+            (
+                "params".into(),
+                serde_json::json!(["token", "user name", "bad\r\nheader", "x".repeat(129)]),
+            ),
+            ("max_params".into(), serde_json::json!(1)),
+        ]);
+        let budget = Budget {
+            max_requests: 2,
+            ..Budget::DEFAULT
+        };
+
+        let plan = plan_for(
+            "hidden-parameter-discovery",
+            &base,
+            &options,
+            budget,
+            &scope,
+        )
+        .ok_or("parameter plan is missing")?;
+        let urls: Vec<_> = plan.probes.iter().map(|probe| probe.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/",
+                "https://example.com/?token=sugra-check"
+            ]
         );
         Ok(())
     }
