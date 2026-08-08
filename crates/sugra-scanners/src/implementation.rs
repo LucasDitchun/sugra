@@ -25,7 +25,7 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
-use crate::web::{WebProbe, discovered, plan_for};
+use crate::web::{WebProbe, discovered, plan_for, should_sample};
 use crate::web_analysis::{
     WebSample, aggregate_findings as aggregate_web_findings, observation as web_observation,
     response_findings as web_response_findings, sample as web_sample, signals as web_signals,
@@ -366,9 +366,14 @@ impl BuiltinScanner {
     ) -> Result<ScanResult, ScanError> {
         let base = base_url(&request.target)?;
         let id = self.descriptor.id.as_str();
-        let plan = plan_for(id, &base, &request.options, request.budget.max_requests)
+        let plan = plan_for(id, &base, &request.options, request.budget, &request.scope)
             .ok_or_else(|| ScanError::new(ScanErrorKind::Internal, "web probe plan is missing"))?;
         let limit = plan.max_pages.min(request.budget.max_requests);
+        let crawl = plan.crawl;
+        let max_depth = plan.max_depth;
+        let sample_per_million = plan.sample_per_million;
+        let delay_ms = plan.delay_ms;
+        let include_subdomains = plan.include_subdomains;
         let mut queue: VecDeque<(WebProbe, usize)> =
             plan.probes.into_iter().map(|probe| (probe, 0)).collect();
         let mut seen = BTreeSet::new();
@@ -381,6 +386,9 @@ impl BuiltinScanner {
         while let Some((probe, depth)) = queue.pop_front() {
             if attempts >= limit || !seen.insert(probe.identity()) {
                 continue;
+            }
+            if attempts > 0 && delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             attempts += 1;
             let method = probe.method;
@@ -403,9 +411,16 @@ impl BuiltinScanner {
                     let index = evidence.len();
                     let signals = web_signals(&response);
                     findings.extend(web_response_findings(id, &response, &signals, index));
-                    if plan.crawl && method == HttpMethod::Get && depth < request.budget.max_depth {
-                        for url in
-                            discover_links(&response.final_url, &response.body, &request.scope)
+                    if crawl && method == HttpMethod::Get && depth < max_depth {
+                        for url in discover_links(
+                            &response.final_url,
+                            &base,
+                            &response.body,
+                            &request.scope,
+                            include_subdomains,
+                        )
+                        .into_iter()
+                        .filter(|url| should_sample(url, sample_per_million))
                         {
                             queue.push_back((discovered(url), depth + 1));
                         }
@@ -1483,7 +1498,13 @@ fn base_url(target: &Target) -> Result<Url, ScanError> {
     Ok(url)
 }
 
-fn discover_links(base: &Url, body: &[u8], scope: &sugra_domain::ScopeGrant) -> Vec<Url> {
+fn discover_links(
+    document_base: &Url,
+    root: &Url,
+    body: &[u8],
+    scope: &sugra_domain::ScopeGrant,
+    include_subdomains: bool,
+) -> Vec<Url> {
     let document = Html::parse_document(&String::from_utf8_lossy(body));
     let Ok(selector) = Selector::parse("a[href], script[src]") else {
         return Vec::new();
@@ -1495,18 +1516,32 @@ fn discover_links(base: &Url, body: &[u8], scope: &sugra_domain::ScopeGrant) -> 
                 .value()
                 .attr("href")
                 .or_else(|| element.value().attr("src"))
-                .and_then(|value| base.join(value).ok())
+                .and_then(|value| document_base.join(value).ok())
         })
         .filter(|candidate| {
             matches!(candidate.scheme(), "http" | "https")
                 && candidate.username().is_empty()
                 && candidate.password().is_none()
+                && candidate.scheme() == root.scheme()
+                && candidate.port_or_known_default() == root.port_or_known_default()
+                && related_discovery_host(root, candidate, include_subdomains)
                 && Target::parse(TargetKind::Url, candidate.as_str())
                     .ok()
                     .is_some_and(|target| scope.allows(&target))
         })
         .take(512)
         .collect()
+}
+
+fn related_discovery_host(root: &Url, candidate: &Url, include_subdomains: bool) -> bool {
+    let (Some(root_host), Some(candidate_host)) = (root.host_str(), candidate.host_str()) else {
+        return false;
+    };
+    candidate_host.eq_ignore_ascii_case(root_host)
+        || include_subdomains
+            && candidate_host
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", root_host.to_ascii_lowercase()))
 }
 
 fn safe_url_label(url: &Url) -> String {
@@ -2568,7 +2603,7 @@ mod tests {
         TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest,
         UdpPort, UdpRequest, UdpResponse,
     };
-    use sugra_domain::{Budget, ScanRequest, ScopeGrant, Target, TargetKind};
+    use sugra_domain::{Budget, ScanRequest, ScopeGrant, ScopeRule, Target, TargetKind};
     use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
 
@@ -2625,6 +2660,41 @@ mod tests {
                 duration_ms: 1,
             })
         }
+    }
+
+    #[test]
+    fn link_discovery_never_leaves_scope_and_requires_subdomain_opt_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = Url::parse("https://example.com/")?;
+        let scope = ScopeGrant::new(
+            vec![ScopeRule::Domain("example.com".into())],
+            true,
+            "tests",
+            OffsetDateTime::UNIX_EPOCH,
+        )?;
+        let body = br#"
+            <a href="/same-origin">same</a>
+            <a href="https://api.example.com/scoped">subdomain</a>
+            <script src="https://outside.example/script.js"></script>
+        "#;
+
+        let exact = discover_links(&root, &root, body, &scope, false);
+        assert_eq!(exact, vec![Url::parse("https://example.com/same-origin")?]);
+
+        let subdomains = discover_links(&root, &root, body, &scope, true);
+        assert_eq!(
+            subdomains,
+            vec![
+                Url::parse("https://example.com/same-origin")?,
+                Url::parse("https://api.example.com/scoped")?,
+            ]
+        );
+        assert!(
+            subdomains
+                .iter()
+                .all(|url| !url.as_str().contains("outside.example"))
+        );
+        Ok(())
     }
 
     struct FakeTcp;
