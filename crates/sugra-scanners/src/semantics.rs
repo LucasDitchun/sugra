@@ -989,7 +989,9 @@ mod tests {
             ),
         ];
         for (id, families) in expected {
-            let profile = profile_for(id).expect("composite profile");
+            let Some(profile) = profile_for(id) else {
+                unreachable!("missing composite profile for {id}");
+            };
             let actual: Vec<_> = profile
                 .supplements
                 .iter()

@@ -218,7 +218,7 @@ pub(crate) fn response_findings(
 ) -> Vec<Finding> {
     match analysis_group(id) {
         Some(AnalysisGroup::Api) => api_findings(id, response, signals, evidence),
-        Some(AnalysisGroup::Change) => Vec::new(),
+        Some(AnalysisGroup::Change | AnalysisGroup::Performance) | None => Vec::new(),
         Some(AnalysisGroup::Crawler) => crawler_findings(id, response, signals, evidence),
         Some(AnalysisGroup::Detection) => detection_findings(id, response, signals, evidence),
         Some(AnalysisGroup::Exposure) => exposure_findings(id, response, signals, evidence),
@@ -226,10 +226,8 @@ pub(crate) fn response_findings(
         Some(AnalysisGroup::Headers) => header_findings(id, response, evidence),
         Some(AnalysisGroup::Inventory) => inventory_findings(id, signals, evidence),
         Some(AnalysisGroup::Metadata) => metadata_findings(id, response, signals, evidence),
-        Some(AnalysisGroup::Performance) => Vec::new(),
         Some(AnalysisGroup::Privacy) => privacy_findings(id, response, signals, evidence),
         Some(AnalysisGroup::Risk) => risk_findings(id, signals, evidence),
-        None => Vec::new(),
     }
 }
 
@@ -685,7 +683,7 @@ fn detection_findings(
         }
         "passive-cve-mapper"
             if headers.get("server").is_some_and(|server| {
-                server.contains('/') && server.chars().any(|c| c.is_numeric())
+                server.contains('/') && server.chars().any(char::is_numeric)
             }) =>
         {
             one(
@@ -1331,7 +1329,7 @@ mod tests {
     fn response(body: &str) -> HttpResponse {
         HttpResponse {
             final_url: Url::parse("https://example.test/page?token=secret#fragment")
-                .expect("valid fixture URL"),
+                .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}")),
             status: 200,
             headers: BTreeMap::new(),
             cookies: Vec::new(),
@@ -1343,7 +1341,8 @@ mod tests {
 
     #[test]
     fn every_http_scanner_has_an_explicit_analysis_group() {
-        let definitions = definitions().expect("built-in definitions");
+        let definitions = definitions()
+            .unwrap_or_else(|error| unreachable!("valid built-in definitions: {error}"));
         let http: Vec<_> = definitions
             .iter()
             .filter(|definition| matches!(definition.operation, Operation::Http))
@@ -1377,8 +1376,10 @@ mod tests {
         });
         response.redirects.push(HttpRedirect {
             status: 302,
-            from: Url::parse("https://example.test/start?secret=value").expect("fixture URL"),
-            to: Url::parse("https://example.test/page?session=value").expect("fixture URL"),
+            from: Url::parse("https://example.test/start?secret=value")
+                .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}")),
+            to: Url::parse("https://example.test/page?session=value")
+                .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}")),
             decision: HttpRedirectDecision::Followed,
         });
 
@@ -1446,7 +1447,12 @@ mod tests {
         );
         assert!(aggregate_findings("attack-surface-delta", &[first], &options).is_empty());
         assert_eq!(
-            aggregate_findings("attack-surface-delta", &[different.clone()], &options)[0].key,
+            aggregate_findings(
+                "attack-surface-delta",
+                std::slice::from_ref(&different),
+                &options,
+            )[0]
+            .key,
             "attack-surface-changed"
         );
         options.insert("baseline_sha256".into(), Value::String("invalid".into()));
