@@ -213,7 +213,13 @@ fn active_plan(
         "cors-misconfiguration-scanner" => cors_plan(base, max_pages),
         "open-redirect-finder" => open_redirect_plan(base, max_pages),
         "virtual-host-fuzzer" => virtual_host_plan(base, options, max_pages),
-        "rate-limit-waf-bypass-test" => repeated_plan(base, 4, max_pages),
+        "rate-limit-waf-bypass-test" => repeated_plan(
+            base,
+            integer_option(options, "batch_size", 4).min(8),
+            max_pages,
+        ),
+        "cache-behavior-analyzer" => repeated_plan(base, 2, max_pages),
+        "performance-monitoring" => repeated_plan(base, 3, max_pages),
         "redirect-chain" => redirect_plan(base, max_pages),
         "hidden-parameter-discovery" => paths_plan(
             base,
@@ -272,7 +278,24 @@ fn root_plan(id: &str, base: &Url, max_pages: usize) -> Option<WebPlan> {
             | "security-changelog-diff"
             | "typosquat-domain-checker"
     );
-    owns_root_probe.then(|| paths_plan(base, vec!["/".into()], false, max_pages))
+    let crawl = matches!(
+        id,
+        "dependency-js-cdn-scanner"
+            | "dom-sink-scanner"
+            | "email-harvester"
+            | "embedded-object-hunter"
+            | "form-grabber"
+            | "javascript-file-analyzer"
+            | "javascript-obfuscation-detector"
+            | "lazy-load-resource-finder"
+            | "pixel-tracker-finder"
+            | "social-media"
+            | "static-asset-fingerprinter"
+            | "third-party-integrations"
+            | "third-party-script-risk-profiler"
+            | "websocket-endpoint-sniffer"
+    );
+    owns_root_probe.then(|| paths_plan(base, vec!["/".into()], crawl, max_pages))
 }
 
 /// Constructs a discovered GET probe after the caller has enforced scope.
@@ -492,6 +515,14 @@ mod tests {
         let rate = plan_for("rate-limit-waf-bypass-test", &base, &BTreeMap::new(), 64)
             .ok_or("rate-limit plan is missing")?;
         assert_eq!(rate.probes.len(), 4);
+
+        let cache = plan_for("cache-behavior-analyzer", &base, &BTreeMap::new(), 64)
+            .ok_or("cache plan is missing")?;
+        assert_eq!(cache.probes.len(), 2);
+
+        let performance = plan_for("performance-monitoring", &base, &BTreeMap::new(), 64)
+            .ok_or("performance plan is missing")?;
+        assert_eq!(performance.probes.len(), 3);
         Ok(())
     }
 }

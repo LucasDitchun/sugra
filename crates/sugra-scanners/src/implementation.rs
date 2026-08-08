@@ -26,6 +26,10 @@ use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
 use crate::web::{WebProbe, discovered, plan_for};
+use crate::web_analysis::{
+    WebSample, aggregate_findings as aggregate_web_findings, observation as web_observation,
+    response_findings as web_response_findings, sample as web_sample, signals as web_signals,
+};
 
 const fn operation_family(operation: Operation) -> BoundaryFamily {
     match operation {
@@ -303,6 +307,7 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut samples: Vec<WebSample> = Vec::new();
         let mut attempts = 0_usize;
 
         while let Some((probe, depth)) = queue.pop_front() {
@@ -328,8 +333,8 @@ impl BuiltinScanner {
             match response {
                 Ok(response) => {
                     let index = evidence.len();
-                    let metrics = document_metrics(&response.body);
-                    analyze_http(id, &response, &metrics, index, &mut findings);
+                    let signals = web_signals(&response);
+                    findings.extend(web_response_findings(id, &response, &signals, index));
                     if plan.crawl && method == HttpMethod::Get && depth < request.budget.max_depth {
                         for url in
                             discover_links(&response.final_url, &response.body, &request.scope)
@@ -337,21 +342,11 @@ impl BuiltinScanner {
                             queue.push_back((discovered(url), depth + 1));
                         }
                     }
+                    samples.push(web_sample(label.clone(), &response));
                     evidence.push(Evidence {
                         kind: "http-observation".into(),
                         source: safe_url_label(&response.final_url),
-                        observation: json!({
-                            "probe": label,
-                            "method": format!("{method:?}").to_ascii_uppercase(),
-                            "status": response.status,
-                            "headers": response.headers,
-                            "cookies": response.cookies,
-                            "redirects": safe_redirects(&response.redirects),
-                            "bytes": response.body.len(),
-                            "sha256": hex::encode(Sha256::digest(&response.body)),
-                            "document": metrics,
-                            "duration_ms": response.duration_ms,
-                        }),
+                        observation: web_observation(&label, method, &response, &signals),
                         observed_at: context.clock.now(),
                     });
                 }
@@ -361,6 +356,7 @@ impl BuiltinScanner {
                 }),
             }
         }
+        findings.extend(aggregate_web_findings(id, &samples, &request.options));
         if evidence.is_empty() {
             let first = diagnostics
                 .first()
@@ -1358,45 +1354,6 @@ fn base_url(target: &Target) -> Result<Url, ScanError> {
     Ok(url)
 }
 
-#[derive(Debug, serde::Serialize)]
-struct DocumentMetrics {
-    title: Option<String>,
-    links: usize,
-    scripts: usize,
-    forms: usize,
-    inputs: usize,
-    comments: usize,
-}
-
-fn document_metrics(body: &[u8]) -> DocumentMetrics {
-    let text = String::from_utf8_lossy(body);
-    let document = Html::parse_document(&text);
-    let count = |selector: &str| {
-        Selector::parse(selector)
-            .ok()
-            .map_or(0, |selector| document.select(&selector).count())
-    };
-    let title = Selector::parse("title").ok().and_then(|selector| {
-        document.select(&selector).next().map(|element| {
-            element
-                .text()
-                .collect::<String>()
-                .trim()
-                .chars()
-                .take(256)
-                .collect()
-        })
-    });
-    DocumentMetrics {
-        title,
-        links: count("a[href]"),
-        scripts: count("script"),
-        forms: count("form"),
-        inputs: count("input, textarea, select"),
-        comments: text.matches("<!--").count(),
-    }
-}
-
 fn discover_links(base: &Url, body: &[u8], scope: &sugra_domain::ScopeGrant) -> Vec<Url> {
     let document = Html::parse_document(&String::from_utf8_lossy(body));
     let Ok(selector) = Selector::parse("a[href], script[src]") else {
@@ -1430,133 +1387,6 @@ fn safe_url_label(url: &Url) -> String {
     safe.set_query(None);
     safe.set_fragment(None);
     safe.to_string()
-}
-
-fn safe_redirects(redirects: &[sugra_core::HttpRedirect]) -> Vec<Value> {
-    redirects
-        .iter()
-        .map(|redirect| {
-            json!({
-                "status": redirect.status,
-                "from": safe_url_label(&redirect.from),
-                "to": safe_url_label(&redirect.to),
-                "decision": format!("{:?}", redirect.decision).to_ascii_lowercase(),
-            })
-        })
-        .collect()
-}
-
-fn analyze_http(
-    id: &str,
-    response: &sugra_core::HttpResponse,
-    metrics: &DocumentMetrics,
-    evidence: usize,
-    findings: &mut Vec<Finding>,
-) {
-    if id == "broken-links" && response.status >= 400 {
-        findings.push(finding(
-            "broken-link",
-            "A linked resource returned an error status",
-            Severity::Low,
-            Confidence::Confirmed,
-            evidence,
-        ));
-    }
-    if id == "exposed-env-files"
-        && response.status == 200
-        && contains_any(
-            &response.body,
-            &[b"=".as_slice(), b"SECRET", b"PASSWORD", b"TOKEN"],
-        )
-    {
-        findings.push(finding(
-            "environment-file-exposed",
-            "An environment-style file is publicly readable",
-            Severity::Critical,
-            Confidence::Confirmed,
-            evidence,
-        ));
-    }
-    if id == "git-repo-exposure-check"
-        && response.status == 200
-        && contains_any(&response.body, &[b"ref: refs/", b"[core]"])
-    {
-        findings.push(finding(
-            "git-metadata-exposed",
-            "Repository metadata is publicly readable",
-            Severity::High,
-            Confidence::Confirmed,
-            evidence,
-        ));
-    }
-    if matches!(
-        id,
-        "http-headers" | "http-security-features" | "csp-deep-analyzer"
-    ) {
-        for header in [
-            "content-security-policy",
-            "strict-transport-security",
-            "x-content-type-options",
-        ] {
-            if !response.headers.contains_key(header) {
-                findings.push(finding(
-                    &format!("missing-{header}"),
-                    &format!("Security header {header} was not observed"),
-                    Severity::Low,
-                    Confidence::Confirmed,
-                    evidence,
-                ));
-            }
-        }
-    }
-    if id == "clickjacking-test"
-        && !response.headers.contains_key("x-frame-options")
-        && !response
-            .headers
-            .get("content-security-policy")
-            .is_some_and(|value| value.to_ascii_lowercase().contains("frame-ancestors"))
-    {
-        findings.push(finding(
-            "framing-not-restricted",
-            "No framing restriction was observed",
-            Severity::Medium,
-            Confidence::Confirmed,
-            evidence,
-        ));
-    }
-    if id == "cors-misconfiguration-scanner"
-        && response
-            .headers
-            .get("access-control-allow-origin")
-            .is_some_and(|value| value == "*" || value == "https://scope-check.invalid")
-    {
-        findings.push(finding(
-            "permissive-cors",
-            "A permissive cross-origin policy was observed",
-            Severity::Medium,
-            Confidence::Confirmed,
-            evidence,
-        ));
-    }
-    if id == "file-upload-surface-finder" && metrics.inputs > 0 {
-        let text = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
-        if text.contains("type=\"file\"") || text.contains("type='file'") {
-            findings.push(finding(
-                "upload-surface",
-                "A file upload input was observed",
-                Severity::Info,
-                Confidence::Confirmed,
-                evidence,
-            ));
-        }
-    }
-}
-
-fn contains_any(body: &[u8], needles: &[&[u8]]) -> bool {
-    needles.iter().any(|needle| {
-        body.windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle))
-    })
 }
 
 #[derive(Clone, Copy)]
