@@ -270,17 +270,11 @@ fn supplemental_boundaries(id: &str) -> &'static [Boundary] {
     }
 }
 
-/// Returns semantic gaps not covered by the offline boundary harness.
-///
-/// These entries prevent the boundary-level checks from being mistaken for
-/// scanner-specific detection parity.
-#[must_use]
-pub fn semantic_gaps() -> Vec<SemanticGap> {
-    contracts()
-        .into_iter()
-        .filter_map(|contract| {
-            let missing = match contract.id {
-                "dnssec"
+macro_rules! has_verified_semantics {
+    ($id:expr) => {
+        matches!(
+            $id,
+            "dnssec"
                 | "dual-stack-behavior-profiler"
                 | "dual-stack-diff"
                 | "email-config"
@@ -366,8 +360,39 @@ pub fn semantic_gaps() -> Vec<SemanticGap> {
                 | "cookie-scope-diff"
                 | "dependency-js-cdn-scanner"
                 | "dom-sink-scanner"
-                | "embedded-object-hunter" => &[],
-                _ => STANDARD_SEMANTIC_GAPS,
+                | "embedded-object-hunter"
+                | "form-grabber"
+                | "graphql-introspection-probe"
+                | "http-method-enumerator"
+                | "websocket-endpoint-sniffer"
+                | "html-comments-extractor"
+                | "third-party-integrations"
+                | "sitemap"
+                | "social-media"
+                | "favicon-hashing"
+                | "technology-stack"
+                | "exposed-env-files"
+                | "git-repo-exposure-check"
+                | "open-redirect-finder"
+                | "javascript-obfuscation-detector"
+                | "security-changelog-diff"
+        )
+    };
+}
+
+/// Returns semantic gaps not covered by the offline boundary harness.
+///
+/// These entries prevent the boundary-level checks from being mistaken for
+/// scanner-specific detection parity.
+#[must_use]
+pub fn semantic_gaps() -> Vec<SemanticGap> {
+    contracts()
+        .into_iter()
+        .filter_map(|contract| {
+            let missing = if has_verified_semantics!(contract.id) {
+                &[]
+            } else {
+                STANDARD_SEMANTIC_GAPS
             };
             (!missing.is_empty()).then_some(SemanticGap {
                 id: contract.id,

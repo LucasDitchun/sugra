@@ -100,6 +100,21 @@ const VERIFIED_SEMANTIC_SCANNERS: &[&str] = &[
     "dependency-js-cdn-scanner",
     "dom-sink-scanner",
     "embedded-object-hunter",
+    "form-grabber",
+    "graphql-introspection-probe",
+    "http-method-enumerator",
+    "websocket-endpoint-sniffer",
+    "html-comments-extractor",
+    "third-party-integrations",
+    "sitemap",
+    "social-media",
+    "favicon-hashing",
+    "technology-stack",
+    "exposed-env-files",
+    "git-repo-exposure-check",
+    "open-redirect-finder",
+    "javascript-obfuscation-detector",
+    "security-changelog-diff",
 ];
 
 #[test]
@@ -133,8 +148,8 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
 
     assert!(gap_ids.is_subset(&contract_ids));
     assert_eq!(contracts().len(), 147);
-    assert_eq!(gaps.len(), 60);
-    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 180);
+    assert_eq!(gaps.len(), 45);
+    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 135);
 
     for covered in VERIFIED_SEMANTIC_SCANNERS {
         assert!(!gap_ids.contains(covered), "{covered} still has a gap");
