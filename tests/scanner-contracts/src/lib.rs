@@ -58,8 +58,6 @@ const STANDARD_SEMANTIC_GAPS: &[MissingFixture] = &[
     MissingFixture::EdgeCase,
 ];
 
-const NEGATIVE_CONTROL_GAP: &[MissingFixture] = &[MissingFixture::NegativeControl];
-
 const CONTRACT_GROUPS: &[(Boundary, &[&str])] = &[
     (
         Boundary::Provider,
@@ -285,15 +283,31 @@ pub fn semantic_gaps() -> Vec<SemanticGap> {
                 "dnssec"
                 | "dual-stack-behavior-profiler"
                 | "dual-stack-diff"
+                | "email-config"
+                | "spf-dkim-dmarc-validator"
                 | "ttl-analysis"
                 | "typosquat-domain-checker"
+                | "http-headers"
+                | "http-security"
+                | "clickjacking-test"
+                | "cors-misconfiguration-scanner"
+                | "security-txt"
+                | "security-contact-gap-finder"
+                | "cookies"
+                | "session-cookie-lifetime-checker"
+                | "ssl-pinning-check"
+                | "ipv6-reachability-test"
+                | "ntp-info-leak-checker"
+                | "snmp-public-community-checker"
+                | "udp-service-sampler"
+                | "netbios-name-query"
+                | "snmp-bulk-walk"
                 | "passive-dns-history"
                 | "rpki-route-validity-check"
                 | "rogue-certificate-check"
                 | "performance-monitoring"
                 | "domain-reputation-check"
                 | "ip-reputation-check" => &[],
-                "email-config" => NEGATIVE_CONTROL_GAP,
                 _ => STANDARD_SEMANTIC_GAPS,
             };
             (!missing.is_empty()).then_some(SemanticGap {

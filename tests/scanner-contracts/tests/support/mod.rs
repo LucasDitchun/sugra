@@ -263,15 +263,22 @@ fn dns_records(fixture: Fixture, query: &DnsQuery) -> Vec<DnsRecord> {
             value: "192.0.2.20".into(),
             ttl: Some(300),
         }],
-        _ => vec![record(
-            query
+        _ => {
+            let record_type = query
                 .record_types
                 .first()
                 .copied()
-                .unwrap_or(DnsRecordType::A),
-            "192.0.2.1",
-            Some(300),
-        )],
+                .unwrap_or(DnsRecordType::A);
+            vec![record(
+                record_type,
+                if record_type == DnsRecordType::Aaaa {
+                    "2001:db8::1"
+                } else {
+                    "192.0.2.1"
+                },
+                Some(300),
+            )]
+        }
     }
 }
 
@@ -316,7 +323,11 @@ impl TcpPort for FakeTcp {
     async fn execute(&self, request: TcpRequest) -> Result<TcpResponse, PortError> {
         self.0.record(Boundary::Tcp)?;
         Ok(TcpResponse {
-            endpoint: format!("{}:{}", request.host, request.port),
+            endpoint: if request.host.contains(':') {
+                format!("[{}]:{}", request.host, request.port)
+            } else {
+                format!("{}:{}", request.host, request.port)
+            },
             bytes: format!("fixture-banner {SECRET_MARKER}").into_bytes(),
             duration_ms: 1,
         })
@@ -329,9 +340,40 @@ struct FakeUdp(Harness);
 impl UdpPort for FakeUdp {
     async fn execute(&self, request: UdpRequest) -> Result<UdpResponse, PortError> {
         self.0.record(Boundary::Udp)?;
-        let mut bytes = vec![0_u8; 48];
-        bytes[0] = 0x24;
-        bytes[1] = 2;
+        let bytes = match request.port {
+            53 => {
+                let mut response = vec![0_u8; 12];
+                response[..2].copy_from_slice(&request.payload[..2]);
+                response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                response
+            }
+            123 => {
+                let mut response = vec![0_u8; 48];
+                response[0] = 0x24;
+                response[1] = 2;
+                response[24..32].copy_from_slice(&request.payload[40..48]);
+                response
+            }
+            137 => {
+                let mut response = vec![0_u8; 12];
+                response[..2].copy_from_slice(&request.payload[..2]);
+                response[2..4].copy_from_slice(&0x8000_u16.to_be_bytes());
+                response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                response
+            }
+            161 => {
+                let mut response = request.payload.clone();
+                if let Some(index) = response
+                    .iter()
+                    .rposition(|byte| matches!(byte, 0xa0 | 0xa5))
+                {
+                    response[index] = 0xa2;
+                }
+                response
+            }
+            _ => Vec::new(),
+        };
         Ok(UdpResponse {
             endpoint: format!("{}:{}", request.host, request.port),
             bytes,
@@ -486,9 +528,14 @@ pub fn request_for(
         max_depth: 1,
     }
     .validate()?;
+    let supplied = if descriptor.id.as_str() == "ssl-pinning-check" {
+        BTreeMap::from([("baseline_sha256".into(), "00".repeat(32))])
+    } else {
+        BTreeMap::new()
+    };
     Ok(ScanRequest {
         scanner_id: descriptor.id.clone(),
-        options: resolve_options(&descriptor.options, &BTreeMap::new())?,
+        options: resolve_options(&descriptor.options, &supplied)?,
         scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
         target,
         budget,

@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 
 use serde_json::json;
 use sugra_core::{LocalInputRequest, ScanErrorKind};
-use sugra_domain::{Budget, ExecutionStatus, ScanRequest, ScanResult};
+use sugra_domain::{
+    Budget, ExecutionStatus, ScanRequest, ScanResult, ScopeGrant, Target, TargetKind,
+};
 use sugra_scanner_contracts::{Boundary, MissingFixture, contracts, semantic_gaps};
 use sugra_scanners::build_builtins;
 
@@ -41,15 +43,32 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
 
     assert!(gap_ids.is_subset(&contract_ids));
     assert_eq!(contracts().len(), 147);
-    assert_eq!(gaps.len(), 136);
-    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 406);
+    assert_eq!(gaps.len(), 119);
+    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 357);
 
     for covered in [
         "dnssec",
         "dual-stack-behavior-profiler",
         "dual-stack-diff",
+        "email-config",
+        "spf-dkim-dmarc-validator",
         "ttl-analysis",
         "typosquat-domain-checker",
+        "http-headers",
+        "http-security",
+        "clickjacking-test",
+        "cors-misconfiguration-scanner",
+        "security-txt",
+        "security-contact-gap-finder",
+        "cookies",
+        "session-cookie-lifetime-checker",
+        "ssl-pinning-check",
+        "ipv6-reachability-test",
+        "ntp-info-leak-checker",
+        "snmp-public-community-checker",
+        "udp-service-sampler",
+        "netbios-name-query",
+        "snmp-bulk-walk",
         "passive-dns-history",
         "rpki-route-validity-check",
         "rogue-certificate-check",
@@ -59,11 +78,19 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
     ] {
         assert!(!gap_ids.contains(covered), "{covered} still has a gap");
     }
-    let email = gaps
-        .iter()
-        .find(|gap| gap.id == "email-config")
-        .unwrap_or_else(|| unreachable!("email-config must retain its real gap"));
-    assert_eq!(email.missing, &[MissingFixture::NegativeControl]);
+
+    for gap in &gaps {
+        assert_eq!(
+            gap.missing,
+            &[
+                MissingFixture::PositiveSignal,
+                MissingFixture::NegativeControl,
+                MissingFixture::EdgeCase,
+            ],
+            "{} must retain every unproven fixture class",
+            gap.id
+        );
+    }
 
     let untouched = gaps
         .iter()
@@ -91,9 +118,30 @@ async fn scan_fixture(
         .registry
         .get(&scanner_id)
         .ok_or("fixture scanner is missing from the registry")?;
-    let mut request = support::request_for(scanner.descriptor())?;
+    let mut request = contract_request_for(scanner.descriptor())?;
     configure(&mut request);
     Ok(scanner.scan(&request, &support::context(false)).await?)
+}
+
+fn contract_request_for(
+    descriptor: &sugra_domain::ScannerDescriptor,
+) -> Result<ScanRequest, Box<dyn std::error::Error>> {
+    let mut descriptor = descriptor.clone();
+    if descriptor.id.as_str() == "ssl-pinning-check" {
+        let baseline = descriptor
+            .options
+            .iter_mut()
+            .find(|option| option.key == "baseline_sha256")
+            .ok_or("TLS pinning descriptor is missing its baseline option")?;
+        baseline.default = Some("00".repeat(32));
+    }
+    let mut request = support::request_for(&descriptor)?;
+    if descriptor.id.as_str() == "ipv6-reachability-test" {
+        let target = Target::parse(TargetKind::Ip, "2001:db8::1")?;
+        request.scope = ScopeGrant::exact(&target, true, time::OffsetDateTime::UNIX_EPOCH);
+        request.target = target;
+    }
+    Ok(request)
 }
 
 fn has_finding(result: &ScanResult, key: &str) -> bool {
@@ -120,7 +168,7 @@ async fn dnssec_public_contract_covers_complete_missing_and_partial_material()
 }
 
 #[tokio::test]
-async fn email_config_public_contract_keeps_the_unqueried_dkim_gap_explicit()
+async fn email_config_public_contract_covers_missing_and_weak_policies()
 -> Result<(), Box<dyn std::error::Error>> {
     let missing = scan_fixture("email-config", support::Fixture::EmailMissing, |_| {}).await?;
     for key in [
@@ -324,7 +372,7 @@ async fn performance_monitoring_public_contract_covers_http_and_pagespeed_signal
     let builtins = build_builtins(&harness.services())?;
     let id = sugra_domain::ScannerId::new("performance-monitoring")?;
     let scanner = builtins.registry.get(&id).ok_or("scanner is missing")?;
-    let mut request = support::request_for(scanner.descriptor())?;
+    let mut request = contract_request_for(scanner.descriptor())?;
     request
         .options
         .insert("strategies".into(), json!(["tablet"]));
@@ -385,7 +433,7 @@ async fn scanner_specific_boundary_failures_keep_their_public_error_kinds()
             .registry
             .get(&scanner_id)
             .ok_or("scanner is missing")?;
-        let request = support::request_for(scanner.descriptor())?;
+        let request = contract_request_for(scanner.descriptor())?;
         let Err(error) = scanner.scan(&request, &support::context(false)).await else {
             return Err(format!("{id} converted a boundary failure into success").into());
         };
@@ -502,7 +550,7 @@ async fn every_scanner_obeys_its_offline_runtime_contract() -> Result<(), Box<dy
             .registry
             .get(&scanner_id)
             .ok_or("matrix scanner is missing from the registry")?;
-        let request = support::request_for(scanner.descriptor())?;
+        let request = contract_request_for(scanner.descriptor())?;
         let result = scanner.scan(&request, &support::context(false)).await?;
         let calls = harness.observed_boundaries();
         assert_success_contract(&contract, &result, &calls, request.budget.max_requests)?;
@@ -619,7 +667,7 @@ async fn cancellation_prevents_all_scanner_boundary_calls() -> Result<(), Box<dy
             .registry
             .get(&descriptor.id)
             .ok_or("catalog scanner is missing from the registry")?;
-        let request = support::request_for(descriptor)?;
+        let request = contract_request_for(descriptor)?;
         let Err(error) = scanner.scan(&request, &support::context(true)).await else {
             return Err(std::io::Error::other(format!(
                 "{} completed after pre-cancellation",
@@ -654,7 +702,7 @@ async fn boundary_failures_are_typed_and_never_become_empty_successes()
             .registry
             .get(&scanner_id)
             .ok_or("matrix scanner is missing from the registry")?;
-        let request = support::request_for(scanner.descriptor())?;
+        let request = contract_request_for(scanner.descriptor())?;
         let outcome = scanner.scan(&request, &support::context(false)).await;
 
         match outcome {
