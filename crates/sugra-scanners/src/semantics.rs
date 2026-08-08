@@ -43,6 +43,7 @@ pub(crate) enum Analyzer {
     ProviderLeaks,
     ProviderCertificates,
     ProviderThreat,
+    ProviderPerformance,
     TlsHandshake,
     TlsChain,
     TlsExpiry,
@@ -95,7 +96,8 @@ impl Analyzer {
             | Self::ProviderReputation
             | Self::ProviderLeaks
             | Self::ProviderCertificates
-            | Self::ProviderThreat => BoundaryFamily::Provider,
+            | Self::ProviderThreat
+            | Self::ProviderPerformance => BoundaryFamily::Provider,
             Self::TlsHandshake
             | Self::TlsChain
             | Self::TlsExpiry
@@ -147,6 +149,7 @@ impl Analyzer {
             Self::ProviderLeaks => "leak-source-analysis",
             Self::ProviderCertificates => "certificate-source-analysis",
             Self::ProviderThreat => "threat-source-analysis",
+            Self::ProviderPerformance => "external-performance-analysis",
             Self::TlsHandshake => "tls-handshake-analysis",
             Self::TlsChain => "tls-chain-analysis",
             Self::TlsExpiry => "tls-expiry-analysis",
@@ -590,9 +593,10 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
             WebMetadata,
             "Inspect alternate-language URL publication."
         ),
-        "performance-monitoring" => profile!(
+        "performance-monitoring" => composite_profile!(
             "performance-monitoring",
             WebPerformance,
+            [ProviderPerformance],
             "Measure bounded HTTP response timing and size."
         ),
         "pixel-tracker-finder" => profile!(
@@ -978,6 +982,7 @@ mod tests {
                 ][..],
             ),
             ("firewall-detection", &[BoundaryFamily::Tcp][..]),
+            ("performance-monitoring", &[BoundaryFamily::Provider][..]),
             (
                 "security-contact-gap-finder",
                 &[BoundaryFamily::Provider][..],

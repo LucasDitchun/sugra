@@ -120,8 +120,36 @@ impl Scanner for BuiltinScanner {
         if context.cancellation.is_cancelled() {
             return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
         }
+        validate_scanner_controls(self.descriptor.id.as_str(), &request.options)?;
         self.scan_stages(request, context).await
     }
+}
+
+fn validate_scanner_controls(
+    scanner_id: &str,
+    options: &BTreeMap<String, Value>,
+) -> Result<(), ScanError> {
+    if scanner_id != "performance-monitoring" {
+        return Ok(());
+    }
+    if options.get("verify_ssl").and_then(Value::as_bool) == Some(false) {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "TLS certificate verification cannot be disabled",
+        ));
+    }
+    if let Some(strategies) = options.get("strategies").and_then(Value::as_array)
+        && (strategies.is_empty()
+            || strategies
+                .iter()
+                .any(|strategy| !matches!(strategy.as_str(), Some("mobile" | "desktop"))))
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "PageSpeed strategies must be mobile or desktop",
+        ));
+    }
+    Ok(())
 }
 
 impl BuiltinScanner {
@@ -522,7 +550,7 @@ impl BuiltinScanner {
                         &request.target,
                         &request.options,
                     ),
-                    secret_env: call.secret_env.map(str::to_owned),
+                    secret_env: call.secret_env,
                     budget: request.budget,
                 })
                 .await;
@@ -1553,11 +1581,12 @@ fn safe_url_label(url: &Url) -> String {
     safe.to_string()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProviderCall {
     provider: &'static str,
     operation: &'static str,
-    secret_env: Option<&'static str>,
+    secret_env: Option<String>,
+    strategy: Option<&'static str>,
 }
 
 fn provider_calls(
@@ -1572,7 +1601,7 @@ fn provider_calls(
         .unwrap_or_else(|| vec![provider_call("configured-provider", "query", None)])
 }
 
-const fn provider_call(
+fn provider_call(
     provider: &'static str,
     operation: &'static str,
     secret_env: Option<&'static str>,
@@ -1580,7 +1609,8 @@ const fn provider_call(
     ProviderCall {
         provider,
         operation,
-        secret_env,
+        secret_env: secret_env.map(str::to_owned),
+        strategy: None,
     }
 }
 
@@ -1590,6 +1620,38 @@ fn provider_registry_calls(
     options: &BTreeMap<String, Value>,
 ) -> Option<Vec<ProviderCall>> {
     match id {
+        "performance-monitoring" => {
+            let secret_env = options
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mut strategies: Vec<_> = options
+                .get("strategies")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(|strategy| match strategy {
+                    "mobile" => Some("mobile"),
+                    "desktop" => Some("desktop"),
+                    _ => None,
+                })
+                .collect();
+            if strategies.is_empty() {
+                strategies.extend(["mobile", "desktop"]);
+            }
+            Some(
+                strategies
+                    .into_iter()
+                    .map(|strategy| ProviderCall {
+                        provider: "pagespeed",
+                        operation: "analyze",
+                        secret_env: secret_env.clone(),
+                        strategy: Some(strategy),
+                    })
+                    .collect(),
+            )
+        }
         "asn-lookup" if matches!(target, Target::Ip(_)) => {
             Some(vec![provider_call("ripestat", "network-info", None)])
         }
@@ -1755,6 +1817,19 @@ fn provider_query(
         "ripestat" => BTreeMap::from([("resource".into(), Value::String(canonical))]),
         "abuseipdb" => BTreeMap::from([("ipAddress".into(), Value::String(host))]),
         "ssllabs" | "urlhaus" => BTreeMap::from([("host".into(), Value::String(host))]),
+        "pagespeed" => BTreeMap::from([
+            (
+                "url".into(),
+                Value::String(match target {
+                    Target::Url(_) => canonical,
+                    _ => format!("https://{host}/"),
+                }),
+            ),
+            (
+                "strategy".into(),
+                Value::String(call.strategy.unwrap_or("mobile").into()),
+            ),
+        ]),
         "censys" if call.operation == "webproperty" => {
             BTreeMap::from([("target".into(), Value::String(format!("{host}:443")))])
         }
@@ -1867,6 +1942,20 @@ fn analyze_provider(
         findings.push(finding(
             "external-tls-grade-risk",
             "The external TLS assessment reported a weak endpoint grade",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "pagespeed"
+        && observation
+            .get("performance_score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score < 0.5)
+    {
+        findings.push(finding(
+            "low-performance-score",
+            "The external performance assessment reported a low score",
             Severity::Medium,
             Confidence::Confirmed,
             evidence,
@@ -2898,6 +2987,7 @@ mod tests {
             provider: "ripestat",
             operation: "rpki-validation",
             secret_env: None,
+            strategy: None,
         };
         let query = provider_query(
             "rpki-route-validity-check",
@@ -2936,6 +3026,92 @@ mod tests {
         assert_eq!(redacted.get("matched_accounts"), Some(&json!(2)));
         assert!(!redacted.to_string().contains("alice"));
         assert!(!redacted.to_string().contains("bob"));
+    }
+
+    #[test]
+    fn pagespeed_plan_honors_strategies_and_secret_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Url, "https://example.com/path")?;
+        let options = BTreeMap::from([
+            ("key".into(), json!("GOOGLE_API_KEY")),
+            ("strategies".into(), json!(["desktop"])),
+        ]);
+        let calls = provider_calls("performance-monitoring", &target, &options);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider, "pagespeed");
+        assert_eq!(calls[0].secret_env.as_deref(), Some("GOOGLE_API_KEY"));
+        let query = provider_query("performance-monitoring", &calls[0], &target, &options);
+        assert_eq!(query.get("url"), Some(&json!("https://example.com/path")));
+        assert_eq!(query.get("strategy"), Some(&json!("desktop")));
+
+        let defaults = provider_calls("performance-monitoring", &target, &BTreeMap::new());
+        assert_eq!(
+            defaults
+                .iter()
+                .filter_map(|call| call.strategy)
+                .collect::<Vec<_>>(),
+            vec!["mobile", "desktop"]
+        );
+        assert!(defaults.iter().all(|call| call.secret_env.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn pagespeed_controls_reject_tls_bypass_and_unknown_strategies() {
+        assert!(
+            validate_scanner_controls(
+                "performance-monitoring",
+                &BTreeMap::from([("verify_ssl".into(), json!(false))]),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scanner_controls(
+                "performance-monitoring",
+                &BTreeMap::from([("strategies".into(), json!(["tablet"]))]),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scanner_controls(
+                "performance-monitoring",
+                &BTreeMap::from([
+                    ("verify_ssl".into(), json!(true)),
+                    ("strategies".into(), json!(["mobile", "desktop"])),
+                ]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn pagespeed_analysis_distinguishes_low_and_healthy_scores() {
+        let low = analyze_provider(
+            "performance-monitoring",
+            "pagespeed",
+            &json!({"performance_score": 0.32}),
+            0,
+        );
+        assert_eq!(low[0].key, "low-performance-score");
+        assert_eq!(low[0].severity, Severity::Medium);
+        assert!(
+            analyze_provider(
+                "performance-monitoring",
+                "pagespeed",
+                &json!({"performance_score": 0.9}),
+                0,
+            )
+            .is_empty()
+        );
+        assert!(
+            analyze_provider(
+                "performance-monitoring",
+                "pagespeed",
+                &json!({"performance_score": null}),
+                0,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

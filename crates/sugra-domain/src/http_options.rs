@@ -388,7 +388,7 @@ fn textual_option(scanner_id: &str, key: &str) -> Option<OptionDefinition> {
             key: key.into(),
             description: "Environment variable containing the Google API key.".into(),
             kind: OptionKind::SecretRef,
-            default: Some("GOOGLE_API_KEY".into()),
+            default: None,
             required: false,
         }),
         "params_file" => Some(text(
