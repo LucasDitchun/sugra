@@ -6,6 +6,7 @@ members = [
   "crates/sugra-scanners",
   "crates/sugra-tui",
   "crates/sugra-cli",
+  "tests/scanner-contracts",
 ]
 resolver = "2"
 
