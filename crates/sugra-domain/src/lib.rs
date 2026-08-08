@@ -1070,7 +1070,7 @@ mod tests {
                 .iter()
                 .map(|contract| contract.options.len())
                 .sum::<usize>(),
-            90
+            94
         );
 
         let broken_links = contracts

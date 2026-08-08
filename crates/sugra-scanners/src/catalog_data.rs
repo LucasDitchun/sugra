@@ -2,7 +2,7 @@
 
 use sugra_domain::{
     Capability, DomainError, LegacyId, OptionDefinition, OptionKind, ScannerDescriptor, ScannerId,
-    TargetKind,
+    TargetKind, scanner_options,
 };
 
 use crate::definition::{Operation, ScannerDefinition};
@@ -839,7 +839,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Http,
             vec![TargetKind::Domain],
             vec![Capability::ActiveFuzz],
-            &[],
+            &["hosts"],
         )?,
         definition(
             LegacyId::Catalog(81),
@@ -857,7 +857,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Http,
             vec![TargetKind::Domain],
             vec![Capability::ActiveHttpSafe],
-            &["ports_top", "timeout"],
+            &["baseline_sha256", "ports_top", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(112),
@@ -1118,7 +1118,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Http,
             vec![TargetKind::Domain, TargetKind::Url],
             vec![Capability::ActiveHttpSafe],
-            &[],
+            &["baseline_sha256"],
         )?,
         definition(
             LegacyId::Catalog(132),
@@ -1357,16 +1357,33 @@ fn definition(
     capabilities: Vec<Capability>,
     option_names: &[&str],
 ) -> Result<ScannerDefinition, DomainError> {
+    let scanner_id = ScannerId::new(id)?;
+    let options = match scanner_options(&scanner_id)? {
+        Some(options) => {
+            let matches_declared = options.len() == option_names.len()
+                && option_names
+                    .iter()
+                    .all(|name| options.iter().any(|option| option.key == *name));
+            if !matches_declared {
+                return Err(DomainError::InvalidScannerDescriptor {
+                    scanner_id: id.into(),
+                    reason: "published typed options differ from the scanner declaration",
+                });
+            }
+            options
+        }
+        None => option_names.iter().map(|name| option(name)).collect(),
+    };
     Ok(ScannerDefinition {
         descriptor: ScannerDescriptor {
-            id: ScannerId::new(id)?,
+            id: scanner_id,
             legacy_id: Some(legacy_id),
             name: name.into(),
             description: format!("Collects and evaluates {name} evidence."),
             track: track(operation).into(),
             target_kinds,
             capabilities,
-            options: option_names.iter().map(|name| option(name)).collect(),
+            options,
             version: "1".into(),
         },
         operation,

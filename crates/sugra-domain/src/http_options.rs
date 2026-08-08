@@ -173,9 +173,12 @@ const SCANNER_CONTRACTS: [(&str, &[&str]); PUBLISHED_SCANNER_OPTION_CONTRACT_COU
     ("technology-stack", &[]),
     ("third-party-integrations", &[]),
     ("third-party-script-risk-profiler", &[]),
-    ("virtual-host-fuzzer", &[]),
+    ("virtual-host-fuzzer", &["hosts"]),
     ("websocket-endpoint-sniffer", &[]),
-    ("attack-surface-delta", &["ports_top", "timeout"]),
+    (
+        "attack-surface-delta",
+        &["baseline_sha256", "ports_top", "timeout"],
+    ),
     ("bug-bounty-program-finder", &["timeout", "workers"]),
     ("cloud-bucket-exposure", &["timeout"]),
     ("cloud-service-enumeration", &[]),
@@ -189,14 +192,14 @@ const SCANNER_CONTRACTS: [(&str, &[&str]); PUBLISHED_SCANNER_OPTION_CONTRACT_COU
     ("passive-cve-mapper", &[]),
     ("privacy-gdpr", &[]),
     ("rate-limit-waf-bypass-test", &["batch_size", "timeout"]),
-    ("security-changelog-diff", &[]),
+    ("security-changelog-diff", &["baseline_sha256"]),
     ("security-contact-gap-finder", &[]),
     ("security-txt", &["log", "timeout"]),
     (
         "session-hijacking-passive",
         &["paths", "session_hints", "timeout"],
     ),
-    ("typosquat-domain-checker", &[]),
+    ("typosquat-domain-checker", &["max_variants"]),
 ];
 
 fn option_definition(scanner_id: &str, key: &str) -> Result<OptionDefinition, DomainError> {
@@ -216,8 +219,8 @@ fn bounded_option(scanner_id: &str, key: &str) -> Option<OptionDefinition> {
             key,
             "Maximum requests in one authorized rate-limit test batch.",
             1,
-            100,
-            25,
+            8,
+            4,
         )),
         "depth" => Some(integer(
             key,
@@ -246,6 +249,13 @@ fn bounded_option(scanner_id: &str, key: &str) -> Option<OptionDefinition> {
             1,
             2_000,
             75,
+        )),
+        "max_variants" => Some(integer(
+            key,
+            "Maximum generated typo-domain candidates to resolve.",
+            1,
+            128,
+            32,
         )),
         "ports_top" => Some(integer(
             key,
@@ -319,6 +329,12 @@ fn collection_option(key: &str) -> Option<OptionDefinition> {
             64,
             None,
         )),
+        "hosts" => Some(list(
+            key,
+            "Comma-separated authorized virtual-host candidates.",
+            128,
+            None,
+        )),
         "paths" => list(
             key,
             "Comma-separated same-origin paths beginning with a slash.",
@@ -356,6 +372,12 @@ fn collection_option(key: &str) -> Option<OptionDefinition> {
 
 fn textual_option(scanner_id: &str, key: &str) -> Option<OptionDefinition> {
     match key {
+        "baseline_sha256" => Some(text(
+            key,
+            "Optional lowercase SHA-256 baseline used for deterministic change comparison.",
+            64,
+            None,
+        )),
         "delay" => Some(text(
             key,
             "Delay in seconds between schema probes, from 0 through 60.",

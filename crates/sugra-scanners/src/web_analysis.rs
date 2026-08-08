@@ -1237,7 +1237,16 @@ fn baseline_diff(
     samples: &[WebSample],
     options: &BTreeMap<String, Value>,
 ) -> Vec<Finding> {
-    let Some(baseline) = options.get("baseline_sha256").and_then(Value::as_str) else {
+    let Some(baseline) = options
+        .get("baseline_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+    else {
         return Vec::new();
     };
     let changed = samples
@@ -1437,9 +1446,11 @@ mod tests {
         );
         assert!(aggregate_findings("attack-surface-delta", &[first], &options).is_empty());
         assert_eq!(
-            aggregate_findings("attack-surface-delta", &[different], &options)[0].key,
+            aggregate_findings("attack-surface-delta", &[different.clone()], &options)[0].key,
             "attack-surface-changed"
         );
+        options.insert("baseline_sha256".into(), Value::String("invalid".into()));
+        assert!(aggregate_findings("attack-surface-delta", &[different], &options).is_empty());
     }
 
     #[test]
