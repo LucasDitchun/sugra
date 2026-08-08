@@ -50,6 +50,17 @@ pub(crate) enum ProviderSummary {
         /// Records explicitly marked malicious by the provider.
         malicious_records: usize,
     },
+    /// Encrypted DNS response metadata without returned names or addresses.
+    DnsOverHttps {
+        /// DNS response code when published by the provider.
+        status: Option<u16>,
+        /// Number of bounded answer records.
+        answers: usize,
+        /// Whether the response was truncated.
+        truncated: bool,
+        /// Whether the provider marked the response data as authenticated.
+        authenticated_data: bool,
+    },
     /// Routing and route-origin aggregate counts.
     Routing {
         /// Prefixes returned by the provider.
@@ -117,10 +128,31 @@ pub(crate) fn analyze_provider_response(
         "urlscan" => Some(analyze_urlscan(scanner_id, response)),
         "ripestat" => Some(analyze_ripestat(scanner_id, response)),
         "pagespeed" => Some(analyze_pagespeed(scanner_id, response)),
+        "cloudflare-doh" | "google-doh" => Some(analyze_doh(response)),
         "virustotal" | "abuseipdb" | "urlhaus" | "otx" => {
             Some(analyze_reputation(scanner_id, response))
         }
         _ => None,
+    }
+}
+
+fn analyze_doh(response: &Value) -> ProviderAnalysis {
+    let status = response
+        .get("Status")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    let answers = response
+        .get("Answer")
+        .and_then(Value::as_array)
+        .map_or(0, |answers| answers.len().min(10_000));
+    ProviderAnalysis {
+        summary: ProviderSummary::DnsOverHttps {
+            status,
+            answers,
+            truncated: response.get("TC").and_then(Value::as_bool).unwrap_or(false),
+            authenticated_data: response.get("AD").and_then(Value::as_bool).unwrap_or(false),
+        },
+        findings: Vec::new(),
     }
 }
 
@@ -784,6 +816,63 @@ mod tests {
             }
         );
         assert!(!serde_json::to_string(&analysis)?.contains("192.0.2.44"));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_dns_response_is_summarized_without_answer_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let analysis = analyze_provider_response(
+            "dns-over-https",
+            "cloudflare-doh",
+            &json!({
+                "Status": 0,
+                "TC": false,
+                "AD": true,
+                "Answer": [
+                    {"name": "private.example", "type": 1, "data": "192.0.2.9"},
+                    {"name": "private.example", "type": 28, "data": "2001:db8::9"}
+                ]
+            }),
+            ProviderBaseline::None,
+        )
+        .ok_or("encrypted DNS response must be supported")?;
+
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::DnsOverHttps {
+                status: Some(0),
+                answers: 2,
+                truncated: false,
+                authenticated_data: true,
+            }
+        );
+        let serialized = serde_json::to_string(&analysis)?;
+        assert!(!serialized.contains("private.example"));
+        assert!(!serialized.contains("192.0.2.9"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_encrypted_dns_metadata_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let analysis = analyze_provider_response(
+            "dns-over-https",
+            "google-doh",
+            &json!({"Status": "ok", "TC": "false", "AD": null, "Answer": "private"}),
+            ProviderBaseline::None,
+        )
+        .ok_or("encrypted DNS response must be supported")?;
+
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::DnsOverHttps {
+                status: None,
+                answers: 0,
+                truncated: false,
+                authenticated_data: false,
+            }
+        );
+        assert!(!serde_json::to_string(&analysis)?.contains("private"));
         Ok(())
     }
 }

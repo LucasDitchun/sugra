@@ -59,7 +59,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             LegacyId::Catalog(2),
             "dns-over-https",
             "DNS Over HTTPS",
-            Operation::Dns,
+            Operation::Intelligence,
             vec![TargetKind::Domain],
             vec![Capability::ThirdPartyApi],
             &["providers", "qtype", "timeout"],

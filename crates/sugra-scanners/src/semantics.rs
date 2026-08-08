@@ -44,6 +44,7 @@ pub(crate) enum Analyzer {
     ProviderCertificates,
     ProviderThreat,
     ProviderPerformance,
+    ProviderDns,
     TlsHandshake,
     TlsChain,
     TlsExpiry,
@@ -97,7 +98,8 @@ impl Analyzer {
             | Self::ProviderLeaks
             | Self::ProviderCertificates
             | Self::ProviderThreat
-            | Self::ProviderPerformance => BoundaryFamily::Provider,
+            | Self::ProviderPerformance
+            | Self::ProviderDns => BoundaryFamily::Provider,
             Self::TlsHandshake
             | Self::TlsChain
             | Self::TlsExpiry
@@ -150,6 +152,7 @@ impl Analyzer {
             Self::ProviderCertificates => "certificate-source-analysis",
             Self::ProviderThreat => "threat-source-analysis",
             Self::ProviderPerformance => "external-performance-analysis",
+            Self::ProviderDns => "encrypted-dns-provider-analysis",
             Self::TlsHandshake => "tls-handshake-analysis",
             Self::TlsChain => "tls-chain-analysis",
             Self::TlsExpiry => "tls-expiry-analysis",
@@ -238,7 +241,7 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
         ),
         "dns-over-https" => profile!(
             "dns-over-https",
-            DnsPerformance,
+            ProviderDns,
             "Compare encrypted DNS resolution observations."
         ),
         "dns-records" => profile!(

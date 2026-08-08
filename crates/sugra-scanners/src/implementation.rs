@@ -134,6 +134,22 @@ fn validate_scanner_controls(
     scanner_id: &str,
     options: &BTreeMap<String, Value>,
 ) -> Result<(), ScanError> {
+    if scanner_id == "dns-over-https"
+        && options
+            .get("qtype")
+            .and_then(Value::as_str)
+            .is_some_and(|qtype| {
+                !matches!(
+                    qtype.to_ascii_uppercase().as_str(),
+                    "A" | "AAAA" | "CAA" | "CNAME" | "DNSKEY" | "DS" | "MX" | "NS" | "TXT"
+                )
+            })
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "DNS-over-HTTPS record type is not supported",
+        ));
+    }
     if scanner_id != "performance-monitoring" {
         return Ok(());
     }
@@ -256,9 +272,6 @@ impl BuiltinScanner {
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
         let id = self.descriptor.id.as_str();
-        if id == "dns-over-https" {
-            return self.scan_doh(request, context).await;
-        }
         let plan = dns_query_plan(id, &request.target, request)?;
         let mut evidence = Vec::new();
         let mut diagnostics = Vec::new();
@@ -325,83 +338,6 @@ impl BuiltinScanner {
                 ExecutionStatus::Partial
             },
             findings,
-            evidence,
-            diagnostics,
-        })
-    }
-
-    async fn scan_doh(
-        &self,
-        request: &ScanRequest,
-        context: &ScanContext,
-    ) -> Result<ScanResult, ScanError> {
-        let name = dns_name(&request.target)?;
-        let qtype = request
-            .options
-            .get("qtype")
-            .and_then(Value::as_str)
-            .unwrap_or("A");
-        let providers = request
-            .options
-            .get("providers")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(doh_provider)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| vec!["cloudflare-doh", "google-doh"]);
-        let mut evidence = Vec::new();
-        let mut diagnostics = Vec::new();
-        for provider in providers.into_iter().take(request.budget.max_requests) {
-            let response = self
-                .services
-                .provider
-                .query(ProviderRequest {
-                    provider: provider.into(),
-                    operation: "resolve".into(),
-                    query: BTreeMap::from([
-                        ("name".into(), Value::String(name.clone())),
-                        ("type".into(), Value::String(qtype.into())),
-                    ]),
-                    secret_env: None,
-                    budget: request.budget,
-                })
-                .await;
-            match response {
-                Ok(response) => evidence.push(Evidence {
-                    kind: "dns-over-https".into(),
-                    source: response.provider,
-                    observation: redact_json(response.data),
-                    observed_at: context.clock.now(),
-                }),
-                Err(error) => diagnostics.push(Diagnostic {
-                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                    message: error.message,
-                }),
-            }
-        }
-        if evidence.is_empty() {
-            let message = diagnostics
-                .first()
-                .map_or("all DNS-over-HTTPS providers failed", |value| {
-                    value.message.as_str()
-                });
-            return Err(ScanError::new(
-                ScanErrorKind::DependencyUnavailable,
-                message,
-            ));
-        }
-        Ok(ScanResult {
-            status: if diagnostics.is_empty() {
-                ExecutionStatus::Completed
-            } else {
-                ExecutionStatus::Partial
-            },
-            findings: Vec::new(),
             evidence,
             diagnostics,
         })
@@ -1627,6 +1563,25 @@ fn provider_registry_calls(
     options: &BTreeMap<String, Value>,
 ) -> Option<Vec<ProviderCall>> {
     match id {
+        "dns-over-https" => {
+            let mut providers: Vec<_> = options
+                .get("providers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(doh_provider)
+                .collect();
+            if providers.is_empty() {
+                providers.extend(["cloudflare-doh", "google-doh"]);
+            }
+            Some(
+                providers
+                    .into_iter()
+                    .map(|provider| provider_call(provider, "resolve", None))
+                    .collect(),
+            )
+        }
         "performance-monitoring" => {
             let secret_env = options
                 .get("key")
@@ -1837,6 +1792,16 @@ fn provider_query(
                 Value::String(call.strategy.unwrap_or("mobile").into()),
             ),
         ]),
+        "cloudflare-doh" | "google-doh" => BTreeMap::from([
+            ("name".into(), Value::String(host)),
+            (
+                "type".into(),
+                options
+                    .get("qtype")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("A".into())),
+            ),
+        ]),
         "censys" if call.operation == "webproperty" => {
             BTreeMap::from([("target".into(), Value::String(format!("{host}:443")))])
         }
@@ -1862,6 +1827,8 @@ fn provider_source(provider: &str) -> &str {
         "censys" => "Censys (https://censys.com/)",
         "cloudflare-radar" => "Cloudflare Radar (https://radar.cloudflare.com/)",
         "pagespeed" => "PageSpeed Insights (https://pagespeed.web.dev/)",
+        "cloudflare-doh" => "Cloudflare DNS over HTTPS (https://cloudflare-dns.com/)",
+        "google-doh" => "Google Public DNS over HTTPS (https://dns.google/)",
         other => other,
     }
 }
@@ -2996,7 +2963,7 @@ mod tests {
                 descriptor.id
             );
         }
-        assert_eq!(provider_scanners, 36);
+        assert_eq!(provider_scanners, 37);
         Ok(())
     }
 
@@ -3018,6 +2985,36 @@ mod tests {
         );
         assert_eq!(query.get("resource"), Some(&json!("64496")));
         assert_eq!(query.get("prefix"), Some(&json!("192.0.2.0/24")));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_dns_plan_uses_only_allowlisted_providers_and_qtypes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let options = BTreeMap::from([
+            (
+                "providers".into(),
+                json!(["google", "unconfigured", "cloudflare"]),
+            ),
+            ("qtype".into(), json!("AAAA")),
+        ]);
+        let calls = provider_calls("dns-over-https", &target, &options);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].provider, "google-doh");
+        assert_eq!(calls[1].provider, "cloudflare-doh");
+        for call in calls {
+            let query = provider_query("dns-over-https", &call, &target, &options);
+            assert_eq!(query.get("name"), Some(&json!("example.com")));
+            assert_eq!(query.get("type"), Some(&json!("AAAA")));
+        }
+        assert!(
+            validate_scanner_controls(
+                "dns-over-https",
+                &BTreeMap::from([("qtype".into(), json!("unsupported"))]),
+            )
+            .is_err()
+        );
         Ok(())
     }
 
