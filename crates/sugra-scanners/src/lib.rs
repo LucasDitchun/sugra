@@ -2,7 +2,9 @@
 
 mod catalog_data;
 mod definition;
+mod dns_analysis;
 mod implementation;
+mod provider_analysis;
 mod semantics;
 mod web;
 mod web_analysis;

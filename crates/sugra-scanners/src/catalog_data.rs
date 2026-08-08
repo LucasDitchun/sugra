@@ -1100,7 +1100,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Intelligence,
             vec![TargetKind::Domain],
             vec![Capability::ThirdPartyApi],
-            &[],
+            &["expected_issuers"],
         )?,
         definition(
             LegacyId::Catalog(126),
@@ -1450,6 +1450,7 @@ fn option(name: &str) -> OptionDefinition {
         "status",
         "wordlist",
         "graphql",
+        "issuers",
     ]
     .iter()
     .any(|candidate| lower.contains(candidate))

@@ -24,6 +24,11 @@ use url::Url;
 
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
+use crate::dns_analysis::{
+    dnssec_findings, dual_stack_finding, email_config_findings, ttl_finding,
+    typosquat_resolution_finding,
+};
+use crate::provider_analysis::{ProviderBaseline, analyze_provider_response};
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
 use crate::web::{WebProbe, discovered, plan_for, should_sample};
 use crate::web_analysis::{
@@ -191,7 +196,7 @@ impl BuiltinScanner {
             stage_request.budget.max_requests = stage_limit;
             match self.execute_stage(analyzer, &stage_request, context).await {
                 Ok(result) => {
-                    merge_scan_result(&mut combined, self.annotate_result(analyzer, result))
+                    merge_scan_result(&mut combined, self.annotate_result(analyzer, result));
                 }
                 Err(error) => {
                     combined.status = ExecutionStatus::Partial;
@@ -258,6 +263,8 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut diagnostics = Vec::new();
         let mut findings = Vec::new();
+        let original_name = dns_name(&request.target).ok();
+        let mut aggregate_records = Vec::new();
         for query in plan.into_iter().take(request.budget.max_requests) {
             let started = Instant::now();
             let result = self
@@ -272,7 +279,15 @@ impl BuiltinScanner {
             match result {
                 Ok(records) => {
                     let index = evidence.len();
-                    analyze_dns(id, &query, &records, index, &mut findings);
+                    analyze_dns(
+                        id,
+                        original_name.as_deref(),
+                        &query,
+                        &records,
+                        index,
+                        &mut findings,
+                    );
+                    aggregate_records.extend(records.iter().cloned());
                     evidence.push(Evidence {
                         kind: "dns-records".into(),
                         source: query.name,
@@ -289,6 +304,11 @@ impl BuiltinScanner {
                     message: format!("{}: {}", query.name, error.message),
                 }),
             }
+        }
+        if matches!(id, "email-config" | "spf-dkim-dmarc-validator")
+            && let Some(domain) = original_name.as_deref()
+        {
+            findings.extend(email_config_findings(domain, &aggregate_records, 0));
         }
         if evidence.is_empty() {
             let message = diagnostics
@@ -537,6 +557,14 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let expected_issuers: Vec<_> = request
+            .options
+            .get("expected_issuers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         for call in calls.into_iter().take(request.budget.max_requests) {
             let response = self
                 .services
@@ -556,13 +584,14 @@ impl BuiltinScanner {
                 .await;
             match response {
                 Ok(response) => {
-                    let observation = redact_provider_data(&response.provider, response.data);
-                    findings.extend(analyze_provider(
+                    let (observation, derived_findings) = provider_observation(
                         self.descriptor.id.as_str(),
                         &response.provider,
-                        &observation,
+                        response.data,
+                        &expected_issuers,
                         evidence.len(),
-                    ));
+                    )?;
+                    findings.extend(derived_findings);
                     evidence.push(Evidence {
                         kind: "provider-observation".into(),
                         source: provider_source(&response.provider).into(),
@@ -894,6 +923,44 @@ impl BuiltinScanner {
             Vec::new(),
         ))
     }
+}
+
+fn provider_observation(
+    scanner_id: &str,
+    provider: &str,
+    data: Value,
+    expected_issuers: &[&str],
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let baseline = if expected_issuers.is_empty() {
+        ProviderBaseline::None
+    } else {
+        ProviderBaseline::CertificateIssuers(expected_issuers)
+    };
+    if let Some(analysis) = analyze_provider_response(scanner_id, provider, &data, baseline) {
+        let findings = analysis
+            .findings
+            .into_iter()
+            .map(|finding| Finding {
+                key: finding.key.into(),
+                title: finding.title.into(),
+                severity: finding.severity,
+                confidence: finding.confidence,
+                evidence: vec![evidence],
+            })
+            .collect();
+        let observation = serde_json::to_value(analysis.summary).map_err(|_| {
+            ScanError::new(
+                ScanErrorKind::Internal,
+                "provider summary serialization failed",
+            )
+        })?;
+        return Ok((observation, findings));
+    }
+
+    let observation = redact_provider_data(provider, data);
+    let findings = analyze_provider(scanner_id, provider, &observation, evidence);
+    Ok((observation, findings))
 }
 
 fn merge_scan_result(target: &mut ScanResult, mut source: ScanResult) {
@@ -1312,6 +1379,7 @@ fn dns_types(id: &str, request: &ScanRequest) -> Vec<DnsRecordType> {
 
 fn analyze_dns(
     id: &str,
+    original_name: Option<&str>,
     query: &DnsPlannedQuery,
     records: &[DnsRecord],
     evidence: usize,
@@ -1319,13 +1387,7 @@ fn analyze_dns(
 ) {
     let missing = records.is_empty();
     match id {
-        "dnssec" if missing => findings.push(finding(
-            "dnssec-not-observed",
-            "DNSSEC material was not observed",
-            Severity::Low,
-            Confidence::Confirmed,
-            evidence,
-        )),
+        "dnssec" => findings.extend(dnssec_findings(&query.name, records, evidence)),
         "dns-caa-checker" if missing => findings.push(finding(
             "caa-not-observed",
             "No CAA policy was observed",
@@ -1353,29 +1415,8 @@ fn analyze_dns(
                 evidence,
             ));
         }
-        "spf-dkim-dmarc-validator" if missing => findings.push(finding(
-            "mail-policy-not-observed",
-            "A sender-authentication policy record was not observed",
-            Severity::Low,
-            Confidence::Confirmed,
-            evidence,
-        )),
-        "email-config"
-            if query.record_types.contains(&DnsRecordType::Mx)
-                && !records
-                    .iter()
-                    .any(|record| record.record_type == DnsRecordType::Mx) =>
-        {
-            findings.push(finding(
-                "mail-exchanger-not-observed",
-                "No mail exchanger was observed",
-                Severity::Low,
-                Confidence::Confirmed,
-                evidence,
-            ));
-        }
         "dual-stack-behavior-profiler" | "dual-stack-diff" => {
-            if let Some(finding) = analyze_dns_dual_stack(records, evidence) {
+            if let Some(finding) = dual_stack_finding(records, evidence) {
                 findings.push(finding);
             }
         }
@@ -1395,38 +1436,20 @@ fn analyze_dns(
                 findings.push(finding);
             }
         }
-        "typosquat-domain-checker" if !missing => findings.push(finding(
-            "resolving-typo-candidate",
-            "A generated typo candidate returned public DNS records",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        )),
+        "typosquat-domain-checker" => {
+            if let Some(finding) = original_name.and_then(|original| {
+                typosquat_resolution_finding(original, &query.name, records, evidence)
+            }) {
+                findings.push(finding);
+            }
+        }
         "ttl-analysis" => {
-            if let Some(finding) = analyze_dns_ttl(records, evidence) {
+            if let Some(finding) = ttl_finding(records, evidence) {
                 findings.push(finding);
             }
         }
         _ => {}
     }
-}
-
-fn analyze_dns_dual_stack(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
-    let ipv4 = records
-        .iter()
-        .any(|record| record.record_type == DnsRecordType::A);
-    let ipv6 = records
-        .iter()
-        .any(|record| record.record_type == DnsRecordType::Aaaa);
-    (ipv4 != ipv6).then(|| {
-        finding(
-            "address-family-asymmetry",
-            "IPv4 and IPv6 publication differs",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        )
-    })
 }
 
 fn analyze_dns_takeover(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
@@ -1451,22 +1474,6 @@ fn analyze_dns_takeover(records: &[DnsRecord], evidence: usize) -> Option<Findin
             evidence,
         )
     })
-}
-
-fn analyze_dns_ttl(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
-    records
-        .iter()
-        .filter_map(|record| record.ttl)
-        .any(|ttl| ttl < 60)
-        .then(|| {
-            finding(
-                "short-dns-ttl",
-                "A DNS record uses a time-to-live below 60 seconds",
-                Severity::Info,
-                Confidence::Confirmed,
-                evidence,
-            )
-        })
 }
 
 fn doh_provider(value: &str) -> Option<&'static str> {
@@ -1854,6 +1861,7 @@ fn provider_source(provider: &str) -> &str {
         "urlscan" => "urlscan.io (https://urlscan.io/)",
         "censys" => "Censys (https://censys.com/)",
         "cloudflare-radar" => "Cloudflare Radar (https://radar.cloudflare.com/)",
+        "pagespeed" => "PageSpeed Insights (https://pagespeed.web.dev/)",
         other => other,
     }
 }
@@ -3213,11 +3221,11 @@ mod tests {
         let candidates = typo_candidates("example.com", 7);
         assert_eq!(candidates.len(), 7);
         assert_eq!(candidates.iter().collect::<BTreeSet<_>>().len(), 7);
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.ends_with(".com"))
-        );
+        assert!(candidates.iter().all(|candidate| {
+            candidate
+                .rsplit_once('.')
+                .is_some_and(|(_, tld)| tld == "com")
+        }));
         assert!(
             !candidates
                 .iter()
