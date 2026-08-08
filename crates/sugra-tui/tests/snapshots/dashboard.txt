@@ -1,0 +1,28 @@
+╭ SECURITY OPERATIONS CONSOLE ─────────────────────────────────────────────────────────────────╮
+│ SUGRA   DASHBOARD  |  [READY]                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ SCANNERS ────────────────────╮╭ ACTIVE ──────────────────────╮╭ RUNS ────────────────────────╮
+│               2              ││               1              ││               0              │
+│           available          ││    authorization required    ││         this session         │
+│                              ││                              ││                              │
+│                              ││                              ││                              │
+│                              ││                              ││                              │
+╰──────────────────────────────╯╰──────────────────────────────╯╰──────────────────────────────╯
+╭ QUICK ACTIONS ───────────────────────────────╮╭ OPERATIONAL POSTURE ─────────────────────────╮
+│[ENTER]  Open scanner catalog                 ││SAFE DEFAULTS                                 │
+│[H]      Review session history               ││Targets are typed and scope-bound.            │
+│[S]      Settings and diagnostics             ││Active capabilities require explicit consent. │
+│[?]      Help and safety guidance             ││Event output is bounded and redacted.         │
+│                                              ││                                              │
+│                                              ││No scans completed in this session.           │
+│                                              ││                                              │
+│                                              ││                                              │
+│                                              ││                                              │
+│                                              ││                                              │
+│                                              ││                                              │
+│                                              ││                                              │
+│                                              ││                                              │
+╰──────────────────────────────────────────────╯╰──────────────────────────────────────────────╯
+╭ KEY MAP ─────────────────────────────────────────────────────────────────────────────────────╮
+│                   Enter catalog | H history | S settings | ? help | Q quit                   │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
