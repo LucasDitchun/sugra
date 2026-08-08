@@ -90,7 +90,7 @@ jobs:
         with:
           key: coverage
       - name: Collect coverage
-        run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 70
+        run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 80
       - name: Print coverage summary
         run: cargo llvm-cov report --summary-only
       - name: Upload LCOV report
