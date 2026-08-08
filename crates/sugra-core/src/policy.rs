@@ -70,31 +70,88 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn active_boundary_is_denied_without_authorization() -> Result<(), Box<dyn std::error::Error>> {
-        let target = Target::parse(TargetKind::Domain, "example.com")?;
-        let descriptor = ScannerDescriptor {
+    fn descriptor(
+        target_kinds: Vec<TargetKind>,
+        capabilities: Vec<Capability>,
+    ) -> Result<ScannerDescriptor, Box<dyn std::error::Error>> {
+        Ok(ScannerDescriptor {
             id: ScannerId::new("active-test")?,
             legacy_id: Some(LegacyId::Catalog(1)),
             name: "Active test".into(),
             description: "test".into(),
             track: "test".into(),
-            target_kinds: vec![TargetKind::Domain],
-            capabilities: vec![Capability::ActiveProtocol],
+            target_kinds,
+            capabilities,
             options: Vec::new(),
             version: "1".into(),
-        };
-        let request = ScanRequest {
-            scanner_id: descriptor.id.clone(),
-            scope: ScopeGrant::exact(&target, false, OffsetDateTime::UNIX_EPOCH),
+        })
+    }
+
+    fn request(target: Target, scope_target: &Target, active_authorized: bool) -> ScanRequest {
+        ScanRequest {
+            scanner_id: ScannerId::new("active-test")
+                .unwrap_or_else(|error| unreachable!("valid test ID: {error}")),
+            scope: ScopeGrant::exact(scope_target, active_authorized, OffsetDateTime::UNIX_EPOCH),
             target,
             options: BTreeMap::new(),
             budget: Budget::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn active_boundary_is_denied_without_authorization() -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let descriptor = descriptor(vec![TargetKind::Domain], vec![Capability::ActiveProtocol])?;
+        let request = request(target.clone(), &target, false);
         assert!(matches!(
             evaluate_policy(&descriptor, &request),
             Err(PolicyError::AuthorizationRequired(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn passive_and_authorized_active_requests_return_explicit_decisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let passive_descriptor = descriptor(
+            vec![TargetKind::Domain],
+            vec![Capability::PassiveNetwork, Capability::SensitiveOutput],
+        )?;
+        let passive = evaluate_policy(
+            &passive_descriptor,
+            &request(target.clone(), &target, false),
+        )?;
+        assert!(!passive.active);
+        assert_eq!(passive.capabilities, passive_descriptor.capabilities);
+
+        let active_descriptor = descriptor(
+            vec![TargetKind::Domain],
+            vec![Capability::PassiveNetwork, Capability::ActiveHttpSafe],
+        )?;
+        let active = evaluate_policy(&active_descriptor, &request(target.clone(), &target, true))?;
+        assert!(active.active);
+        assert_eq!(active.capabilities, active_descriptor.capabilities);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_and_out_of_scope_targets_are_rejected_before_authorization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let ip = Target::parse(TargetKind::Ip, "192.0.2.10")?;
+        let descriptor = descriptor(vec![TargetKind::Domain], vec![Capability::ActiveProtocol])?;
+
+        assert_eq!(
+            evaluate_policy(&descriptor, &request(ip, &domain, false)),
+            Err(PolicyError::UnsupportedTarget("ip"))
+        );
+
+        let outside = Target::parse(TargetKind::Domain, "outside.example")?;
+        assert_eq!(
+            evaluate_policy(&descriptor, &request(outside, &domain, false)),
+            Err(PolicyError::OutOfScope)
+        );
         Ok(())
     }
 }

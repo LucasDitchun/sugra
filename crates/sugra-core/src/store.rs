@@ -105,29 +105,71 @@ impl RunStore {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
     use sugra_domain::{RunId, RunReport};
     use time::OffsetDateTime;
 
     use super::*;
 
-    #[tokio::test]
-    async fn report_is_written_once() -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
-        let store = RunStore::new(root.path())?;
-        let report = RunReport {
+    fn report() -> RunReport {
+        RunReport {
             schema_version: 1,
             run_id: RunId::new(),
             app_version: "test".into(),
             started_at: OffsetDateTime::UNIX_EPOCH,
             finished_at: OffsetDateTime::UNIX_EPOCH,
             executions: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn empty_and_parent_traversal_roots_are_rejected() {
+        assert!(matches!(RunStore::new(""), Err(StoreError::UnsafePath)));
+        assert!(matches!(
+            RunStore::new("../outside"),
+            Err(StoreError::UnsafePath)
+        ));
+        assert!(matches!(
+            RunStore::new("runs/../outside"),
+            Err(StoreError::UnsafePath)
+        ));
+        assert!(RunStore::new("runs/safe").is_ok());
+    }
+
+    #[tokio::test]
+    async fn report_is_written_once() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let store = RunStore::new(root.path())?;
+        let report = report();
         let artifact = store.persist(&report).await?;
-        assert!(root.path().join(&artifact.path).is_file());
+        let path = root.path().join(&artifact.path);
+        let bytes = tokio::fs::read(&path).await?;
+        assert!(path.is_file());
+        assert_eq!(artifact.media_type, "application/json");
+        assert_eq!(artifact.bytes, u64::try_from(bytes.len())?);
+        assert_eq!(artifact.sha256, hex::encode(Sha256::digest(&bytes)));
+        assert_eq!(artifact.path.file_name(), Some("report.json".as_ref()));
+        assert!(!path.with_file_name("report.json.tmp").exists());
         assert!(matches!(
             store.persist(&report).await,
             Err(StoreError::AlreadyExists(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filesystem_failures_are_typed_without_overwriting_the_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let file_root = root.path().join("not-a-directory");
+        tokio::fs::write(&file_root, b"preserve").await?;
+        let store = RunStore::new(&file_root)?;
+
+        assert!(matches!(
+            store.persist(&report()).await,
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(tokio::fs::read(file_root).await?, b"preserve");
         Ok(())
     }
 }

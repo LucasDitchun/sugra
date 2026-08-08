@@ -98,9 +98,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn html_escapes_scanner_identity_projection() -> Result<(), Box<dyn std::error::Error>> {
-        let report = RunReport {
+    fn report(status: ExecutionStatus) -> Result<RunReport, Box<dyn std::error::Error>> {
+        Ok(RunReport {
             schema_version: 1,
             run_id: RunId::new(),
             app_version: "test".into(),
@@ -109,19 +108,70 @@ mod tests {
             executions: vec![ScanExecution {
                 scanner_id: ScannerId::new("safe-id")?,
                 result: ScanResult {
-                    status: ExecutionStatus::Partial,
+                    status,
                     findings: Vec::new(),
                     evidence: Vec::new(),
                     diagnostics: vec![Diagnostic {
                         kind: "test".into(),
-                        message: "<script>".into(),
+                        message: "safe diagnostic".into(),
                     }],
                 },
-                duration_ms: 1,
+                duration_ms: 42,
             }],
-        };
-        let html = render_html(&report);
+        })
+    }
+
+    #[test]
+    fn html_escapes_scanner_identity_projection() -> Result<(), Box<dyn std::error::Error>> {
+        let html = render_html(&report(ExecutionStatus::Partial)?);
         assert!(!html.contains("<script>"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_projection_is_plain_text_with_execution_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let report = report(ExecutionStatus::Completed)?;
+        let terminal = render_terminal(&report);
+
+        assert!(terminal.starts_with(&format!("Run {} — Completed\n", report.run_id)));
+        assert!(terminal.contains("safe-id"));
+        assert!(terminal.contains("42 ms"));
+        assert!(terminal.contains("findings=0 evidence=0"));
+        assert!(!terminal.contains('\u{1b}'));
+        Ok(())
+    }
+
+    #[test]
+    fn csv_projection_uses_crlf_and_stable_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let csv = render_csv(&report(ExecutionStatus::Skipped)?);
+        assert_eq!(
+            csv,
+            "scanner_id,status,duration_ms,findings,evidence,diagnostics\r\nsafe-id,skipped,42,0,0,1\r\n"
+        );
+        assert!(!csv.replace("\r\n", "").contains('\n'));
+        Ok(())
+    }
+
+    #[test]
+    fn csv_cells_quote_delimiters_quotes_and_line_breaks() {
+        assert_eq!(csv_cell("plain"), "plain");
+        assert_eq!(csv_cell("comma,value"), "\"comma,value\"");
+        assert_eq!(csv_cell("quoted\"value"), "\"quoted\"\"value\"");
+        assert_eq!(csv_cell("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    #[test]
+    fn html_projection_is_self_contained_and_escapes_all_markup_characters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#39;");
+        let report = report(ExecutionStatus::Failed)?;
+        let html = render_html(&report);
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("<meta charset=\"utf-8\">"));
+        assert!(html.contains(&format!("<title>Sugra run {}</title>", report.run_id)));
+        assert!(html.contains("<td>safe-id</td><td>Failed</td><td>42</td>"));
+        assert!(html.ends_with("</html>"));
         Ok(())
     }
 }

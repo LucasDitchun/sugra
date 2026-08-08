@@ -366,3 +366,318 @@ fn cancelled_execution(scanner_id: ScannerId, duration_ms: u64) -> ScanExecution
 fn millis(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use sugra_domain::{Budget, Capability, ScannerDescriptor, ScopeGrant, Target, TargetKind};
+    use time::OffsetDateTime;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Behavior {
+        Complete,
+        Fail(ScanErrorKind),
+        Delay(Duration),
+    }
+
+    struct TestScanner {
+        descriptor: ScannerDescriptor,
+        behavior: Behavior,
+    }
+
+    #[async_trait]
+    impl Scanner for TestScanner {
+        fn descriptor(&self) -> &ScannerDescriptor {
+            &self.descriptor
+        }
+
+        async fn scan(
+            &self,
+            _request: &ScanRequest,
+            _context: &ScanContext,
+        ) -> Result<ScanResult, ScanError> {
+            match self.behavior {
+                Behavior::Complete => Ok(ScanResult::completed(Vec::new(), Vec::new())),
+                Behavior::Fail(kind) => Err(ScanError::new(kind, "safe failure")),
+                Behavior::Delay(duration) => {
+                    tokio::time::sleep(duration).await;
+                    Ok(ScanResult::completed(Vec::new(), Vec::new()))
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH
+        }
+    }
+
+    fn descriptor(id: &str, capabilities: Vec<Capability>) -> ScannerDescriptor {
+        ScannerDescriptor {
+            id: ScannerId::new(id).unwrap_or_else(|error| unreachable!("valid test ID: {error}")),
+            legacy_id: None,
+            name: id.into(),
+            description: "test scanner".into(),
+            track: "test".into(),
+            target_kinds: vec![TargetKind::Domain],
+            capabilities,
+            options: Vec::new(),
+            version: "1".into(),
+        }
+    }
+
+    fn scanner(id: &str, behavior: Behavior, capabilities: Vec<Capability>) -> Arc<dyn Scanner> {
+        Arc::new(TestScanner {
+            descriptor: descriptor(id, capabilities),
+            behavior,
+        })
+    }
+
+    fn request(id: &str, active_authorized: bool) -> ScanRequest {
+        let target = Target::parse(TargetKind::Domain, "example.com")
+            .unwrap_or_else(|error| unreachable!("valid test target: {error}"));
+        ScanRequest {
+            scanner_id: ScannerId::new(id)
+                .unwrap_or_else(|error| unreachable!("valid test ID: {error}")),
+            scope: ScopeGrant::exact(&target, active_authorized, OffsetDateTime::UNIX_EPOCH),
+            target,
+            options: BTreeMap::new(),
+            budget: Budget::default(),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_duplicates_and_supports_lookup() -> Result<(), EngineError> {
+        let empty = ScannerRegistry::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let registered = scanner(
+            "registered",
+            Behavior::Complete,
+            vec![Capability::PassiveNetwork],
+        );
+        let registry = ScannerRegistry::new(vec![Arc::clone(&registered)])?;
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(&registered.descriptor().id).is_some());
+
+        let duplicate = ScannerRegistry::new(vec![Arc::clone(&registered), registered]);
+        assert!(matches!(duplicate, Err(EngineError::ScannerMismatch(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_invalid_setup_requests_and_budgets() -> Result<(), EngineError> {
+        assert!(matches!(
+            Engine::new(ScannerRegistry::default(), Arc::new(FixedClock), 0),
+            Err(EngineError::InvalidConcurrency)
+        ));
+
+        let engine = Engine::new(ScannerRegistry::default(), Arc::new(FixedClock), 1)?;
+        assert!(matches!(
+            engine.validate(&[request("missing", false)]),
+            Err(EngineError::ScannerNotRegistered(_))
+        ));
+
+        let active = scanner(
+            "active",
+            Behavior::Complete,
+            vec![Capability::ActiveProtocol],
+        );
+        let engine = Engine::new(ScannerRegistry::new(vec![active])?, Arc::new(FixedClock), 1)?;
+        assert!(matches!(
+            engine.validate(&[request("active", false)]),
+            Err(EngineError::PolicyRejected { .. })
+        ));
+
+        let mut invalid_budget = request("active", true);
+        invalid_budget.budget.timeout_ms = 0;
+        assert!(matches!(
+            engine.validate(&[invalid_budget]),
+            Err(EngineError::PolicyRejected { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_preserves_plan_order_and_emits_terminal_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scanners = vec![
+            scanner(
+                "slow-success",
+                Behavior::Delay(Duration::from_millis(15)),
+                vec![Capability::PassiveNetwork],
+            ),
+            scanner(
+                "unavailable",
+                Behavior::Fail(ScanErrorKind::DependencyUnavailable),
+                vec![Capability::PassiveNetwork],
+            ),
+            scanner(
+                "invalid-response",
+                Behavior::Fail(ScanErrorKind::InvalidResponse),
+                vec![Capability::PassiveNetwork],
+            ),
+            scanner(
+                "timeout",
+                Behavior::Delay(Duration::from_millis(50)),
+                vec![Capability::PassiveNetwork],
+            ),
+        ];
+        let engine = Engine::new(ScannerRegistry::new(scanners)?, Arc::new(FixedClock), 4)?;
+        let mut requests = vec![
+            request("slow-success", false),
+            request("unavailable", false),
+            request("invalid-response", false),
+            request("timeout", false),
+        ];
+        requests[3].budget.timeout_ms = 1;
+        let (sender, mut receiver) = broadcast::channel(32);
+
+        let report = engine
+            .execute(requests, CancellationToken::new(), Some(sender))
+            .await?;
+
+        assert_eq!(report.started_at, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(report.finished_at, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(
+            report
+                .executions
+                .iter()
+                .map(|execution| execution.scanner_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slow-success", "unavailable", "invalid-response", "timeout"]
+        );
+        assert_eq!(
+            report
+                .executions
+                .iter()
+                .map(|execution| execution.result.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ExecutionStatus::Completed,
+                ExecutionStatus::Skipped,
+                ExecutionStatus::Failed,
+                ExecutionStatus::Failed,
+            ]
+        );
+        assert_eq!(report.status(), ExecutionStatus::Failed);
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(matches!(
+            events.first(),
+            Some(RunEvent::Planned { scanners: 4, .. })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::ScanStarted { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::ScanFinished { .. }))
+                .count(),
+            4
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Completed {
+                status: ExecutionStatus::Failed,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_running_and_waiting_scanners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scanners = vec![
+            scanner(
+                "first",
+                Behavior::Delay(Duration::from_secs(1)),
+                vec![Capability::PassiveNetwork],
+            ),
+            scanner(
+                "second",
+                Behavior::Delay(Duration::from_secs(1)),
+                vec![Capability::PassiveNetwork],
+            ),
+        ];
+        let engine = Engine::new(ScannerRegistry::new(scanners)?, Arc::new(FixedClock), 1)?;
+        let cancellation = CancellationToken::new();
+        let (sender, mut receiver) = broadcast::channel(16);
+        let execution = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                engine
+                    .execute(
+                        vec![request("first", false), request("second", false)],
+                        cancellation,
+                        Some(sender),
+                    )
+                    .await
+            }
+        });
+
+        loop {
+            if matches!(receiver.recv().await?, RunEvent::ScanStarted { .. }) {
+                break;
+            }
+        }
+        cancellation.cancel();
+        let report = execution.await??;
+
+        assert!(
+            report
+                .executions
+                .iter()
+                .all(|execution| execution.result.status == ExecutionStatus::Cancelled)
+        );
+        assert!(report.executions.iter().any(|execution| {
+            execution
+                .result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "scan cancelled before it started")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn scanner_failures_map_to_safe_terminal_results() {
+        let cases = [
+            (ScanErrorKind::Cancelled, ExecutionStatus::Cancelled),
+            (
+                ScanErrorKind::DependencyUnavailable,
+                ExecutionStatus::Skipped,
+            ),
+            (ScanErrorKind::PolicyDenied, ExecutionStatus::Skipped),
+            (ScanErrorKind::InvalidInput, ExecutionStatus::Failed),
+            (ScanErrorKind::Timeout, ExecutionStatus::Failed),
+            (ScanErrorKind::Transport, ExecutionStatus::Failed),
+            (ScanErrorKind::InvalidResponse, ExecutionStatus::Failed),
+            (ScanErrorKind::Internal, ExecutionStatus::Failed),
+        ];
+        for (kind, expected) in cases {
+            let result = failed_result(ScanError::new(kind, "safe message"));
+            assert_eq!(result.status, expected);
+            assert!(result.findings.is_empty());
+            assert!(result.evidence.is_empty());
+            assert_eq!(result.diagnostics[0].message, "safe message");
+        }
+        assert_eq!(millis(u128::MAX), u64::MAX);
+    }
+}

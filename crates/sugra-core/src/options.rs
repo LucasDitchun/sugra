@@ -142,4 +142,199 @@ mod tests {
         assert_eq!(supplied, original);
         Ok(())
     }
+
+    fn definition(
+        key: &str,
+        kind: OptionKind,
+        default: Option<&str>,
+        required: bool,
+    ) -> OptionDefinition {
+        OptionDefinition {
+            key: key.into(),
+            description: format!("{key} option"),
+            kind,
+            default: default.map(Into::into),
+            required,
+        }
+    }
+
+    #[test]
+    fn every_option_kind_resolves_to_typed_json() -> Result<(), OptionError> {
+        let definitions = vec![
+            definition("enabled", OptionKind::Boolean, None, true),
+            definition(
+                "retries",
+                OptionKind::Integer { min: 0, max: 3 },
+                None,
+                true,
+            ),
+            definition("label", OptionKind::Text { max_len: 8 }, None, true),
+            definition(
+                "mode",
+                OptionKind::Choice {
+                    values: vec!["safe".into(), "strict".into()],
+                },
+                None,
+                true,
+            ),
+            definition("ports", OptionKind::List { max_items: 3 }, None, true),
+            definition("credential", OptionKind::SecretRef, None, true),
+        ];
+        let supplied = BTreeMap::from([
+            ("enabled".into(), "true".into()),
+            ("retries".into(), "3".into()),
+            ("label".into(), "bounded".into()),
+            ("mode".into(), "strict".into()),
+            ("ports".into(), "80, 443,,8080".into()),
+            ("credential".into(), "SUGRA_TEST_TOKEN_2".into()),
+        ]);
+
+        let resolved = resolve_options(&definitions, &supplied)?;
+
+        assert_eq!(resolved.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(resolved.get("retries"), Some(&Value::from(3)));
+        assert_eq!(resolved.get("label"), Some(&Value::from("bounded")));
+        assert_eq!(resolved.get("mode"), Some(&Value::from("strict")));
+        assert_eq!(
+            resolved.get("ports"),
+            Some(&Value::Array(vec![
+                Value::from("80"),
+                Value::from("443"),
+                Value::from("8080"),
+            ]))
+        );
+        assert_eq!(
+            resolved.get("credential"),
+            Some(&Value::from("SUGRA_TEST_TOKEN_2"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_are_parsed_and_absent_optional_values_are_omitted() -> Result<(), OptionError> {
+        let definitions = vec![
+            definition("enabled", OptionKind::Boolean, Some("false"), false),
+            definition("optional", OptionKind::Text { max_len: 4 }, None, false),
+            definition(
+                "empty-list",
+                OptionKind::List { max_items: 0 },
+                Some(""),
+                false,
+            ),
+        ];
+
+        let resolved = resolve_options(&definitions, &BTreeMap::new())?;
+
+        assert_eq!(resolved.get("enabled"), Some(&Value::Bool(false)));
+        assert!(!resolved.contains_key("optional"));
+        assert_eq!(resolved.get("empty-list"), Some(&Value::Array(Vec::new())));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_and_missing_options_are_distinct_errors() {
+        let required = definition("required", OptionKind::Boolean, None, true);
+        assert_eq!(
+            resolve_options(
+                std::slice::from_ref(&required),
+                &BTreeMap::from([("unexpected".into(), "true".into())]),
+            ),
+            Err(OptionError::Unknown("unexpected".into()))
+        );
+        assert_eq!(
+            resolve_options(&[required], &BTreeMap::new()),
+            Err(OptionError::Missing("required".into()))
+        );
+    }
+
+    #[test]
+    fn invalid_values_report_the_declared_key_without_echoing_input() {
+        let cases = [
+            (
+                definition("boolean", OptionKind::Boolean, None, true),
+                "yes",
+                "expected true or false",
+            ),
+            (
+                definition(
+                    "integer",
+                    OptionKind::Integer { min: 1, max: 2 },
+                    None,
+                    true,
+                ),
+                "3",
+                "integer is outside the accepted range",
+            ),
+            (
+                definition("text", OptionKind::Text { max_len: 3 }, None, true),
+                "four",
+                "text exceeds its limit or contains a null byte",
+            ),
+            (
+                definition(
+                    "choice",
+                    OptionKind::Choice {
+                        values: vec!["one".into()],
+                    },
+                    None,
+                    true,
+                ),
+                "two",
+                "value is not one of the declared choices",
+            ),
+            (
+                definition("list", OptionKind::List { max_items: 1 }, None, true),
+                "one,two",
+                "list exceeds its item limit",
+            ),
+            (
+                definition("secret", OptionKind::SecretRef, None, true),
+                "lowercase-secret",
+                "secret reference must be an environment variable name",
+            ),
+        ];
+
+        for (definition, raw, expected_message) in cases {
+            let key = definition.key.clone();
+            let result = resolve_options(
+                std::slice::from_ref(&definition),
+                &BTreeMap::from([(key.clone(), raw.into())]),
+            );
+            assert_eq!(
+                result,
+                Err(OptionError::Invalid {
+                    key,
+                    message: expected_message.into(),
+                })
+            );
+            assert!(
+                !result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
+                    .contains(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn text_null_bytes_and_oversized_secret_names_are_rejected() {
+        let text = definition("text", OptionKind::Text { max_len: 32 }, None, true);
+        assert!(
+            resolve_options(
+                &[text],
+                &BTreeMap::from([("text".into(), "safe\0hidden".into())]),
+            )
+            .is_err()
+        );
+
+        let secret = definition("secret", OptionKind::SecretRef, None, true);
+        assert!(
+            resolve_options(
+                &[secret],
+                &BTreeMap::from([("secret".into(), "A".repeat(129))]),
+            )
+            .is_err()
+        );
+    }
 }

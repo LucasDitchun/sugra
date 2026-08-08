@@ -494,3 +494,41 @@ pub struct ServiceBundle {
     /// Clock boundary.
     pub clock: Arc<dyn Clock>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_errors_have_a_safe_message_and_no_implicit_retry() {
+        let error = PortError::new(
+            PortErrorKind::RateLimited,
+            "provider rate limited the request",
+        );
+        assert_eq!(error.kind, PortErrorKind::RateLimited);
+        assert_eq!(error.message, "provider rate limited the request");
+        assert_eq!(error.retry_after_ms, None);
+        assert_eq!(error.to_string(), "provider rate limited the request");
+    }
+
+    #[test]
+    fn dns_record_type_spellings_are_complete_and_stable() {
+        let cases = [
+            (DnsRecordType::A, "A"),
+            (DnsRecordType::Aaaa, "AAAA"),
+            (DnsRecordType::Cname, "CNAME"),
+            (DnsRecordType::Mx, "MX"),
+            (DnsRecordType::Ns, "NS"),
+            (DnsRecordType::Soa, "SOA"),
+            (DnsRecordType::Txt, "TXT"),
+            (DnsRecordType::Srv, "SRV"),
+            (DnsRecordType::Caa, "CAA"),
+            (DnsRecordType::Dnskey, "DNSKEY"),
+            (DnsRecordType::Ds, "DS"),
+            (DnsRecordType::Ptr, "PTR"),
+        ];
+        for (record_type, spelling) in cases {
+            assert_eq!(record_type.as_str(), spelling);
+        }
+    }
+}
