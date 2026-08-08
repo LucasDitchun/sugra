@@ -4,9 +4,13 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION, SET_COOKIE};
 use reqwest::{Client, Method, redirect};
-use sugra_core::{HttpMethod, HttpPort, HttpRequest, HttpResponse, PortError, PortErrorKind};
+use sha2::{Digest, Sha256};
+use sugra_core::{
+    HttpCookie, HttpMethod, HttpPort, HttpRedirect, HttpRequest, HttpResponse, PortError,
+    PortErrorKind,
+};
 use sugra_domain::{Target, TargetKind};
 
 /// Reqwest client configured to disable automatic redirects and require Rustls.
@@ -24,6 +28,7 @@ impl ReqwestHttp {
     /// initialized.
     pub fn new() -> Result<Self, PortError> {
         let client = Client::builder()
+            .no_proxy()
             .redirect(redirect::Policy::none())
             .user_agent(concat!("sugra/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -44,6 +49,7 @@ impl HttpPort for ReqwestHttp {
         let mut method = request.method;
         let headers = request_headers(&request.headers)?;
         let started = Instant::now();
+        let mut redirects = Vec::new();
         for redirect_count in 0..=request.max_redirects {
             ensure_url_in_scope(&request.scope, &url)?;
             let mut builder = self
@@ -75,12 +81,18 @@ impl HttpPort for ReqwestHttp {
                             "HTTP redirect omitted Location",
                         )
                     })?;
-                url = response.url().join(location).map_err(|_| {
+                let next = response.url().join(location).map_err(|_| {
                     PortError::new(
                         PortErrorKind::InvalidResponse,
                         "HTTP redirect has an invalid URL",
                     )
                 })?;
+                redirects.push(HttpRedirect {
+                    status: response.status().as_u16(),
+                    from: response.url().clone(),
+                    to: next.clone(),
+                });
+                url = next;
                 if response.status().as_u16() == 303
                     || (matches!(response.status().as_u16(), 301 | 302)
                         && method == HttpMethod::Post)
@@ -102,6 +114,7 @@ impl HttpPort for ReqwestHttp {
             let status = response.status().as_u16();
             let final_url = response.url().clone();
             let response_headers = response_headers(response.headers());
+            let cookies = response_cookies(response.headers());
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| {
                 PortError::new(PortErrorKind::Transport, "HTTP response body failed")
@@ -118,6 +131,8 @@ impl HttpPort for ReqwestHttp {
                 final_url,
                 status,
                 headers: response_headers,
+                cookies,
+                redirects,
                 body,
                 duration_ms: millis(started.elapsed().as_millis()),
             });
@@ -150,25 +165,79 @@ fn request_headers(values: &BTreeMap<String, String>) -> Result<HeaderMap, PortE
 }
 
 fn response_headers(values: &HeaderMap) -> BTreeMap<String, String> {
-    values
+    let mut headers: BTreeMap<_, _> = values
         .iter()
+        .filter(|(name, _)| *name != SET_COOKIE)
         .map(|(name, value)| {
             let text = value.to_str().unwrap_or("<non-text>");
-            let safe = if name.as_str().eq_ignore_ascii_case("set-cookie") {
-                redact_cookie(text)
-            } else {
-                text.chars().take(4096).collect()
-            };
+            let safe = text.chars().take(4096).collect();
             (name.as_str().to_ascii_lowercase(), safe)
         })
+        .collect();
+    let cookie_count = values.get_all(SET_COOKIE).iter().count();
+    if cookie_count > 0 {
+        headers.insert(
+            "set-cookie".into(),
+            format!("<redacted>; count={cookie_count}"),
+        );
+    }
+    headers
+}
+
+fn response_cookies(values: &HeaderMap) -> Vec<HttpCookie> {
+    values
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(parse_cookie_metadata)
+        .take(256)
         .collect()
 }
 
-fn redact_cookie(value: &str) -> String {
-    value.split_once(';').map_or_else(
-        || "<redacted>".into(),
-        |(_, attributes)| format!("<redacted>;{attributes}"),
-    )
+fn parse_cookie_metadata(value: &str) -> Option<HttpCookie> {
+    let mut segments = value.split(';');
+    let (name, _) = segments.next()?.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut cookie = HttpCookie {
+        name_sha256: hex::encode(Sha256::digest(name.as_bytes())),
+        domain: None,
+        path: None,
+        secure: false,
+        http_only: false,
+        same_site: None,
+        max_age_seconds: None,
+    };
+    for segment in segments {
+        let (name, value) = segment
+            .split_once('=')
+            .map_or((segment.trim(), None), |(name, value)| {
+                (name.trim(), Some(value.trim()))
+            });
+        match name.to_ascii_lowercase().as_str() {
+            "secure" => cookie.secure = true,
+            "httponly" => cookie.http_only = true,
+            "domain" => cookie.domain = value.map(bounded_cookie_attribute),
+            "path" => cookie.path = value.map(bounded_cookie_attribute),
+            "samesite" => {
+                cookie.same_site = value.and_then(|value| match value.to_ascii_lowercase().as_str() {
+                    "strict" => Some("strict".into()),
+                    "lax" => Some("lax".into()),
+                    "none" => Some("none".into()),
+                    _ => None,
+                });
+            }
+            "max-age" => cookie.max_age_seconds = value.and_then(|value| value.parse().ok()),
+            _ => {}
+        }
+    }
+    Some(cookie)
+}
+
+fn bounded_cookie_attribute(value: &str) -> String {
+    value.chars().take(256).collect()
 }
 
 fn ensure_url_in_scope(scope: &sugra_domain::ScopeGrant, url: &url::Url) -> Result<(), PortError> {
@@ -210,26 +279,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cookie_values_are_redacted_but_security_attributes_remain() {
-        assert_eq!(
-            redact_cookie("session=secret; Secure; HttpOnly; SameSite=Lax"),
-            "<redacted>; Secure; HttpOnly; SameSite=Lax"
-        );
-        assert_eq!(redact_cookie("session=secret"), "<redacted>");
+    fn cookie_values_are_discarded_but_security_attributes_remain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cookie = parse_cookie_metadata(
+            "session=secret; Domain=example.com; Path=/account; Secure; HttpOnly; SameSite=Lax; Max-Age=600",
+        )
+        .ok_or("cookie metadata was not parsed")?;
+        assert_eq!(cookie.name_sha256.len(), 64);
+        assert_eq!(cookie.domain.as_deref(), Some("example.com"));
+        assert_eq!(cookie.path.as_deref(), Some("/account"));
+        assert!(cookie.secure);
+        assert!(cookie.http_only);
+        assert_eq!(cookie.same_site.as_deref(), Some("lax"));
+        assert_eq!(cookie.max_age_seconds, Some(600));
+        assert!(!serde_json::to_string(&cookie)?.contains("secret"));
+        Ok(())
     }
 
     #[test]
-    fn response_headers_never_expose_cookie_values() {
+    fn response_headers_never_expose_cookie_values() -> Result<(), Box<dyn std::error::Error>> {
         let mut headers = HeaderMap::new();
         headers.insert(
             SET_COOKIE,
             HeaderValue::from_static("session=secret; Secure; HttpOnly"),
         );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("preference=value; SameSite=Lax"),
+        );
         let safe = response_headers(&headers);
         assert_eq!(
             safe.get("set-cookie").map(String::as_str),
-            Some("<redacted>; Secure; HttpOnly")
+            Some("<redacted>; count=2")
         );
+        let cookies = response_cookies(&headers);
+        assert_eq!(cookies.len(), 2);
+        let serialized = serde_json::to_string(&cookies)?;
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("value"));
+        Ok(())
     }
 
     #[test]

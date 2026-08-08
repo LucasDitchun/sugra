@@ -15,10 +15,10 @@ pub use options::{OptionError, resolve_options};
 pub use policy::{PolicyDecision, PolicyError, evaluate_policy};
 pub use ports::{
     Clock, CommandKind, CommandPort, CommandRequest, CommandResponse, DnsPort, DnsQuery, DnsRecord,
-    DnsRecordType, HttpMethod, HttpPort, HttpRequest, HttpResponse, PortError, PortErrorKind,
-    ProviderPort, ProviderRequest, ProviderResponse, ServiceBundle, TcpPort, TcpRequest,
-    TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest, UdpPort,
-    UdpRequest, UdpResponse,
+    DnsRecordType, HttpCookie, HttpMethod, HttpPort, HttpRedirect, HttpRequest, HttpResponse,
+    PortError, PortErrorKind, ProviderPort, ProviderRequest, ProviderResponse, ServiceBundle,
+    TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort,
+    TlsRequest, UdpPort, UdpRequest, UdpResponse,
 };
 pub use report::{render_csv, render_html, render_terminal};
 pub use scanner::{ScanContext, ScanError, ScanErrorKind, Scanner};

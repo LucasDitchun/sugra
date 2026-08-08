@@ -171,6 +171,36 @@ pub struct HttpRequest {
     pub scope: ScopeGrant,
 }
 
+/// Safe metadata for one `Set-Cookie` response header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCookie {
+    /// SHA-256 fingerprint of the cookie name; the value is never retained.
+    pub name_sha256: String,
+    /// Declared cookie domain, when present.
+    pub domain: Option<String>,
+    /// Declared cookie path, when present.
+    pub path: Option<String>,
+    /// Whether the `Secure` attribute is present.
+    pub secure: bool,
+    /// Whether the `HttpOnly` attribute is present.
+    pub http_only: bool,
+    /// Normalized `SameSite` attribute, when present.
+    pub same_site: Option<String>,
+    /// Declared maximum lifetime in seconds, when present.
+    pub max_age_seconds: Option<i64>,
+}
+
+/// One manually validated HTTP redirect hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRedirect {
+    /// Redirect response status.
+    pub status: u16,
+    /// URL that returned the redirect.
+    pub from: Url,
+    /// Scoped destination resolved from `Location`.
+    pub to: Url,
+}
+
 /// Normalized HTTP response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpResponse {
@@ -180,6 +210,10 @@ pub struct HttpResponse {
     pub status: u16,
     /// Lowercase response headers with redacted values where required.
     pub headers: BTreeMap<String, String>,
+    /// Redacted metadata for every response cookie.
+    pub cookies: Vec<HttpCookie>,
+    /// Redirect hops followed by the boundary.
+    pub redirects: Vec<HttpRedirect>,
     /// Bounded response body.
     pub body: Vec<u8>,
     /// Observed duration in milliseconds.

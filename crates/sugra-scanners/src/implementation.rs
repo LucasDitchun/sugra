@@ -2676,6 +2676,8 @@ mod tests {
                     ),
                     ("x-content-type-options".into(), "nosniff".into()),
                 ]),
+                cookies: Vec::new(),
+                redirects: Vec::new(),
                 body: b"<html><title>Fixture</title><a href='/next'>Next</a></html>".to_vec(),
                 duration_ms: 1,
             })
