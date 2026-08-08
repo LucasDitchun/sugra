@@ -20,6 +20,7 @@ pub(crate) struct WebSignals {
     pub(crate) scripts: usize,
     pub(crate) inline_scripts: usize,
     pub(crate) external_script_hosts: Vec<String>,
+    pub(crate) external_integration_hosts: Vec<String>,
     pub(crate) external_scripts_without_integrity: usize,
     pub(crate) forms: usize,
     pub(crate) inputs: usize,
@@ -97,6 +98,8 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         || (Vec::new(), 0),
         |selector| external_scripts(&document, &selector, &response.final_url, base_host),
     );
+    let external_integration_hosts =
+        external_integration_hosts(&document, &response.final_url, base_host);
     let password_selector = selector("input[type='password' i]");
     let password_inputs = count_selected(&document, password_selector.as_ref());
     WebSignals {
@@ -105,6 +108,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         scripts,
         inline_scripts,
         external_script_hosts,
+        external_integration_hosts,
         external_scripts_without_integrity,
         forms: count(&document, "form"),
         inputs: count(&document, "input, textarea, select"),
@@ -113,7 +117,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         sensitive_autocomplete_inputs: sensitive_autocomplete(&document),
         password_get_forms: password_get_forms(&document),
         hidden_inputs: count(&document, "input[type='hidden' i]"),
-        comments: lower.matches("<!--").count(),
+        comments: html_comment_count(response, &document),
         iframes: count(&document, "iframe"),
         unsandboxed_iframes: count(&document, "iframe:not([sandbox])"),
         embedded_objects: count(&document, "object, embed, applet"),
@@ -122,7 +126,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         tracking_pixels: tracking_pixels(&document),
         email_fingerprints: email_fingerprints(&text),
         social_links: link_host_count(&document, &response.final_url, social_host),
-        websocket_references: marker_count(&lower, &["ws://", "wss://", "websocket("]),
+        websocket_references: websocket_reference_count(response, &document, &lower),
         api_references: marker_count(
             &lower,
             &[
@@ -144,7 +148,9 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
                 "insertadjacenthtml",
             ],
         ),
-        obfuscation_markers: marker_count(
+        obfuscation_markers: executable_marker_count(
+            response,
+            &document,
             &lower,
             &["fromcharcode", "unescape(", "eval(", "atob(", "\\x"],
         ),
@@ -189,8 +195,8 @@ pub(crate) fn observation(
         "cookies": response.cookies.iter().take(128).map(safe_cookie).collect::<Vec<_>>(),
         "redirects": response.redirects.iter().map(|redirect| json!({
             "status": redirect.status,
-            "from": safe_url(&redirect.from),
-            "to": safe_url(&redirect.to),
+            "from": safe_redirect_url(&redirect.from),
+            "to": safe_redirect_url(&redirect.to),
             "decision": format!("{:?}", redirect.decision).to_ascii_lowercase(),
         })).collect::<Vec<_>>(),
         "bytes": response.body.len(),
@@ -441,9 +447,66 @@ fn executable_marker_count(
     selector("script:not([src])").map_or(0, |selector| {
         document
             .select(&selector)
+            .filter(|script| is_executable_script_type(script.value().attr("type")))
             .map(|script| marker_count(&script.inner_html().to_ascii_lowercase(), markers))
             .sum()
     })
+}
+
+fn is_executable_script_type(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "module"
+                | "text/javascript"
+                | "application/javascript"
+                | "text/ecmascript"
+                | "application/ecmascript"
+        )
+    })
+}
+
+fn html_comment_count(response: &HttpResponse, document: &Html) -> usize {
+    if !is_html_response(response) {
+        return 0;
+    }
+    let parsed = document
+        .tree
+        .nodes()
+        .filter(|node| node.value().is_comment())
+        .take(256)
+        .count();
+    let source = String::from_utf8_lossy(&response.body);
+    parsed.min(
+        source
+            .matches("<!--")
+            .count()
+            .min(source.matches("-->").count()),
+    )
+}
+
+fn websocket_reference_count(response: &HttpResponse, document: &Html, lower: &str) -> usize {
+    let executable = executable_marker_count(
+        response,
+        document,
+        lower,
+        &["ws://", "wss://", "websocket("],
+    );
+    let structured = selector("[href], [src], [data-url], [data-endpoint]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|element| {
+                ["href", "src", "data-url", "data-endpoint"]
+                    .iter()
+                    .filter_map(|attribute| element.value().attr(attribute))
+                    .any(|value| {
+                        let value = value.trim().to_ascii_lowercase();
+                        value.starts_with("ws://") || value.starts_with("wss://")
+                    })
+            })
+            .count()
+    });
+    executable.saturating_add(structured)
 }
 
 fn recognized_generator(document: &Html) -> Option<String> {
@@ -539,6 +602,16 @@ fn safe_url(url: &Url) -> String {
     safe.to_string()
 }
 
+fn safe_redirect_url(url: &Url) -> String {
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.set_path("/");
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.to_string()
+}
+
 fn safe_probe_label(label: &str) -> String {
     let Some((kind, value)) = label.split_once(':') else {
         return label.chars().take(128).collect();
@@ -584,6 +657,51 @@ fn external_scripts(
         }
     }
     (hosts.into_iter().take(128).collect(), missing_integrity)
+}
+
+fn external_integration_hosts(document: &Html, base: &Url, base_host: &str) -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+    let Some(selector) = selector(
+        "script[src], iframe[src], embed[src], object[data], form[action], link[href][rel]",
+    ) else {
+        return Vec::new();
+    };
+    for element in document.select(&selector) {
+        let name = element.value().name();
+        if name == "link"
+            && !element.value().attr("rel").is_some_and(|rel| {
+                rel.split_ascii_whitespace().any(|token| {
+                    matches!(
+                        token.to_ascii_lowercase().as_str(),
+                        "preconnect" | "dns-prefetch" | "stylesheet" | "preload" | "modulepreload"
+                    )
+                })
+            })
+        {
+            continue;
+        }
+        let attribute = match name {
+            "object" => "data",
+            "form" => "action",
+            "link" => "href",
+            _ => "src",
+        };
+        let Some(host) = element
+            .value()
+            .attr(attribute)
+            .and_then(|value| base.join(value).ok())
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        else {
+            continue;
+        };
+        if !host.eq_ignore_ascii_case(base_host) {
+            hosts.insert(host);
+        }
+        if hosts.len() == 128 {
+            break;
+        }
+    }
+    hosts.into_iter().collect()
 }
 
 fn sensitive_autocomplete(document: &Html) -> usize {
@@ -685,7 +803,6 @@ fn api_findings(
     signals: &WebSignals,
     evidence: usize,
 ) -> Vec<Finding> {
-    let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
         "api-schema-grabber" if response.status == 200 && is_api_schema(&response.body) => one(
             "api-schema-published",
@@ -709,9 +826,7 @@ fn api_findings(
             evidence,
         ),
         "graphql-introspection-probe"
-            if response.status == 200
-                && lower.contains("__schema")
-                && lower.contains("querytype") =>
+            if response.status == 200 && is_graphql_introspection(&response.body) =>
         {
             one(
                 "graphql-introspection-enabled",
@@ -729,11 +844,10 @@ fn api_findings(
             evidence,
         ),
         "http-method-enumerator"
-            if response.headers.get("allow").is_some_and(|allow| {
-                ["PUT", "DELETE", "TRACE", "CONNECT"]
-                    .iter()
-                    .any(|method| allow.to_ascii_uppercase().contains(method))
-            }) =>
+            if response
+                .headers
+                .get("allow")
+                .is_some_and(|allow| advertises_sensitive_method(allow)) =>
         {
             one(
                 "state-changing-http-method-advertised",
@@ -752,6 +866,21 @@ fn api_findings(
         ),
         _ => Vec::new(),
     }
+}
+
+fn is_graphql_introspection(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|document| document.pointer("/data/__schema/queryType").cloned())
+        .is_some_and(|query_type| query_type.is_object())
+}
+
+fn advertises_sensitive_method(allow: &str) -> bool {
+    allow.split(',').map(str::trim).any(|candidate| {
+        ["POST", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT"]
+            .iter()
+            .any(|method| candidate.eq_ignore_ascii_case(method))
+    })
 }
 
 fn is_api_schema(body: &[u8]) -> bool {
@@ -850,13 +979,20 @@ fn detection_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "technology-stack" if signals.generator.is_some() || headers.contains_key("server") => one(
-            "technology-signal-observed",
-            "Public technology-identification metadata is present",
-            Severity::Info,
-            Confidence::Inferred,
-            evidence,
-        ),
+        "technology-stack"
+            if signals.generator.is_some()
+                || headers
+                    .get("server")
+                    .is_some_and(|value| !value.trim().is_empty()) =>
+        {
+            one(
+                "technology-signal-observed",
+                "Public technology-identification metadata is present",
+                Severity::Info,
+                Confidence::Inferred,
+                evidence,
+            )
+        }
         "firewall-detection"
             if has_header(headers, &["cf-ray", "x-sucuri-id", "x-akamai-transformed"]) =>
         {
@@ -891,35 +1027,21 @@ fn exposure_findings(
     signals: &WebSignals,
     evidence: usize,
 ) -> Vec<Finding> {
-    let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
-        "exposed-env-files"
-            if response.status == 200
-                && lower.lines().filter(|line| line.contains('=')).count() >= 2
-                && ["secret", "password", "token", "database_url"]
-                    .iter()
-                    .any(|marker| lower.contains(marker)) =>
-        {
-            one(
-                "environment-file-exposed",
-                "An environment-style configuration file is publicly readable",
-                Severity::Critical,
-                Confidence::Confirmed,
-                evidence,
-            )
-        }
-        "git-repo-exposure-check"
-            if response.status == 200
-                && (lower.contains("ref: refs/") || lower.contains("[core]")) =>
-        {
-            one(
-                "git-metadata-exposed",
-                "Repository metadata is publicly readable",
-                Severity::High,
-                Confidence::Confirmed,
-                evidence,
-            )
-        }
+        "exposed-env-files" if is_exposed_env_file(response) => one(
+            "environment-file-exposed",
+            "An environment-style configuration file is publicly readable",
+            Severity::Critical,
+            Confidence::Confirmed,
+            evidence,
+        ),
+        "git-repo-exposure-check" if is_exposed_git_metadata(response) => one(
+            "git-metadata-exposed",
+            "Repository metadata is publicly readable",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ),
         "exposed-api-endpoints"
             if response.status == 200
                 && (signals.api_references > 0
@@ -954,6 +1076,145 @@ fn exposure_findings(
     }
 }
 
+fn is_exposed_env_file(response: &HttpResponse) -> bool {
+    const MAX_ENV_BYTES: usize = 1_048_576;
+    if !matches!(response.status, 200..=299)
+        || response.body.len() > MAX_ENV_BYTES
+        || is_html_response(response)
+        || !response
+            .final_url
+            .path()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == ".env" || name.starts_with(".env."))
+    {
+        return false;
+    }
+    let Ok(body) = std::str::from_utf8(&response.body) else {
+        return false;
+    };
+    let mut assignments = 0;
+    let mut sensitive = false;
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        if !valid_env_key(key) || value.trim().is_empty() || value.contains(['<', '>']) {
+            return false;
+        }
+        assignments += 1;
+        sensitive |= sensitive_env_key(key);
+    }
+    assignments > 0 && sensitive
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn sensitive_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper == "DATABASE_URL"
+        || upper == "PRIVATE_KEY"
+        || upper == "API_KEY"
+        || upper
+            .split('_')
+            .any(|part| matches!(part, "SECRET" | "PASSWORD" | "PASSWD" | "TOKEN"))
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_API_KEY")
+        || upper.ends_with("_PRIVATE_KEY")
+        || upper.ends_with("_ACCESS_KEY")
+}
+
+fn is_exposed_git_metadata(response: &HttpResponse) -> bool {
+    const MAX_GIT_METADATA_BYTES: usize = 1_048_576;
+    if !matches!(response.status, 200..=299)
+        || response.body.len() > MAX_GIT_METADATA_BYTES
+        || is_html_response(response)
+    {
+        return false;
+    }
+    let Ok(body) = std::str::from_utf8(&response.body) else {
+        return false;
+    };
+    match response.final_url.path() {
+        "/.git/HEAD" => valid_git_head(body),
+        "/.git/config" => valid_git_config(body),
+        _ => false,
+    }
+}
+
+fn valid_git_head(body: &str) -> bool {
+    let value = body.trim();
+    value.strip_prefix("ref: ").is_some_and(valid_git_reference)
+        || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_git_reference(reference: &str) -> bool {
+    let Some(name) = reference.strip_prefix("refs/") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.ends_with(['.', '/'])
+        && name
+            .as_bytes()
+            .get(name.len().saturating_sub(5)..)
+            .is_none_or(|suffix| suffix != b".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name.split('/').all(|component| {
+            !component.is_empty()
+                && !component.starts_with('.')
+                && !component.ends_with('.')
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+fn valid_git_config(body: &str) -> bool {
+    let mut section = None;
+    let mut core_marker = false;
+    let mut entries = 0;
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = Some(line[1..line.len() - 1].trim().to_ascii_lowercase());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() || value.trim().is_empty() || section.is_none() {
+            return false;
+        }
+        entries += 1;
+        if section.as_deref() == Some("core")
+            && matches!(
+                key.as_str(),
+                "repositoryformatversion" | "filemode" | "bare" | "logallrefupdates"
+            )
+        {
+            core_marker = true;
+        }
+    }
+    entries > 0 && core_marker
+}
+
 fn fuzz_findings(
     id: &str,
     response: &HttpResponse,
@@ -968,22 +1229,43 @@ fn fuzz_findings(
             Confidence::Inferred,
             evidence,
         ),
-        "open-redirect-finder"
-            if response.redirects.iter().any(|redirect| {
-                redirect.decision == HttpRedirectDecision::OutOfScope
-                    && redirect.to.host_str() == Some("scope-check.invalid")
-            }) =>
-        {
-            one(
-                "external-open-redirect",
-                "The application accepted an external redirect destination",
-                Severity::Medium,
-                Confidence::Confirmed,
-                evidence,
-            )
-        }
+        "open-redirect-finder" if accepted_external_redirect(response) => one(
+            "external-open-redirect",
+            "The application accepted an external redirect destination",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ),
         _ => Vec::new(),
     }
+}
+
+fn accepted_external_redirect(response: &HttpResponse) -> bool {
+    if !redirect_probe_targets_external_host(response) {
+        return false;
+    }
+    response.redirects.iter().any(|redirect| {
+        redirect.decision == HttpRedirectDecision::OutOfScope
+            && redirect.to.host_str() == Some("scope-check.invalid")
+    }) || matches!(response.status, 300..=399)
+        && response
+            .headers
+            .get("location")
+            .and_then(|location| response.final_url.join(location).ok())
+            .is_some_and(|location| location.host_str() == Some("scope-check.invalid"))
+}
+
+fn redirect_probe_targets_external_host(response: &HttpResponse) -> bool {
+    let probe = response
+        .redirects
+        .first()
+        .map_or(&response.final_url, |redirect| &redirect.from);
+    probe.query_pairs().any(|(key, value)| {
+        matches!(key.as_ref(), "next" | "url" | "redirect")
+            && Url::parse(&value)
+                .ok()
+                .is_some_and(|url| url.host_str() == Some("scope-check.invalid"))
+    })
 }
 
 fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Finding> {
@@ -1350,8 +1632,8 @@ fn inventory_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Fi
         ),
         "third-party-integrations" => (
             "third-party-integration-observed",
-            "Third-party script integrations are present",
-            signals.external_script_hosts.len(),
+            "Third-party integrations are present",
+            signals.external_integration_hosts.len(),
         ),
         "static-asset-fingerprinter" => (
             "static-assets-observed",
@@ -1396,7 +1678,7 @@ fn metadata_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "favicon-hashing" if response.status == 200 && !response.body.is_empty() => one(
+        "favicon-hashing" if is_favicon_response(response) => one(
             "favicon-fingerprint-observed",
             "A favicon fingerprint was collected",
             Severity::Info,
@@ -1417,7 +1699,7 @@ fn metadata_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "sitemap" if response.status == 200 && lower.contains("<urlset") => one(
+        "sitemap" if is_sitemap_document(response) => one(
             "sitemap-observed",
             "A sitemap document is publicly available",
             Severity::Info,
@@ -1449,6 +1731,112 @@ fn metadata_findings(
         }
         _ => Vec::new(),
     }
+}
+
+fn is_sitemap_document(response: &HttpResponse) -> bool {
+    if response.status != 200
+        || response
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    {
+        return false;
+    }
+    let Ok(body) = std::str::from_utf8(&response.body) else {
+        return false;
+    };
+    let mut root = body.trim_start().to_ascii_lowercase();
+    if root.starts_with("<?xml") {
+        let Some((_, remainder)) = root.split_once("?>") else {
+            return false;
+        };
+        root = remainder.trim_start().to_owned();
+    }
+    html_prefix_matches(&root, "<urlset") || html_prefix_matches(&root, "<sitemapindex")
+}
+
+fn is_favicon_response(response: &HttpResponse) -> bool {
+    const MAX_FAVICON_BYTES: usize = 1_048_576;
+    if !matches!(response.status, 200..=299)
+        || response.body.is_empty()
+        || response.body.len() > MAX_FAVICON_BYTES
+        || is_html_response(response)
+    {
+        return false;
+    }
+    let media_type = response
+        .headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    match media_type.as_deref() {
+        Some("image/x-icon" | "image/vnd.microsoft.icon") => is_ico(&response.body),
+        Some("image/png") => response.body.starts_with(b"\x89PNG\r\n\x1a\n"),
+        Some("image/gif") => {
+            response.body.starts_with(b"GIF87a") || response.body.starts_with(b"GIF89a")
+        }
+        Some("image/jpeg") => response.body.starts_with(&[0xff, 0xd8, 0xff]),
+        Some("image/webp") => {
+            response.body.starts_with(b"RIFF") && response.body.get(8..12) == Some(b"WEBP")
+        }
+        Some("image/svg+xml") => is_svg(&response.body),
+        Some("image/avif") => response
+            .body
+            .get(4..12)
+            .is_some_and(|brand| matches!(brand, b"ftypavif" | b"ftypavis")),
+        _ => {
+            is_ico(&response.body)
+                || response.body.starts_with(b"\x89PNG\r\n\x1a\n")
+                || is_svg(&response.body)
+        }
+    }
+}
+
+fn is_ico(body: &[u8]) -> bool {
+    if body.len() < 6 || !body.starts_with(&[0, 0, 1, 0]) {
+        return false;
+    }
+    let count = usize::from(u16::from_le_bytes([body[4], body[5]]));
+    if count == 0 || count > 256 {
+        return false;
+    }
+    let Some(directory_end) = count.checked_mul(16).and_then(|size| size.checked_add(6)) else {
+        return false;
+    };
+    if directory_end > body.len() {
+        return false;
+    }
+    body[6..directory_end].chunks_exact(16).all(|entry| {
+        let size = usize::try_from(u32::from_le_bytes([
+            entry[8], entry[9], entry[10], entry[11],
+        ]))
+        .unwrap_or(usize::MAX);
+        let offset = usize::try_from(u32::from_le_bytes([
+            entry[12], entry[13], entry[14], entry[15],
+        ]))
+        .unwrap_or(usize::MAX);
+        entry[3] == 0
+            && size > 0
+            && offset >= directory_end
+            && offset
+                .checked_add(size)
+                .is_some_and(|end| end <= body.len())
+    })
+}
+
+fn is_svg(body: &[u8]) -> bool {
+    let Ok(body) = std::str::from_utf8(body) else {
+        return false;
+    };
+    let mut root = body.trim_start();
+    if root.starts_with("<?xml") {
+        let Some((_, remainder)) = root.split_once("?>") else {
+            return false;
+        };
+        root = remainder.trim_start();
+    }
+    html_prefix_matches(root, "<svg")
 }
 
 fn has_valid_robots_policy(response: &HttpResponse) -> bool {
@@ -1801,18 +2189,13 @@ fn baseline_diff(
     let Some(baseline) = options
         .get("baseline_sha256")
         .and_then(Value::as_str)
-        .filter(|value| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        })
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
     else {
         return Vec::new();
     };
     let changed = samples
         .first()
-        .is_some_and(|sample| sample.body_sha256 != baseline);
+        .is_some_and(|sample| !sample.body_sha256.eq_ignore_ascii_case(baseline));
     if changed {
         aggregate_one(
             if id == "attack-surface-delta" {
@@ -1979,9 +2362,9 @@ mod tests {
         });
         response.redirects.push(HttpRedirect {
             status: 302,
-            from: Url::parse("https://example.test/start?secret=value")
+            from: Url::parse("https://example.test/start/path-secret?secret=value")
                 .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}")),
-            to: Url::parse("https://example.test/page?session=value")
+            to: Url::parse("https://example.test/reset/session-secret?session=value")
                 .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}")),
             decision: HttpRedirectDecision::Followed,
         });
@@ -2004,6 +2387,8 @@ mod tests {
         assert!(!serialized.contains("label-person@example.test"));
         assert!(!serialized.contains("secret=value"));
         assert!(!serialized.contains("session=value"));
+        assert!(!serialized.contains("path-secret"));
+        assert!(!serialized.contains("session-secret"));
         assert!(!serialized.contains("private-cookie.example.test"));
         assert!(!serialized.contains("#fragment"));
         assert!(serialized.contains("cookie-name-hash"));
@@ -2725,9 +3110,16 @@ mod tests {
         let mut options = BTreeMap::new();
         options.insert(
             "baseline_sha256".into(),
-            Value::String(first.body_sha256.clone()),
+            Value::String(first.body_sha256.to_ascii_uppercase()),
         );
-        assert!(aggregate_findings("attack-surface-delta", &[first], &options).is_empty());
+        assert!(
+            aggregate_findings(
+                "attack-surface-delta",
+                std::slice::from_ref(&first),
+                &options
+            )
+            .is_empty()
+        );
         assert_eq!(
             aggregate_findings(
                 "attack-surface-delta",
@@ -2739,6 +3131,271 @@ mod tests {
         );
         options.insert("baseline_sha256".into(), Value::String("invalid".into()));
         assert!(aggregate_findings("attack-surface-delta", &[different], &options).is_empty());
+    }
+
+    #[test]
+    fn graphql_introspection_requires_structured_schema_metadata() {
+        let positive = response(r#"{"data":{"__schema":{"queryType":{"name":"Query"}}}}"#);
+        assert_eq!(
+            finding_keys("graphql-introspection-probe", &positive),
+            BTreeSet::from(["graphql-introspection-enabled".into()])
+        );
+
+        let prose = response(r#"{"message":"Documentation mentions __schema and queryType"}"#);
+        assert!(finding_keys("graphql-introspection-probe", &prose).is_empty());
+
+        let incomplete = response(r#"{"data":{"__schema":null},"queryType":"Query"}"#);
+        assert!(finding_keys("graphql-introspection-probe", &incomplete).is_empty());
+    }
+
+    #[test]
+    fn method_enumerator_tokenizes_the_allow_header() {
+        let mut positive = response("");
+        positive.headers.insert("allow".into(), "GET, put".into());
+        assert_eq!(
+            finding_keys("http-method-enumerator", &positive),
+            BTreeSet::from(["state-changing-http-method-advertised".into()])
+        );
+
+        let mut deceptive = response("");
+        deceptive
+            .headers
+            .insert("allow".into(), "GET, INPUT, HEAD".into());
+        assert!(finding_keys("http-method-enumerator", &deceptive).is_empty());
+
+        for method in ["POST", "PATCH"] {
+            let mut response = response("");
+            response
+                .headers
+                .insert("allow".into(), format!("GET, HEAD, {method}"));
+            assert_eq!(
+                finding_keys("http-method-enumerator", &response),
+                BTreeSet::from(["state-changing-http-method-advertised".into()])
+            );
+        }
+    }
+
+    #[test]
+    fn technology_stack_requires_non_empty_server_metadata() {
+        let mut empty = response("<html><body>fixture</body></html>");
+        empty.headers.insert("server".into(), "  ".into());
+        assert!(finding_keys("technology-stack", &empty).is_empty());
+
+        empty.headers.insert("server".into(), "nginx".into());
+        assert_eq!(
+            finding_keys("technology-stack", &empty),
+            BTreeSet::from(["technology-signal-observed".into()])
+        );
+    }
+
+    #[test]
+    fn obfuscation_markers_require_executable_content() {
+        let prose = response("<p>Documentation mentions eval( and atob( safely.</p>");
+        assert_eq!(signals(&prose).obfuscation_markers, 0);
+        assert!(finding_keys("javascript-obfuscation-detector", &prose).is_empty());
+
+        let script = response("<script>eval(atob(encoded));</script>");
+        assert_eq!(signals(&script).obfuscation_markers, 2);
+        assert_eq!(
+            finding_keys("javascript-obfuscation-detector", &script),
+            BTreeSet::from(["javascript-obfuscation-markers".into()])
+        );
+
+        for script_type in ["application/json", "application/ld+json"] {
+            let data = response(&format!(
+                r#"<script type="{script_type}">{{"example":"eval(atob(value))"}}</script>"#
+            ));
+            assert_eq!(signals(&data).obfuscation_markers, 0);
+            assert!(finding_keys("javascript-obfuscation-detector", &data).is_empty());
+        }
+    }
+
+    #[test]
+    fn websocket_references_require_structured_or_executable_context() {
+        let prose =
+            response("<p>The WebSocket() constructor and wss:// scheme are documented.</p>");
+        assert_eq!(signals(&prose).websocket_references, 0);
+        assert!(finding_keys("websocket-endpoint-sniffer", &prose).is_empty());
+
+        let link = response(r#"<a href="wss://socket.example.test/events">Events</a>"#);
+        assert_eq!(signals(&link).websocket_references, 1);
+        assert_eq!(
+            finding_keys("websocket-endpoint-sniffer", &link),
+            BTreeSet::from(["websocket-reference-observed".into()])
+        );
+
+        let script = response(r#"<script>new WebSocket("wss://socket.example.test")</script>"#);
+        assert!(signals(&script).websocket_references > 0);
+
+        let structured_data = response(
+            r#"<script type="application/json">{"endpoint":"wss://socket.example.test"}</script>"#,
+        );
+        assert_eq!(signals(&structured_data).websocket_references, 0);
+    }
+
+    #[test]
+    fn html_comments_require_a_complete_html_comment() {
+        let mut html = response("<html><!-- bounded comment --><body>ok</body></html>");
+        html.headers
+            .insert("content-type".into(), "text/html".into());
+        assert_eq!(signals(&html).comments, 1);
+        assert_eq!(
+            finding_keys("html-comments-extractor", &html),
+            BTreeSet::from(["html-comments-observed".into()])
+        );
+
+        let mut json = response(r#"{"documentation":"<!-- not an HTML comment -->"}"#);
+        json.headers
+            .insert("content-type".into(), "application/json".into());
+        assert_eq!(signals(&json).comments, 0);
+
+        let mut incomplete = response("<html><!-- incomplete<body>ok</body></html>");
+        incomplete
+            .headers
+            .insert("content-type".into(), "text/html".into());
+        assert_eq!(signals(&incomplete).comments, 0);
+
+        let mut script =
+            response(r#"<html><script>const open = "<!--"; const close = "-->";</script></html>"#);
+        script
+            .headers
+            .insert("content-type".into(), "text/html".into());
+        assert_eq!(signals(&script).comments, 0);
+    }
+
+    #[test]
+    fn sitemap_requires_a_document_root() {
+        let mut urlset = response(r#"<?xml version="1.0"?><urlset></urlset>"#);
+        urlset.final_url = Url::parse("https://example.test/sitemap.xml")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        assert_eq!(
+            finding_keys("sitemap", &urlset),
+            BTreeSet::from(["sitemap-observed".into()])
+        );
+
+        let index = response("<sitemapindex></sitemapindex>");
+        assert_eq!(
+            finding_keys("sitemap", &index),
+            BTreeSet::from(["sitemap-observed".into()])
+        );
+
+        let prose = response("<html><p>Example: &lt;urlset&gt;</p></html>");
+        assert!(finding_keys("sitemap", &prose).is_empty());
+
+        for malformed in [
+            "<urlsetevil></urlsetevil>",
+            "<sitemapindexer></sitemapindexer>",
+        ] {
+            assert!(finding_keys("sitemap", &response(malformed)).is_empty());
+        }
+    }
+
+    #[test]
+    fn exposure_detectors_require_structured_boundary_evidence() {
+        let mut env = response("SECRET_TOKEN=one-secret");
+        env.final_url = Url::parse("https://example.test/.env")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        env.headers
+            .insert("content-type".into(), "text/plain".into());
+        assert_eq!(
+            finding_keys("exposed-env-files", &env),
+            BTreeSet::from(["environment-file-exposed".into()])
+        );
+
+        env.body = b"Documentation example:\nSECRET_TOKEN=placeholder".to_vec();
+        assert!(finding_keys("exposed-env-files", &env).is_empty());
+        env.body = b"<html><body>SECRET_TOKEN=placeholder</body></html>".to_vec();
+        env.headers
+            .insert("content-type".into(), "text/html".into());
+        assert!(finding_keys("exposed-env-files", &env).is_empty());
+
+        let mut git = response("ref: refs/heads/main\n");
+        git.final_url = Url::parse("https://example.test/.git/HEAD")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        git.status = 206;
+        git.headers
+            .insert("content-type".into(), "text/plain".into());
+        assert_eq!(
+            finding_keys("git-repo-exposure-check", &git),
+            BTreeSet::from(["git-metadata-exposed".into()])
+        );
+
+        git.body = b"ref: refs/tags/v1.0.0\n".to_vec();
+        assert_eq!(
+            finding_keys("git-repo-exposure-check", &git),
+            BTreeSet::from(["git-metadata-exposed".into()])
+        );
+
+        git.body = b"Documentation mentions ref: refs/heads/main".to_vec();
+        assert!(finding_keys("git-repo-exposure-check", &git).is_empty());
+        git.body = b"ref: refs/tags/../private".to_vec();
+        assert!(finding_keys("git-repo-exposure-check", &git).is_empty());
+    }
+
+    #[test]
+    fn open_redirect_accepts_exact_external_location_without_leaking_it() {
+        let mut redirect = response("");
+        redirect.final_url =
+            Url::parse("https://example.test/?next=https%3A%2F%2Fscope-check.invalid%2F")
+                .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        redirect.status = 302;
+        redirect.headers.insert(
+            "location".into(),
+            "https://scope-check.invalid/reset/private-token?secret=value#fragment".into(),
+        );
+        assert_eq!(
+            finding_keys("open-redirect-finder", &redirect),
+            BTreeSet::from(["external-open-redirect".into()])
+        );
+        let serialized = observation(
+            "redirect-probe",
+            HttpMethod::Get,
+            &redirect,
+            &signals(&redirect),
+        )
+        .to_string();
+        assert!(!serialized.contains("private-token"));
+        assert!(!serialized.contains("secret=value"));
+
+        redirect.final_url = Url::parse("https://example.test/")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        assert!(finding_keys("open-redirect-finder", &redirect).is_empty());
+    }
+
+    #[test]
+    fn third_party_integrations_include_structured_origins_but_not_anchors() {
+        let integrations = response(
+            r#"<link rel="preconnect" href="https://api.example.net"><a href="https://ordinary.example.org">link</a>"#,
+        );
+        let signals = signals(&integrations);
+        assert_eq!(signals.external_integration_hosts, ["api.example.net"]);
+        assert_eq!(
+            finding_keys("third-party-integrations", &integrations),
+            BTreeSet::from(["third-party-integration-observed".into()])
+        );
+    }
+
+    #[test]
+    fn favicon_fingerprint_requires_icon_content() {
+        let mut icon = response("");
+        icon.final_url = Url::parse("https://example.test/favicon.ico")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        icon.headers
+            .insert("content-type".into(), "image/x-icon".into());
+        icon.body = vec![
+            0, 0, 1, 0, 1, 0, // header: one icon
+            16, 16, 0, 0, 1, 0, 32, 0, 4, 0, 0, 0, 22, 0, 0, 0, // directory
+            1, 2, 3, 4, // bounded image payload
+        ];
+        assert_eq!(
+            finding_keys("favicon-hashing", &icon),
+            BTreeSet::from(["favicon-fingerprint-observed".into()])
+        );
+
+        icon.headers
+            .insert("content-type".into(), "text/html".into());
+        icon.body = b"<html><body>branded fallback</body></html>".to_vec();
+        assert!(finding_keys("favicon-hashing", &icon).is_empty());
     }
 
     #[test]
