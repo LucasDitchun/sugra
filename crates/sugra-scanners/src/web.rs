@@ -276,7 +276,6 @@ fn root_plan(id: &str, base: &Url, max_pages: usize) -> Option<WebPlan> {
             | "passive-cve-mapper"
             | "privacy-gdpr"
             | "security-changelog-diff"
-            | "typosquat-domain-checker"
     );
     let crawl = matches!(
         id,
@@ -476,7 +475,7 @@ mod tests {
             .iter()
             .filter(|definition| definition.operation == Operation::Http)
             .collect();
-        assert_eq!(http.len(), 68);
+        assert_eq!(http.len(), 67);
         for definition in http {
             let plan = plan_for(
                 definition.descriptor.id.as_str(),

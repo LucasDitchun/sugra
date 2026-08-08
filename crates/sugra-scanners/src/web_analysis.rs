@@ -280,7 +280,6 @@ fn analysis_group(id: &str) -> Option<AnalysisGroup> {
         "directory-finder"
         | "open-redirect-finder"
         | "rate-limit-waf-bypass-test"
-        | "typosquat-domain-checker"
         | "virtual-host-fuzzer" => Some(AnalysisGroup::Fuzz),
         "cache-behavior-analyzer"
         | "clickjacking-test"
@@ -1340,7 +1339,7 @@ mod tests {
             .iter()
             .filter(|definition| matches!(definition.operation, Operation::Http))
             .collect();
-        assert_eq!(http.len(), 68);
+        assert_eq!(http.len(), 67);
         for definition in http {
             assert!(
                 analysis_group(definition.descriptor.id.as_str()).is_some(),

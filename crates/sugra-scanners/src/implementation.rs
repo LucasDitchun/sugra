@@ -120,28 +120,96 @@ impl Scanner for BuiltinScanner {
         if context.cancellation.is_cancelled() {
             return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
         }
-        let result = match self.profile.analyzer.family() {
-            BoundaryFamily::Dns => self.scan_dns(request, context).await,
-            BoundaryFamily::Http => self.scan_http(request, context).await,
-            BoundaryFamily::Tls => self.scan_tls(request, context).await,
-            BoundaryFamily::Provider => self.scan_providers(request, context).await,
-            BoundaryFamily::Tcp => self.scan_tcp(request, context).await,
-            BoundaryFamily::Udp => self.scan_udp(request, context).await,
-            BoundaryFamily::Command => self.scan_command(request, context).await,
-            BoundaryFamily::Local => self.scan_local(request, context),
-        }?;
-        Ok(self.annotate_result(result))
+        self.scan_stages(request, context).await
     }
 }
 
 impl BuiltinScanner {
-    fn annotate_result(&self, mut result: ScanResult) -> ScanResult {
+    async fn scan_stages(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        let stages: Vec<_> = std::iter::once(self.profile.analyzer)
+            .chain(self.profile.supplements.iter().copied())
+            .collect();
+        let mut combined = ScanResult::completed(Vec::new(), Vec::new());
+        let mut first_error = None;
+        let base_limit = request.budget.max_requests / stages.len();
+        let remainder = request.budget.max_requests % stages.len();
+
+        for (index, analyzer) in stages.into_iter().enumerate() {
+            if context.cancellation.is_cancelled() {
+                if combined.evidence.is_empty() {
+                    return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+                }
+                combined.status = ExecutionStatus::Cancelled;
+                combined.diagnostics.push(Diagnostic {
+                    kind: "cancelled".into(),
+                    message: "remaining analysis stages were cancelled".into(),
+                });
+                return Ok(combined);
+            }
+            let stage_limit = base_limit + usize::from(index < remainder);
+            if stage_limit == 0 {
+                combined.status = ExecutionStatus::Partial;
+                combined.diagnostics.push(Diagnostic {
+                    kind: "budget-exhausted".into(),
+                    message: format!("{} stage omitted by the request budget", analyzer.as_str()),
+                });
+                continue;
+            }
+            let mut stage_request = request.clone();
+            stage_request.budget.max_requests = stage_limit;
+            match self.execute_stage(analyzer, &stage_request, context).await {
+                Ok(result) => {
+                    merge_scan_result(&mut combined, self.annotate_result(analyzer, result))
+                }
+                Err(error) => {
+                    combined.status = ExecutionStatus::Partial;
+                    combined.diagnostics.push(Diagnostic {
+                        kind: "analysis-stage-unavailable".into(),
+                        message: format!("{}: {}", analyzer.as_str(), error.message),
+                    });
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if combined.evidence.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                ScanError::new(ScanErrorKind::Internal, "scanner produced no evidence")
+            }));
+        }
+        Ok(combined)
+    }
+
+    async fn execute_stage(
+        &self,
+        analyzer: Analyzer,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        match analyzer.family() {
+            BoundaryFamily::Dns => self.scan_dns(request, context).await,
+            BoundaryFamily::Http => self.scan_http(request, context).await,
+            BoundaryFamily::Tls => self.scan_tls(analyzer, request, context).await,
+            BoundaryFamily::Provider => self.scan_providers(request, context).await,
+            BoundaryFamily::Tcp => self.scan_tcp(analyzer, request, context).await,
+            BoundaryFamily::Udp => self.scan_udp(analyzer, request, context).await,
+            BoundaryFamily::Command => self.scan_command(request, context).await,
+            BoundaryFamily::Local => self.scan_local(request, context),
+        }
+    }
+
+    fn annotate_result(&self, analyzer: Analyzer, mut result: ScanResult) -> ScanResult {
         for evidence in &mut result.evidence {
             evidence.kind = format!("{}-{}", self.profile.id, evidence.kind);
             let prior = std::mem::take(&mut evidence.observation);
             evidence.observation = json!({
                 "scanner_id": self.profile.id,
-                "analysis": self.profile.analyzer.as_str(),
+                "analysis": analyzer.as_str(),
                 "purpose": self.profile.purpose,
                 "observation": prior,
             });
@@ -379,6 +447,7 @@ impl BuiltinScanner {
 
     async fn scan_tls(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
@@ -395,11 +464,7 @@ impl BuiltinScanner {
             })
             .await
             .map_err(scan_error_from_port)?;
-        let findings = analyze_tls(
-            self.profile.analyzer,
-            &observation,
-            context.clock.now().unix_timestamp(),
-        );
+        let findings = analyze_tls(analyzer, &observation, context.clock.now().unix_timestamp());
         Ok(ScanResult::completed(
             vec![Evidence {
                 kind: "tls-handshake".into(),
@@ -429,7 +494,7 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
-        for call in calls {
+        for call in calls.into_iter().take(request.budget.max_requests) {
             let response = self
                 .services
                 .provider
@@ -493,14 +558,12 @@ impl BuiltinScanner {
 
     async fn scan_tcp(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        if matches!(
-            self.profile.analyzer,
-            Analyzer::TcpCertificate | Analyzer::TcpTlsState
-        ) {
-            return self.scan_network_tls(request, context).await;
+        if matches!(analyzer, Analyzer::TcpCertificate | Analyzer::TcpTlsState) {
+            return self.scan_network_tls(analyzer, request, context).await;
         }
         let targets = network_hosts(&request.target, host_limit(request))?;
         let ports = tcp_ports(self.descriptor.id.as_str(), request);
@@ -520,8 +583,8 @@ impl BuiltinScanner {
                     .execute(TcpRequest {
                         host: host.clone(),
                         port: *port,
-                        payload: tcp_payload(self.profile.analyzer, &host, *port)?,
-                        read_response: tcp_reads_response(self.profile.analyzer, *port),
+                        payload: tcp_payload(analyzer, &host, *port)?,
+                        read_response: tcp_reads_response(analyzer, *port),
                         budget: request.budget,
                         scope: request.scope.clone(),
                     })
@@ -529,7 +592,7 @@ impl BuiltinScanner {
                 match response {
                     Ok(response) => {
                         let index = evidence.len();
-                        let transfer_accepted = self.profile.analyzer == Analyzer::TcpDnsTransfer
+                        let transfer_accepted = analyzer == Analyzer::TcpDnsTransfer
                             && dns_transfer_accepted(&response.bytes);
                         if transfer_accepted {
                             findings.push(finding(
@@ -539,10 +602,7 @@ impl BuiltinScanner {
                                 Confidence::Confirmed,
                                 index,
                             ));
-                        } else if matches!(
-                            self.profile.analyzer,
-                            Analyzer::TcpPorts | Analyzer::TcpRange
-                        ) {
+                        } else if matches!(analyzer, Analyzer::TcpPorts | Analyzer::TcpRange) {
                             findings.push(finding(
                                 "tcp-port-open",
                                 &format!("TCP port {port} accepted a connection"),
@@ -565,13 +625,11 @@ impl BuiltinScanner {
                         });
                     }
                     Err(error)
-                        if matches!(
-                            self.profile.analyzer,
-                            Analyzer::TcpPorts | Analyzer::TcpRange
-                        ) && matches!(
-                            error.kind,
-                            PortErrorKind::Transport | PortErrorKind::Timeout
-                        ) =>
+                        if matches!(analyzer, Analyzer::TcpPorts | Analyzer::TcpRange)
+                            && matches!(
+                                error.kind,
+                                PortErrorKind::Transport | PortErrorKind::Timeout
+                            ) =>
                     {
                         evidence.push(Evidence {
                             kind: "tcp-observation".into(),
@@ -595,12 +653,13 @@ impl BuiltinScanner {
 
     async fn scan_network_tls(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
         let targets = network_hosts(&request.target, host_limit(request))?;
         let ports = tcp_ports(self.descriptor.id.as_str(), request);
-        let samples = if self.profile.analyzer == Analyzer::TcpTlsState {
+        let samples = if analyzer == Analyzer::TcpTlsState {
             usize_option(&request.options, "samples", 2).clamp(2, 8)
         } else {
             1
@@ -637,7 +696,7 @@ impl BuiltinScanner {
                         Ok(observation) => {
                             let index = evidence.len();
                             resumed |= observation.handshake_kind == TlsHandshakeKind::Resumed;
-                            if self.profile.analyzer == Analyzer::TcpCertificate {
+                            if analyzer == Analyzer::TcpCertificate {
                                 let now = context.clock.now().unix_timestamp();
                                 let mut observed = analyze_tls_chain(&observation);
                                 observed.extend(analyze_tls_expiry(&observation, now));
@@ -663,7 +722,7 @@ impl BuiltinScanner {
                 }
             }
         }
-        if self.profile.analyzer == Analyzer::TcpTlsState && !evidence.is_empty() && !resumed {
+        if analyzer == Analyzer::TcpTlsState && !evidence.is_empty() && !resumed {
             findings.push(Finding {
                 key: "tls-session-not-resumed".into(),
                 title: "No TLS session resumption was observed in the bounded sample".into(),
@@ -677,6 +736,7 @@ impl BuiltinScanner {
 
     async fn scan_udp(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
@@ -698,11 +758,7 @@ impl BuiltinScanner {
                     .execute(UdpRequest {
                         host: host.clone(),
                         port: *port,
-                        payload: udp_payload(
-                            self.profile.analyzer,
-                            self.descriptor.id.as_str(),
-                            *port,
-                        )?,
+                        payload: udp_payload(analyzer, self.descriptor.id.as_str(), *port)?,
                         budget: request.budget,
                         scope: request.scope.clone(),
                     })
@@ -710,11 +766,7 @@ impl BuiltinScanner {
                 match response {
                     Ok(response) => {
                         let index = evidence.len();
-                        findings.extend(analyze_udp_response(
-                            self.profile.analyzer,
-                            &response.bytes,
-                            index,
-                        ));
+                        findings.extend(analyze_udp_response(analyzer, &response.bytes, index));
                         evidence.push(Evidence {
                             kind: "udp-observation".into(),
                             source: response.endpoint,
@@ -722,7 +774,7 @@ impl BuiltinScanner {
                                 "responded": true,
                                 "bytes": response.bytes.len(),
                                 "sha256": hex::encode(Sha256::digest(&response.bytes)),
-                                "protocol": udp_observation(self.profile.analyzer, &response.bytes),
+                                "protocol": udp_observation(analyzer, &response.bytes),
                                 "duration_ms": response.duration_ms,
                             }),
                             observed_at: context.clock.now(),
@@ -799,6 +851,21 @@ impl BuiltinScanner {
             Vec::new(),
         ))
     }
+}
+
+fn merge_scan_result(target: &mut ScanResult, mut source: ScanResult) {
+    let offset = target.evidence.len();
+    for finding in &mut source.findings {
+        for evidence in &mut finding.evidence {
+            *evidence += offset;
+        }
+    }
+    if target.status == ExecutionStatus::Completed && source.status != ExecutionStatus::Completed {
+        target.status = source.status;
+    }
+    target.findings.append(&mut source.findings);
+    target.evidence.append(&mut source.evidence);
+    target.diagnostics.append(&mut source.diagnostics);
 }
 
 fn analyze_tls(analyzer: Analyzer, observation: &TlsObservation, now: i64) -> Vec<Finding> {
@@ -1050,6 +1117,23 @@ fn dns_query_plan(
     let query =
         |name: String, record_types: Vec<DnsRecordType>| DnsPlannedQuery { name, record_types };
     let plan = match id {
+        "typosquat-domain-checker" => typo_candidates(
+            &name,
+            usize_option(&request.options, "max_variants", 32).clamp(1, 128),
+        )
+        .into_iter()
+        .map(|candidate| {
+            query(
+                candidate,
+                vec![
+                    DnsRecordType::A,
+                    DnsRecordType::Aaaa,
+                    DnsRecordType::Cname,
+                    DnsRecordType::Mx,
+                ],
+            )
+        })
+        .collect(),
         "dns-sla-latency-monitor" => {
             let samples = request
                 .options
@@ -1090,6 +1174,44 @@ fn dns_query_plan(
         _ => vec![query(name, dns_types(id, request))],
     };
     Ok(plan)
+}
+
+fn typo_candidates(name: &str, limit: usize) -> Vec<String> {
+    let canonical = name.trim_end_matches('.').to_ascii_lowercase();
+    let (label, suffix) = canonical
+        .split_once('.')
+        .map_or((canonical.as_str(), ""), |(label, suffix)| (label, suffix));
+    let bytes = label.as_bytes();
+    let mut variants = BTreeSet::new();
+    for index in 0..bytes.len() {
+        if bytes.len() > 2 {
+            let mut deleted = bytes.to_vec();
+            deleted.remove(index);
+            variants.insert(String::from_utf8_lossy(&deleted).into_owned());
+        }
+        if bytes.len() < 63 {
+            let mut duplicated = bytes.to_vec();
+            duplicated.insert(index, bytes[index]);
+            variants.insert(String::from_utf8_lossy(&duplicated).into_owned());
+        }
+        if index + 1 < bytes.len() && bytes[index] != bytes[index + 1] {
+            let mut swapped = bytes.to_vec();
+            swapped.swap(index, index + 1);
+            variants.insert(String::from_utf8_lossy(&swapped).into_owned());
+        }
+    }
+    variants
+        .into_iter()
+        .filter(|candidate| candidate != label && !candidate.is_empty())
+        .map(|candidate| {
+            if suffix.is_empty() {
+                candidate
+            } else {
+                format!("{candidate}.{suffix}")
+            }
+        })
+        .take(limit)
+        .collect()
 }
 
 fn dns_types(id: &str, request: &ScanRequest) -> Vec<DnsRecordType> {
@@ -1230,6 +1352,13 @@ fn analyze_dns(
                 findings.push(finding);
             }
         }
+        "typosquat-domain-checker" if !missing => findings.push(finding(
+            "resolving-typo-candidate",
+            "A generated typo candidate returned public DNS records",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )),
         "ttl-analysis" => {
             if let Some(finding) = analyze_dns_ttl(records, evidence) {
                 findings.push(finding);
@@ -1429,7 +1558,7 @@ fn provider_registry_calls(
         "asn-lookup" if matches!(target, Target::Ip(_)) => {
             Some(vec![provider_call("ripestat", "network-info", None)])
         }
-        "asn-lookup" | "rdap-lookup" => Some(vec![provider_call(
+        "asn-lookup" | "rdap-lookup" | "security-contact-gap-finder" => Some(vec![provider_call(
             "rdap",
             if matches!(target, Target::Ip(_)) {
                 "ip"
@@ -1459,7 +1588,7 @@ fn provider_registry_calls(
 
 fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<ProviderCall>> {
     match id {
-        "associated-hosts" | "domain-shadowing-detector" => Some(vec![
+        "associated-hosts" | "domain-shadowing-detector" | "attack-surface-delta" => Some(vec![
             provider_call("crtsh", "query", None),
             provider_call("urlscan", "search", None),
         ]),
@@ -2833,6 +2962,24 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn typo_candidates_are_deterministic_bounded_and_domain_preserving() {
+        let candidates = typo_candidates("example.com", 7);
+        assert_eq!(candidates.len(), 7);
+        assert_eq!(candidates.iter().collect::<BTreeSet<_>>().len(), 7);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.ends_with(".com"))
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate == "example.com")
+        );
+        assert_eq!(typo_candidates("example.com", 2).len(), 2);
+    }
+
     #[tokio::test]
     async fn every_built_in_has_an_offline_functional_contract()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2870,6 +3017,74 @@ mod tests {
                 descriptor.id
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn composite_scanners_merge_typed_evidence_with_one_shared_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let builtins = build_builtins(&services())?;
+        let descriptor = builtins
+            .catalog
+            .iter()
+            .find(|descriptor| descriptor.id.as_str() == "attack-surface-delta")
+            .ok_or("missing composite descriptor")?;
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let scanner = builtins
+            .registry
+            .get(&descriptor.id)
+            .ok_or("missing composite scanner")?;
+        let context = ScanContext {
+            run_id: sugra_domain::RunId::new(),
+            cancellation: CancellationToken::new(),
+            clock: Arc::new(FixedClock),
+        };
+        let request = ScanRequest {
+            scanner_id: descriptor.id.clone(),
+            scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+            target: target.clone(),
+            options: BTreeMap::new(),
+            budget: Budget {
+                max_requests: 4,
+                ..Budget::default()
+            },
+        };
+        let result = scanner.scan(&request, &context).await?;
+        let analyses: BTreeSet<_> = result
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.observation.get("analysis"))
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            analyses,
+            BTreeSet::from([
+                "asset-source-analysis",
+                "dns-topology-analysis",
+                "tcp-port-analysis",
+                "web-change-analysis",
+            ])
+        );
+        assert!(result.evidence.len() <= request.budget.max_requests);
+
+        let limited = ScanRequest {
+            budget: Budget {
+                max_requests: 1,
+                ..request.budget
+            },
+            ..request
+        };
+        let result = scanner.scan(&limited, &context).await?;
+        assert_eq!(result.evidence.len(), 1);
+        assert_eq!(result.status, ExecutionStatus::Partial);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == "budget-exhausted")
+                .count(),
+            3
+        );
         Ok(())
     }
 

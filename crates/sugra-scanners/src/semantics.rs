@@ -177,6 +177,7 @@ impl Analyzer {
 pub(crate) struct SemanticProfile {
     pub(crate) id: &'static str,
     pub(crate) analyzer: Analyzer,
+    pub(crate) supplements: &'static [Analyzer],
     pub(crate) purpose: &'static str,
 }
 
@@ -185,6 +186,18 @@ macro_rules! profile {
         Some(SemanticProfile {
             id: $id,
             analyzer: Analyzer::$analyzer,
+            supplements: &[],
+            purpose: $purpose,
+        })
+    };
+}
+
+macro_rules! composite_profile {
+    ($id:literal, $analyzer:ident, [$($supplement:ident),+ $(,)?], $purpose:literal) => {
+        Some(SemanticProfile {
+            id: $id,
+            analyzer: Analyzer::$analyzer,
+            supplements: &[$(Analyzer::$supplement),+],
             purpose: $purpose,
         })
     };
@@ -214,9 +227,10 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
             ProviderRouting,
             "Inspect announced prefixes and route-origin context."
         ),
-        "cdn-detection" => profile!(
+        "cdn-detection" => composite_profile!(
             "cdn-detection",
             WebDetection,
+            [DnsTopology],
             "Detect delivery networks from scoped HTTP and DNS indicators."
         ),
         "dns-over-https" => profile!(
@@ -646,9 +660,10 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
             WebApi,
             "Discover WebSocket endpoint indicators."
         ),
-        "attack-surface-delta" => profile!(
+        "attack-surface-delta" => composite_profile!(
             "attack-surface-delta",
             WebChange,
+            [ProviderAsset, DnsTopology, TcpPorts],
             "Build a deterministic attack-surface snapshot for comparison."
         ),
         "breached-credentials-lookup" => profile!(
@@ -711,9 +726,10 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
             WebExposure,
             "Check for publicly readable environment files."
         ),
-        "firewall-detection" => profile!(
+        "firewall-detection" => composite_profile!(
             "firewall-detection",
             WebDetection,
+            [TcpPorts],
             "Detect public web-application firewall indicators."
         ),
         "git-repo-exposure-check" => profile!(
@@ -796,9 +812,10 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
             WebChange,
             "Compare published security-change indicators."
         ),
-        "security-contact-gap-finder" => profile!(
+        "security-contact-gap-finder" => composite_profile!(
             "security-contact-gap-finder",
             WebMetadata,
+            [ProviderRegistration],
             "Assess published security contact coverage."
         ),
         "security-txt" => profile!(
@@ -848,7 +865,7 @@ pub(crate) fn profile_for(id: &str) -> Option<SemanticProfile> {
         ),
         "typosquat-domain-checker" => profile!(
             "typosquat-domain-checker",
-            WebFuzz,
+            DnsExposure,
             "Generate and check a bounded set of typo candidates."
         ),
         "virustotal-scan" => profile!(
@@ -946,5 +963,42 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 147);
         Ok(())
+    }
+
+    #[test]
+    fn composite_profiles_declare_distinct_supporting_boundaries() {
+        let expected = [
+            ("cdn-detection", &[BoundaryFamily::Dns][..]),
+            (
+                "attack-surface-delta",
+                &[
+                    BoundaryFamily::Provider,
+                    BoundaryFamily::Dns,
+                    BoundaryFamily::Tcp,
+                ][..],
+            ),
+            ("firewall-detection", &[BoundaryFamily::Tcp][..]),
+            (
+                "security-contact-gap-finder",
+                &[BoundaryFamily::Provider][..],
+            ),
+        ];
+        for (id, families) in expected {
+            let profile = profile_for(id).expect("composite profile");
+            let actual: Vec<_> = profile
+                .supplements
+                .iter()
+                .map(|analyzer| analyzer.family())
+                .collect();
+            assert_eq!(
+                actual, families,
+                "unexpected supporting boundaries for {id}"
+            );
+            assert!(
+                actual
+                    .iter()
+                    .all(|family| *family != profile.analyzer.family())
+            );
+        }
     }
 }
