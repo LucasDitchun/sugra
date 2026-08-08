@@ -30,6 +30,49 @@ pub(crate) struct ProviderAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum ProviderSummary {
+    /// Internet Archive CDX rows reduced to temporal and uniqueness counts.
+    ArchiveHistory {
+        /// Valid bounded snapshot rows.
+        snapshots: usize,
+        /// Distinct archived URLs.
+        unique_urls: usize,
+        /// Distinct HTTP statuses.
+        unique_statuses: usize,
+        /// Distinct content digests.
+        unique_digests: usize,
+        /// Earliest valid four-digit snapshot year.
+        earliest_year: Option<u16>,
+        /// Latest valid four-digit snapshot year.
+        latest_year: Option<u16>,
+    },
+    /// Registration data reduced to non-identifying counts.
+    Registration {
+        /// Distinct public object handles.
+        handles: usize,
+        /// Valid entity objects.
+        entities: usize,
+        /// Distinct registration roles.
+        roles: usize,
+        /// Network ranges or CIDR collections present.
+        networks: usize,
+        /// Distinct autonomous-system identifiers.
+        autonomous_systems: usize,
+        /// Public notice or remark objects.
+        notices: usize,
+    },
+    /// Host-intelligence records reduced to aggregate asset counts.
+    HostIntelligence {
+        /// Valid service records.
+        records: usize,
+        /// Distinct hostnames.
+        unique_hostnames: usize,
+        /// Distinct registered domains.
+        unique_domains: usize,
+        /// Distinct address observations.
+        unique_ips: usize,
+        /// Distinct open ports.
+        open_ports: usize,
+    },
     /// Certificate-transparency counts.
     CertificateTransparency {
         /// Provider records with the expected shape.
@@ -136,6 +179,11 @@ pub(crate) fn analyze_provider_response(
     baseline: ProviderBaseline<'_>,
 ) -> Option<ProviderAnalysis> {
     match provider {
+        "wayback" if scanner_id == "archive-history" => Some(analyze_wayback(response)),
+        "rdap" if matches!(scanner_id, "asn-lookup" | "rdap-lookup") => {
+            Some(analyze_rdap(scanner_id, response))
+        }
+        "shodan" if scanner_id == "associated-hosts" => Some(analyze_shodan_host(response)),
         "crtsh" => Some(analyze_certificate_transparency(
             scanner_id, response, baseline,
         )),
@@ -149,6 +197,260 @@ pub(crate) fn analyze_provider_response(
         "hibp" if scanner_id == "dark-web-monitoring" => Some(analyze_hibp_stealer_logs(response)),
         "hibp" if scanner_id == "pastebin-monitoring" => Some(analyze_hibp_pastes(response)),
         _ => None,
+    }
+}
+
+fn analyze_wayback(response: &Value) -> ProviderAnalysis {
+    let mut urls = BTreeSet::new();
+    let mut statuses = BTreeSet::new();
+    let mut digests = BTreeSet::new();
+    let mut years = BTreeSet::new();
+    let mut snapshots = 0_usize;
+    for row in response
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS.saturating_add(1))
+    {
+        let Some(columns) = row.as_array() else {
+            continue;
+        };
+        let Some(timestamp) = columns.first().and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(year) = parse_snapshot_year(timestamp) else {
+            continue;
+        };
+        let Some(original) = columns
+            .get(1)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        let Some(status) = columns
+            .get(2)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| (100..=599).contains(value))
+        else {
+            continue;
+        };
+        let Some(digest) = columns
+            .get(3)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        snapshots += 1;
+        urls.insert(original.to_owned());
+        statuses.insert(status);
+        digests.insert(digest.to_owned());
+        years.insert(year);
+        if snapshots == MAX_PROVIDER_RECORDS {
+            break;
+        }
+    }
+    let findings = (snapshots > 0)
+        .then_some(ProviderFinding {
+            key: "archived-snapshots-observed",
+            title: "The archive provider returned historical snapshots",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        })
+        .into_iter()
+        .collect();
+    ProviderAnalysis {
+        summary: ProviderSummary::ArchiveHistory {
+            snapshots,
+            unique_urls: urls.len(),
+            unique_statuses: statuses.len(),
+            unique_digests: digests.len(),
+            earliest_year: years.first().copied(),
+            latest_year: years.last().copied(),
+        },
+        findings,
+    }
+}
+
+fn parse_snapshot_year(timestamp: &str) -> Option<u16> {
+    (timestamp.len() == 14 && timestamp.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| timestamp.get(..4)?.parse::<u16>().ok())
+        .flatten()
+        .filter(|year| (1990..=2100).contains(year))
+}
+
+fn analyze_rdap(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    let mut handles = BTreeSet::new();
+    let mut roles = BTreeSet::new();
+    let mut autonomous_systems = BTreeSet::new();
+    if let Some(handle) = response.get("handle").and_then(Value::as_str) {
+        handles.insert(handle.to_owned());
+    }
+    let mut entities = 0_usize;
+    for entity in response
+        .get("entities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(entity) = entity.as_object() else {
+            continue;
+        };
+        entities += 1;
+        if let Some(handle) = entity.get("handle").and_then(Value::as_str) {
+            handles.insert(handle.to_owned());
+        }
+        roles.extend(
+            entity
+                .get("roles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(128)
+                .map(str::to_ascii_lowercase),
+        );
+    }
+    for key in ["startAutnum", "endAutnum"] {
+        if let Some(value) = response.get(key).and_then(Value::as_u64) {
+            autonomous_systems.insert(value);
+        }
+    }
+    autonomous_systems.extend(
+        response
+            .get("arin_originas0_originautnums")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .take(MAX_PROVIDER_RECORDS),
+    );
+    let networks = usize::from(
+        response
+            .get("startAddress")
+            .and_then(Value::as_str)
+            .is_some()
+            || response.get("endAddress").and_then(Value::as_str).is_some(),
+    ) + response
+        .get("cidr0_cidrs")
+        .and_then(Value::as_array)
+        .map_or(0, |values| values.len().min(MAX_PROVIDER_RECORDS));
+    let notices = ["notices", "remarks"]
+        .into_iter()
+        .filter_map(|key| response.get(key).and_then(Value::as_array))
+        .flat_map(|values| values.iter())
+        .filter(|value| value.is_object())
+        .take(MAX_PROVIDER_RECORDS)
+        .count();
+    let observed = !handles.is_empty()
+        || entities > 0
+        || !roles.is_empty()
+        || networks > 0
+        || !autonomous_systems.is_empty()
+        || notices > 0;
+    let findings = observed
+        .then_some(ProviderFinding {
+            key: if scanner_id == "asn-lookup" {
+                "autonomous-system-context-observed"
+            } else {
+                "registration-data-observed"
+            },
+            title: if scanner_id == "asn-lookup" {
+                "The provider returned autonomous-system registration context"
+            } else {
+                "The provider returned public registration context"
+            },
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        })
+        .into_iter()
+        .collect();
+    ProviderAnalysis {
+        summary: ProviderSummary::Registration {
+            handles: handles.len(),
+            entities,
+            roles: roles.len(),
+            networks: networks.min(MAX_PROVIDER_RECORDS),
+            autonomous_systems: autonomous_systems.len(),
+            notices,
+        },
+        findings,
+    }
+}
+
+fn analyze_shodan_host(response: &Value) -> ProviderAnalysis {
+    let mut hostnames = BTreeSet::new();
+    let mut domains = BTreeSet::new();
+    let mut ips = BTreeSet::new();
+    let mut ports = BTreeSet::new();
+    hostnames.extend(
+        response
+            .get("hostnames")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(MAX_PROVIDER_RECORDS)
+            .map(str::to_ascii_lowercase),
+    );
+    domains.extend(
+        response
+            .get("domains")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(MAX_PROVIDER_RECORDS)
+            .map(str::to_ascii_lowercase),
+    );
+    if let Some(ip) = response.get("ip_str").and_then(Value::as_str) {
+        ips.insert(ip.to_owned());
+    }
+    let mut records = 0_usize;
+    for service in response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(service) = service.as_object() else {
+            continue;
+        };
+        records += 1;
+        if let Some(port) = service
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+        {
+            ports.insert(port);
+        }
+        if let Some(ip) = service.get("ip_str").and_then(Value::as_str) {
+            ips.insert(ip.to_owned());
+        }
+    }
+    let observed = !hostnames.is_empty() || !domains.is_empty();
+    let findings = observed
+        .then_some(ProviderFinding {
+            key: "associated-hosts-observed",
+            title: "The provider returned associated host observations",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        })
+        .into_iter()
+        .collect();
+    ProviderAnalysis {
+        summary: ProviderSummary::HostIntelligence {
+            records,
+            unique_hostnames: hostnames.len(),
+            unique_domains: domains.len(),
+            unique_ips: ips.len(),
+            open_ports: ports.len(),
+        },
+        findings,
     }
 }
 
@@ -261,15 +563,27 @@ fn analyze_ripestat(scanner_id: &str, response: &Value) -> ProviderAnalysis {
             unknown_routes += 1;
         }
     }
-    let findings = if scanner_id == "rpki-route-validity-check" && invalid_routes > 0 {
-        vec![ProviderFinding {
+    let observed = prefixes + origins + valid_routes + invalid_routes + unknown_routes > 0;
+    let findings = match scanner_id {
+        "rpki-route-validity-check" if invalid_routes > 0 => vec![ProviderFinding {
             key: "rpki-route-invalid",
             title: "The route origin is invalid under the observed RPKI state",
             severity: Severity::High,
             confidence: Confidence::Confirmed,
-        }]
-    } else {
-        Vec::new()
+        }],
+        "bgp-route-analysis" if observed => vec![ProviderFinding {
+            key: "routing-observations-present",
+            title: "The provider returned routing observations",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        "asn-lookup" if observed => vec![ProviderFinding {
+            key: "autonomous-system-context-observed",
+            title: "The provider returned autonomous-system routing context",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        _ => Vec::new(),
     };
     ProviderAnalysis {
         summary: ProviderSummary::Routing {
@@ -448,22 +762,32 @@ fn analyze_urlscan(scanner_id: &str, response: &Value) -> ProviderAnalysis {
                 == Some(true),
         );
     }
-    let findings = if scanner_id == "passive-dns-history" && records > 0 {
-        vec![ProviderFinding {
+    let findings = match scanner_id {
+        "passive-dns-history" if records > 0 => vec![ProviderFinding {
             key: "historical-dns-observations",
             title: "The provider returned historical domain or address observations",
             severity: Severity::Info,
             confidence: Confidence::Confirmed,
-        }]
-    } else if malicious_records > 0 {
-        vec![ProviderFinding {
+        }],
+        "reverse-ip-lookup" if records > 0 => vec![ProviderFinding {
+            key: "reverse-ip-host-observed",
+            title: "The provider returned a host observation for the address",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        "associated-hosts" if records > 0 => vec![ProviderFinding {
+            key: "associated-hosts-observed",
+            title: "The provider returned associated host observations",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        _ if malicious_records > 0 => vec![ProviderFinding {
             key: "malicious-urlscan-observation",
             title: "URLScan marked one or more observations as malicious",
             severity: Severity::High,
             confidence: Confidence::Confirmed,
-        }]
-    } else {
-        Vec::new()
+        }],
+        _ => Vec::new(),
     };
     ProviderAnalysis {
         summary: ProviderSummary::UrlScan {
@@ -512,15 +836,36 @@ fn analyze_certificate_transparency(
         }),
         ProviderBaseline::None => false,
     };
-    let findings = if scanner_id == "rogue-certificate-check" && unexpected {
-        vec![ProviderFinding {
+    let concrete_names = names
+        .iter()
+        .filter(|name| is_concrete_hostname(name))
+        .count();
+    let findings = match scanner_id {
+        "rogue-certificate-check" if unexpected => vec![ProviderFinding {
             key: "unexpected-certificate-issuer",
             title: "Certificate transparency contains an unexpected issuer",
             severity: Severity::High,
             confidence: Confidence::Confirmed,
-        }]
-    } else {
-        Vec::new()
+        }],
+        "ct-log-query" if records > 0 => vec![ProviderFinding {
+            key: "certificate-transparency-record-observed",
+            title: "Certificate transparency records were observed",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        "subdomain-enum" if !names.is_empty() => vec![ProviderFinding {
+            key: "subdomain-observations-present",
+            title: "Certificate transparency returned hostname observations",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        "associated-hosts" if concrete_names > 0 => vec![ProviderFinding {
+            key: "associated-hosts-observed",
+            title: "Certificate transparency returned associated host observations",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        }],
+        _ => Vec::new(),
     };
     ProviderAnalysis {
         summary: ProviderSummary::CertificateTransparency {
@@ -531,6 +876,43 @@ fn analyze_certificate_transparency(
         },
         findings,
     }
+}
+
+fn is_concrete_hostname(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty()
+        || name.len() > 253
+        || !name.is_ascii()
+        || name.contains('*')
+        || name.parse::<std::net::IpAddr>().is_ok()
+    {
+        return false;
+    }
+
+    let mut labels = name.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    let Some(second) = labels.next() else {
+        return false;
+    };
+    valid_hostname_label(first) && valid_hostname_label(second) && labels.all(valid_hostname_label)
+}
+
+fn valid_hostname_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 #[cfg(test)]
@@ -742,7 +1124,8 @@ mod tests {
         )
         .ok_or("RIPEstat response must be supported")?;
 
-        assert!(analysis.findings.is_empty());
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].key, "routing-observations-present");
         assert!(matches!(
             analysis.summary,
             ProviderSummary::Routing {
@@ -1087,6 +1470,255 @@ mod tests {
             }
         );
         assert!(!serde_json::to_string(&analysis)?.contains("private"));
+        Ok(())
+    }
+
+    #[test]
+    fn archive_history_is_bounded_deduplicated_and_redacted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!([
+            ["timestamp", "original", "statuscode", "digest"],
+            [
+                "20200102030405",
+                "https://private.example/a",
+                "200",
+                "secret-a"
+            ],
+            [
+                "20210102030405",
+                "https://private.example/a",
+                "200",
+                "secret-a"
+            ],
+            [
+                "20220102030405",
+                "https://private.example/b",
+                "404",
+                "secret-b"
+            ],
+            ["invalid", "https://ignored.example", "999", "secret-c"]
+        ]);
+        let analysis = analyze_provider_response(
+            "archive-history",
+            "wayback",
+            &response,
+            ProviderBaseline::None,
+        )
+        .ok_or("Wayback response must be supported")?;
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::ArchiveHistory {
+                snapshots: 3,
+                unique_urls: 2,
+                unique_statuses: 2,
+                unique_digests: 2,
+                earliest_year: Some(2020),
+                latest_year: Some(2022),
+            }
+        );
+        assert_eq!(analysis.findings[0].key, "archived-snapshots-observed");
+        let serialized = serde_json::to_string(&analysis)?;
+        assert!(!serialized.contains("private.example"));
+        assert!(!serialized.contains("secret-a"));
+
+        let empty = analyze_provider_response(
+            "archive-history",
+            "wayback",
+            &json!([]),
+            ProviderBaseline::None,
+        )
+        .ok_or("Wayback response must be supported")?;
+        assert!(empty.findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn registration_analysis_counts_context_without_retaining_contact_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "handle": "NET-PRIVATE",
+            "startAddress": "192.0.2.0",
+            "endAddress": "192.0.2.255",
+            "startAutnum": 64500,
+            "endAutnum": 64500,
+            "entities": [
+                {"handle": "CONTACT-PRIVATE", "roles": ["registrant", "registrant"], "email": "secret@example.com"},
+                "malformed"
+            ],
+            "notices": [{"title": "private notice", "description": ["secret text"]}]
+        });
+        for scanner_id in ["rdap-lookup", "asn-lookup"] {
+            let analysis =
+                analyze_provider_response(scanner_id, "rdap", &response, ProviderBaseline::None)
+                    .ok_or("RDAP response must be supported")?;
+            assert!(matches!(
+                analysis.summary,
+                ProviderSummary::Registration {
+                    handles: 2,
+                    entities: 1,
+                    roles: 1,
+                    networks: 1,
+                    autonomous_systems: 1,
+                    notices: 1,
+                }
+            ));
+            assert_eq!(analysis.findings.len(), 1);
+            let serialized = serde_json::to_string(&analysis)?;
+            assert!(!serialized.contains("secret@example.com"));
+            assert!(!serialized.contains("CONTACT-PRIVATE"));
+            assert!(!serialized.contains("private notice"));
+        }
+        let malformed = analyze_provider_response(
+            "rdap-lookup",
+            "rdap",
+            &json!({"entities": "private", "vcardArray": ["secret@example.com"]}),
+            ProviderBaseline::None,
+        )
+        .ok_or("RDAP response must be supported")?;
+        assert!(malformed.findings.is_empty());
+        assert!(!serde_json::to_string(&malformed)?.contains("secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn host_intelligence_is_deduplicated_and_redacted() -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "hostnames": ["PRIVATE.example", "private.example"],
+            "domains": ["example", "example"],
+            "ip_str": "192.0.2.10",
+            "data": [
+                {"port": 443, "ip_str": "192.0.2.10", "banner": "secret"},
+                {"port": 443},
+                {"port": 70000},
+                "malformed"
+            ]
+        });
+        let analysis = analyze_provider_response(
+            "associated-hosts",
+            "shodan",
+            &response,
+            ProviderBaseline::None,
+        )
+        .ok_or("Shodan response must be supported")?;
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::HostIntelligence {
+                records: 3,
+                unique_hostnames: 1,
+                unique_domains: 1,
+                unique_ips: 1,
+                open_ports: 1,
+            }
+        );
+        assert_eq!(analysis.findings[0].key, "associated-hosts-observed");
+        let serialized = serde_json::to_string(&analysis)?;
+        assert!(!serialized.contains("PRIVATE.example"));
+        assert!(!serialized.contains("192.0.2.10"));
+        assert!(!serialized.contains("secret"));
+
+        let target_only = analyze_provider_response(
+            "associated-hosts",
+            "shodan",
+            &json!({"ip_str": "192.0.2.10", "data": [{"port": 443}]}),
+            ProviderBaseline::None,
+        )
+        .ok_or("Shodan response must be supported")?;
+        assert!(target_only.findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn hostname_scanners_require_a_crt_name_not_only_an_issuer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let issuer_only = json!([{"issuer_name": "Private CA"}]);
+        for scanner_id in ["subdomain-enum", "associated-hosts"] {
+            let analysis = analyze_provider_response(
+                scanner_id,
+                "crtsh",
+                &issuer_only,
+                ProviderBaseline::None,
+            )
+            .ok_or("crt.sh response must be supported")?;
+            assert!(analysis.findings.is_empty());
+            assert!(matches!(
+                analysis.summary,
+                ProviderSummary::CertificateTransparency {
+                    records: 1,
+                    unique_names: 0,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn associated_hosts_requires_a_concrete_crt_hostname() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let wildcard_only = json!([{
+            "issuer_name": "Private CA",
+            "name_value": "*.private.example"
+        }]);
+        let analysis = analyze_provider_response(
+            "associated-hosts",
+            "crtsh",
+            &wildcard_only,
+            ProviderBaseline::None,
+        )
+        .ok_or("crt.sh response must be supported")?;
+
+        assert!(analysis.findings.is_empty());
+        assert!(matches!(
+            analysis.summary,
+            ProviderSummary::CertificateTransparency {
+                records: 1,
+                unique_names: 1,
+                wildcard_names: 1,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_provider_shapes_emit_scanner_specific_observation_findings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "ct-log-query",
+                "crtsh",
+                json!([{"issuer_name": "Private CA", "name_value": "private.example"}]),
+                "certificate-transparency-record-observed",
+            ),
+            (
+                "subdomain-enum",
+                "crtsh",
+                json!([{"issuer_name": "Private CA", "name_value": "*.private.example"}]),
+                "subdomain-observations-present",
+            ),
+            (
+                "reverse-ip-lookup",
+                "urlscan",
+                json!({"results": [{"page": {"domain": "private.example", "ip": "192.0.2.1"}}]}),
+                "reverse-ip-host-observed",
+            ),
+            (
+                "bgp-route-analysis",
+                "ripestat",
+                json!({"data": {"routes": [{"status": "mystery"}]}}),
+                "routing-observations-present",
+            ),
+        ];
+        for (scanner_id, provider, response, key) in cases {
+            let analysis =
+                analyze_provider_response(scanner_id, provider, &response, ProviderBaseline::None)
+                    .ok_or("provider response must be supported")?;
+            assert_eq!(analysis.findings[0].key, key);
+            let serialized = serde_json::to_string(&analysis)?;
+            assert!(!serialized.contains("private.example"));
+            assert!(!serialized.contains("192.0.2.1"));
+            assert!(!serialized.contains("Private CA"));
+        }
         Ok(())
     }
 }

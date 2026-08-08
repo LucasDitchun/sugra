@@ -10,10 +10,12 @@ use sugra_core::{HttpMethod, HttpRedirectDecision, HttpResponse};
 use sugra_domain::{Confidence, Finding, Severity};
 use url::Url;
 
+const MAX_FINDING_EVIDENCE: usize = 32;
+
 /// Safe signals derived from one bounded HTTP response body.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WebSignals {
-    pub(crate) title: Option<String>,
+    pub(crate) title_sha256: Option<String>,
     pub(crate) links: usize,
     pub(crate) scripts: usize,
     pub(crate) inline_scripts: usize,
@@ -41,6 +43,7 @@ pub(crate) struct WebSignals {
     pub(crate) obfuscation_markers: usize,
     pub(crate) browser_feature_markers: usize,
     pub(crate) captcha_markers: usize,
+    pub(crate) cms_markers: usize,
     pub(crate) privacy_markers: usize,
     pub(crate) cloud_markers: usize,
     pub(crate) generator: Option<String>,
@@ -58,6 +61,7 @@ pub(crate) struct WebSample {
     pub(crate) duration_ms: u64,
     pub(crate) bytes: usize,
     pub(crate) redirect_count: usize,
+    cache_reusable: bool,
     has_security_contact: bool,
 }
 
@@ -82,7 +86,8 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
     let text = String::from_utf8_lossy(&response.body);
     let lower = text.to_ascii_lowercase();
     let document = Html::parse_document(&text);
-    let title = first_text(&document, "title", 256);
+    let title_sha256 = first_text(&document, "title", 256)
+        .map(|title| hex::encode(Sha256::digest(title.as_bytes())));
     let script_selector = selector("script[src]");
     let scripts = count(&document, "script");
     let inline_scripts =
@@ -95,7 +100,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
     let password_selector = selector("input[type='password' i]");
     let password_inputs = count_selected(&document, password_selector.as_ref());
     WebSignals {
-        title,
+        title_sha256,
         links: count(&document, "a[href]"),
         scripts,
         inline_scripts,
@@ -151,7 +156,8 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
                 "websocket",
             ],
         ),
-        captcha_markers: marker_count(&lower, &["recaptcha", "hcaptcha", "turnstile"]),
+        captcha_markers: captcha_integrations(&document, &response.final_url),
+        cms_markers: cms_markers(&document, &response.final_url),
         privacy_markers: marker_count(&lower, &["privacy", "cookie consent", "gdpr", "opt-out"]),
         cloud_markers: marker_count(
             &lower,
@@ -161,7 +167,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
                 "blob.core.windows.net",
             ],
         ),
-        generator: generator(&document),
+        generator: recognized_generator(&document),
         text_bytes: document.root_element().text().map(str::len).sum(),
     }
 }
@@ -174,10 +180,10 @@ pub(crate) fn observation(
     signals: &WebSignals,
 ) -> Value {
     json!({
-        "probe": label,
+        "probe": safe_probe_label(label),
         "method": format!("{method:?}").to_ascii_uppercase(),
         "status": response.status,
-        "headers": response.headers,
+        "headers": response.headers.keys().take(256).collect::<Vec<_>>(),
         "cookies": response.cookies,
         "redirects": response.redirects.iter().map(|redirect| json!({
             "status": redirect.status,
@@ -207,6 +213,7 @@ pub(crate) fn sample(label: String, response: &HttpResponse) -> WebSample {
         duration_ms: response.duration_ms,
         bytes: response.body.len(),
         redirect_count: response.redirects.len(),
+        cache_reusable: response_is_reusable(response),
         has_security_contact: has_valid_security_contact(&response.body),
     }
 }
@@ -373,14 +380,88 @@ fn marker_count(text: &str, markers: &[&str]) -> usize {
         .sum()
 }
 
-fn generator(document: &Html) -> Option<String> {
+fn recognized_generator(document: &Html) -> Option<String> {
     selector("meta[name='generator' i]").and_then(|selector| {
         document
             .select(&selector)
             .next()
             .and_then(|element| element.value().attr("content"))
-            .map(|value| value.chars().take(128).collect())
+            .and_then(recognized_cms_name)
     })
+}
+
+fn recognized_cms_name(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    ["wordpress", "drupal", "joomla", "ghost"]
+        .into_iter()
+        .find(|candidate| lower.contains(candidate))
+        .map(str::to_owned)
+}
+
+fn cms_markers(document: &Html, base: &Url) -> usize {
+    let Some(selector) = selector("[href], [src], [action]") else {
+        return 0;
+    };
+    document
+        .select(&selector)
+        .filter_map(|element| {
+            ["href", "src", "action"]
+                .into_iter()
+                .find_map(|name| element.value().attr(name))
+        })
+        .filter_map(|value| base.join(value).ok())
+        .filter(|url| {
+            let path = url.path().to_ascii_lowercase();
+            path.contains("/wp-content/")
+                || path.contains("/wp-includes/")
+                || path.contains("/sites/default/")
+                || path.contains("/media/system/")
+        })
+        .take(32)
+        .count()
+}
+
+fn captcha_integrations(document: &Html, base: &Url) -> usize {
+    let class_markers = selector("[class]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|element| {
+                element
+                    .value()
+                    .attr("class")
+                    .into_iter()
+                    .flat_map(str::split_ascii_whitespace)
+                    .any(|class| {
+                        ["g-recaptcha", "h-captcha", "cf-turnstile"]
+                            .iter()
+                            .any(|marker| class.eq_ignore_ascii_case(marker))
+                    })
+            })
+            .take(32)
+            .count()
+    });
+    let script_markers = selector("script[src]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter_map(|script| {
+                script
+                    .value()
+                    .attr("src")
+                    .and_then(|value| base.join(value).ok())
+            })
+            .filter(|url| {
+                let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+                let path = url.path().to_ascii_lowercase();
+                ((host == "google.com" || host.ends_with(".google.com"))
+                    && path.contains("/recaptcha/"))
+                    || ((host == "hcaptcha.com" || host.ends_with(".hcaptcha.com"))
+                        && path.contains("/captcha/"))
+                    || (host == "challenges.cloudflare.com" && path.contains("/turnstile/"))
+            })
+            .take(32)
+            .count()
+    });
+    class_markers.saturating_add(script_markers).min(32)
 }
 
 fn safe_url(url: &Url) -> String {
@@ -390,6 +471,24 @@ fn safe_url(url: &Url) -> String {
     safe.set_query(None);
     safe.set_fragment(None);
     safe.to_string()
+}
+
+fn safe_probe_label(label: &str) -> String {
+    let Some((kind, value)) = label.split_once(':') else {
+        return label.chars().take(128).collect();
+    };
+    if let Ok(url) = Url::parse(value) {
+        return format!(
+            "{}:{}",
+            kind.chars().take(64).collect::<String>(),
+            safe_url(&url)
+        );
+    }
+    format!(
+        "{}:{}",
+        kind.chars().take(64).collect::<String>(),
+        hex::encode(Sha256::digest(value.as_bytes()))
+    )
 }
 
 fn external_scripts(
@@ -522,18 +621,13 @@ fn api_findings(
 ) -> Vec<Finding> {
     let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
-        "api-schema-grabber"
-            if response.status == 200
-                && (lower.contains("openapi") || lower.contains("swagger")) =>
-        {
-            one(
-                "api-schema-published",
-                "A machine-readable API schema is publicly available",
-                Severity::Info,
-                Confidence::Confirmed,
-                evidence,
-            )
-        }
+        "api-schema-grabber" if response.status == 200 && is_api_schema(&response.body) => one(
+            "api-schema-published",
+            "A machine-readable API schema is publicly available",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ),
         "file-upload-surface-finder" if signals.file_inputs > 0 => one(
             "file-upload-surface",
             "A file upload input is present",
@@ -594,17 +688,52 @@ fn api_findings(
     }
 }
 
+fn is_api_schema(body: &[u8]) -> bool {
+    const MAX_SCHEMA_BYTES: usize = 1_048_576;
+    if body.len() > MAX_SCHEMA_BYTES {
+        return false;
+    }
+    let Ok(document) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(root) = document.as_object() else {
+        return false;
+    };
+    let has_paths = root.get("paths").is_some_and(Value::is_object);
+    let openapi = root
+        .get("openapi")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version.starts_with("3."));
+    let swagger = root
+        .get("swagger")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version.starts_with("2."));
+    let graphql = root
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("__schema"))
+        .is_some_and(Value::is_object);
+    (has_paths && (openapi || swagger)) || graphql
+}
+
 fn crawler_findings(
     id: &str,
     response: &HttpResponse,
-    _signals: &WebSignals,
+    signals: &WebSignals,
     evidence: usize,
 ) -> Vec<Finding> {
     match id {
-        "broken-links" if response.status >= 400 => one(
+        "broken-links" if (400..=599).contains(&response.status) => one(
             "broken-link",
             "An in-scope resource returned an error status",
             Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        ),
+        "crawler" if is_crawlable_response(response) && signals.links > 0 => one(
+            "crawlable-links-observed",
+            "The successful HTML response contains crawl candidates",
+            Severity::Info,
             Confidence::Confirmed,
             evidence,
         ),
@@ -626,7 +755,6 @@ fn detection_findings(
     evidence: usize,
 ) -> Vec<Finding> {
     let headers = &response.headers;
-    let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
         "cdn-detection" if has_header(headers, &["cf-ray", "x-amz-cf-id", "x-cdn", "x-cache"]) => {
             one(
@@ -644,20 +772,13 @@ fn detection_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "cms-detection"
-            if signals.generator.is_some()
-                || ["wp-content", "drupalsettings", "joomla!"]
-                    .iter()
-                    .any(|marker| lower.contains(marker)) =>
-        {
-            one(
-                "cms-signal-observed",
-                "Public content-management-system signals are present",
-                Severity::Info,
-                Confidence::Inferred,
-                evidence,
-            )
-        }
+        "cms-detection" if signals.generator.is_some() || signals.cms_markers > 0 => one(
+            "cms-signal-observed",
+            "Public content-management-system signals are present",
+            Severity::Info,
+            Confidence::Inferred,
+            evidence,
+        ),
         "login-page-brute-identifier" if signals.password_inputs > 0 => one(
             "login-surface-observed",
             "A password-based login surface is present",
@@ -802,10 +923,11 @@ fn fuzz_findings(
 }
 
 fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Finding> {
+    if id == "csp-deep-analyzer" {
+        return csp_findings(response, evidence);
+    }
     let mut findings = Vec::new();
-    if is_html_response(response)
-        && matches!(id, "http-headers" | "http-security" | "csp-deep-analyzer")
-    {
+    if is_html_response(response) && matches!(id, "http-headers" | "http-security") {
         let mut headers = vec!["content-security-policy", "x-content-type-options"];
         if response.final_url.scheme() == "https" {
             headers.push("strict-transport-security");
@@ -846,6 +968,143 @@ fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Fi
         ));
     }
     findings
+}
+
+#[derive(Debug, Default)]
+struct CspSummary {
+    effective_directives: usize,
+    unsafe_eval: bool,
+    unsafe_inline: bool,
+    wildcard_source: bool,
+}
+
+fn csp_findings(response: &HttpResponse, evidence: usize) -> Vec<Finding> {
+    if !is_html_response(response) {
+        return Vec::new();
+    }
+    let Some(policy) = response.headers.get("content-security-policy") else {
+        return if response
+            .headers
+            .get("content-security-policy-report-only")
+            .is_some_and(|policy| summarize_csp(policy).effective_directives > 0)
+        {
+            one(
+                "csp-not-enforced",
+                "A Content Security Policy is present only in report-only mode",
+                Severity::Low,
+                Confidence::Confirmed,
+                evidence,
+            )
+        } else {
+            one(
+                "csp-not-observed",
+                "No enforced Content Security Policy was observed",
+                Severity::Low,
+                Confidence::Confirmed,
+                evidence,
+            )
+        };
+    };
+    let summary = summarize_csp(policy);
+    if summary.effective_directives == 0 {
+        return one(
+            "csp-no-effective-directive",
+            "The Content Security Policy has no effective enforcement directive",
+            Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        );
+    }
+    let mut findings = Vec::new();
+    if summary.unsafe_inline {
+        findings.extend(one(
+            "csp-unsafe-inline",
+            "The Content Security Policy permits inline execution",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if summary.unsafe_eval {
+        findings.extend(one(
+            "csp-unsafe-eval",
+            "The Content Security Policy permits dynamic code evaluation",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if summary.wildcard_source {
+        findings.extend(one(
+            "csp-wildcard-source",
+            "The Content Security Policy permits an unrestricted source wildcard",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    findings
+}
+
+fn summarize_csp(policy: &str) -> CspSummary {
+    let mut summary = CspSummary::default();
+    for directive in policy.split(';').take(128) {
+        let mut parts = directive.split_ascii_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !is_csp_enforcement_directive(name) {
+            continue;
+        }
+        let sources = parts.take(128).collect::<Vec<_>>();
+        if sources.is_empty() && !csp_directive_allows_empty_value(name) {
+            continue;
+        }
+        summary.effective_directives += 1;
+        for source in sources {
+            summary.unsafe_inline |= source.eq_ignore_ascii_case("'unsafe-inline'");
+            summary.unsafe_eval |= source.eq_ignore_ascii_case("'unsafe-eval'");
+            summary.wildcard_source |= source == "*";
+        }
+    }
+    summary
+}
+
+fn csp_directive_allows_empty_value(name: &str) -> bool {
+    [
+        "sandbox",
+        "upgrade-insecure-requests",
+        "block-all-mixed-content",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_csp_enforcement_directive(name: &str) -> bool {
+    [
+        "default-src",
+        "script-src",
+        "style-src",
+        "img-src",
+        "connect-src",
+        "font-src",
+        "object-src",
+        "media-src",
+        "frame-src",
+        "child-src",
+        "worker-src",
+        "manifest-src",
+        "base-uri",
+        "form-action",
+        "frame-ancestors",
+        "sandbox",
+        "upgrade-insecure-requests",
+        "block-all-mixed-content",
+        "require-trusted-types-for",
+        "trusted-types",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 fn permits_untrusted_cors_origin(value: &str) -> bool {
@@ -979,6 +1238,10 @@ fn is_html_response(response: &HttpResponse) -> bool {
         .any(|tag| html_prefix_matches(prefix, tag))
 }
 
+pub(crate) fn is_crawlable_response(response: &HttpResponse) -> bool {
+    response.status == 200 && is_html_response(response)
+}
+
 fn html_prefix_matches(value: &str, tag: &str) -> bool {
     value
         .get(..tag.len())
@@ -1055,7 +1318,7 @@ fn metadata_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "crawl-rules" if response.status == 200 && lower.contains("user-agent:") => one(
+        "crawl-rules" if has_valid_robots_policy(response) => one(
             "crawl-rules-observed",
             "A robots policy is published",
             Severity::Info,
@@ -1115,6 +1378,44 @@ fn metadata_findings(
         }
         _ => Vec::new(),
     }
+}
+
+fn has_valid_robots_policy(response: &HttpResponse) -> bool {
+    const MAX_ROBOTS_BYTES: usize = 256 * 1024;
+    if response.status != 200
+        || response.final_url.path() != "/robots.txt"
+        || response.body.len() > MAX_ROBOTS_BYTES
+        || response
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&response.body) else {
+        return false;
+    };
+    let mut has_agent = false;
+    let mut has_directive = false;
+    for line in text.lines().take(4096) {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("user-agent") && !value.is_empty() {
+            has_agent = true;
+        } else if has_agent
+            && ["allow", "disallow", "crawl-delay", "sitemap"]
+                .iter()
+                .any(|directive| name.eq_ignore_ascii_case(directive))
+            && !value.is_empty()
+        {
+            has_directive = true;
+        }
+    }
+    has_agent && has_directive
 }
 
 fn has_valid_security_contact(body: &[u8]) -> bool {
@@ -1283,8 +1584,38 @@ fn cookie_diff(samples: &[WebSample]) -> Vec<Finding> {
     }
 }
 
+fn response_is_reusable(response: &HttpResponse) -> bool {
+    if response.status != 200 {
+        return false;
+    }
+    let Some(value) = response.headers.get("cache-control") else {
+        return false;
+    };
+    let directives = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if directives.iter().any(|directive| {
+        directive.eq_ignore_ascii_case("no-store")
+            || directive.eq_ignore_ascii_case("no-cache")
+            || directive.eq_ignore_ascii_case("private")
+    }) {
+        return false;
+    }
+    directives.iter().any(|directive| {
+        directive.split_once('=').is_some_and(|(name, seconds)| {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "max-age" | "s-maxage"
+            ) && seconds
+                .trim()
+                .trim_matches('"')
+                .parse::<u64>()
+                .is_ok_and(|seconds| seconds > 0)
+        })
+    })
+}
+
 fn cache_diff(samples: &[WebSample]) -> Vec<Finding> {
     if samples.len() >= 2
+        && samples.iter().all(|sample| sample.cache_reusable)
         && samples
             .windows(2)
             .all(|window| window[0].body_sha256 != window[1].body_sha256)
@@ -1474,7 +1805,7 @@ fn aggregate_one(
             title: title.into(),
             severity,
             confidence,
-            evidence: (0..samples.len()).collect(),
+            evidence: (0..samples.len().min(MAX_FINDING_EVIDENCE)).collect(),
         }]
     }
 }
@@ -1549,10 +1880,14 @@ mod tests {
     #[test]
     fn structured_observation_fingerprints_emails_and_redacts_urls() {
         let mut response = response(
-            r#"<html><head><title>Example</title></head><body>
+            r#"<html><head><title>private-title@example.test</title></head><body>
             <a href="mailto:person@example.test">Contact</a>
             <script src="https://cdn.example.net/app.js"></script>
             </body></html>"#,
+        );
+        response.headers.insert(
+            "x-debug-contact".into(),
+            "header-person@example.test".into(),
         );
         response.cookies.push(HttpCookie {
             name_sha256: "cookie-name-hash".into(),
@@ -1573,11 +1908,21 @@ mod tests {
         });
 
         let signals = signals(&response);
-        let serialized = observation("root", HttpMethod::Get, &response, &signals).to_string();
+        let serialized = observation(
+            "discovered:https://example.test/page?email=label-person@example.test",
+            HttpMethod::Get,
+            &response,
+            &signals,
+        )
+        .to_string();
 
-        assert_eq!(signals.email_fingerprints.len(), 1);
+        assert_eq!(signals.email_fingerprints.len(), 2);
+        assert_eq!(signals.title_sha256.as_deref().map(str::len), Some(64));
         assert_eq!(signals.external_script_hosts, ["cdn.example.net"]);
         assert!(!serialized.contains("person@example.test"));
+        assert!(!serialized.contains("private-title@example.test"));
+        assert!(!serialized.contains("header-person@example.test"));
+        assert!(!serialized.contains("label-person@example.test"));
         assert!(!serialized.contains("secret=value"));
         assert!(!serialized.contains("session=value"));
         assert!(!serialized.contains("#fragment"));
@@ -1586,7 +1931,7 @@ mod tests {
 
     #[test]
     fn schema_and_security_findings_are_scanner_specific() {
-        let schema = response(r#"{"openapi":"3.1.0"}"#);
+        let schema = response(r#"{"openapi":"3.1.0","paths":{}}"#);
         let schema_signals = signals(&schema);
         assert_eq!(
             response_findings("api-schema-grabber", &schema, &schema_signals, 0)[0].key,
@@ -1603,6 +1948,297 @@ mod tests {
         assert!(keys.contains("missing-content-security-policy"));
         assert!(keys.contains("missing-strict-transport-security"));
         assert!(keys.contains("missing-x-content-type-options"));
+    }
+
+    #[test]
+    fn api_schema_grabber_requires_a_structured_openapi_document() {
+        let positive =
+            response(r#"{"openapi":"3.1.0","info":{"title":"private@example.test"},"paths":{}}"#);
+        let findings = response_findings("api-schema-grabber", &positive, &signals(&positive), 7);
+        assert_eq!(findings[0].key, "api-schema-published");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = response(r#"{"note":"the swagger migration is not a schema"}"#);
+        assert!(finding_keys("api-schema-grabber", &negative).is_empty());
+
+        let edge = response(r#"{"swagger":"2.0","paths":{}}"#);
+        assert_eq!(
+            finding_keys("api-schema-grabber", &edge),
+            BTreeSet::from(["api-schema-published".into()])
+        );
+
+        let malformed = response(r#"{"openapi":"3.1.0","paths": private@example.test"#);
+        assert!(finding_keys("api-schema-grabber", &malformed).is_empty());
+    }
+
+    #[test]
+    fn broken_links_accepts_only_valid_http_error_statuses() {
+        let mut positive = response("private@example.test");
+        positive.status = 404;
+        let findings = response_findings("broken-links", &positive, &signals(&positive), 7);
+        assert_eq!(findings[0].key, "broken-link");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = response("reachable");
+        assert!(finding_keys("broken-links", &negative).is_empty());
+
+        let mut edge = response("redirected");
+        edge.status = 399;
+        assert!(finding_keys("broken-links", &edge).is_empty());
+
+        let mut malformed = response("invalid status private@example.test");
+        malformed.status = 700;
+        assert!(finding_keys("broken-links", &malformed).is_empty());
+    }
+
+    #[test]
+    fn cache_behavior_requires_reusable_success_responses_and_bounds_evidence() {
+        let cacheable = |body: &str| {
+            let mut response = response(body);
+            response
+                .headers
+                .insert("cache-control".into(), "public, max-age=60".into());
+            response
+        };
+        let first = sample("repeat-0".into(), &cacheable("one private@example.test"));
+        let second = sample("repeat-1".into(), &cacheable("two private@example.test"));
+        let findings = aggregate_findings(
+            "cache-behavior-analyzer",
+            &[first.clone(), second],
+            &BTreeMap::new(),
+        );
+        assert_eq!(findings[0].key, "cache-response-varies");
+        assert_eq!(findings[0].evidence, [0, 1]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let same = sample("repeat-1".into(), &cacheable("one private@example.test"));
+        assert!(
+            aggregate_findings(
+                "cache-behavior-analyzer",
+                &[first.clone(), same],
+                &BTreeMap::new(),
+            )
+            .is_empty()
+        );
+
+        let mut not_modified = cacheable("");
+        not_modified.status = 304;
+        assert!(
+            aggregate_findings(
+                "cache-behavior-analyzer",
+                &[first.clone(), sample("repeat-1".into(), &not_modified)],
+                &BTreeMap::new(),
+            )
+            .is_empty()
+        );
+
+        let malformed = |body: &str| {
+            let mut response = response(body);
+            response.headers.insert(
+                "cache-control".into(),
+                "public, max-age=private@example.test".into(),
+            );
+            sample("malformed".into(), &response)
+        };
+        assert!(
+            aggregate_findings(
+                "cache-behavior-analyzer",
+                &[malformed("one"), malformed("two")],
+                &BTreeMap::new(),
+            )
+            .is_empty()
+        );
+
+        let many = (0..256)
+            .map(|index| sample(format!("repeat-{index}"), &cacheable(&index.to_string())))
+            .collect::<Vec<_>>();
+        let bounded = aggregate_findings("cache-behavior-analyzer", &many, &BTreeMap::new());
+        assert_eq!(bounded[0].evidence.len(), MAX_FINDING_EVIDENCE);
+    }
+
+    #[test]
+    fn captcha_detection_requires_structural_integration_markers() {
+        let positive = response(
+            r#"<script src="https://www.google.com/recaptcha/api.js?account=private@example.test"></script>"#,
+        );
+        let findings = response_findings(
+            "captcha-presence-checker",
+            &positive,
+            &signals(&positive),
+            7,
+        );
+        assert_eq!(findings[0].key, "captcha-control-observed");
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = response("<p>This site does not use recaptcha.</p>");
+        assert!(finding_keys("captcha-presence-checker", &negative).is_empty());
+
+        let edge =
+            response(r#"<div class="cf-turnstile" data-sitekey="private@example.test"></div>"#);
+        assert_eq!(
+            finding_keys("captcha-presence-checker", &edge),
+            BTreeSet::from(["captcha-control-observed".into()])
+        );
+
+        let malformed = response(r#"<div class="g-recaptcha-ish">private@example.test"#);
+        assert!(finding_keys("captcha-presence-checker", &malformed).is_empty());
+    }
+
+    #[test]
+    fn cms_detection_requires_recognized_structural_markers() {
+        let positive = response(
+            r#"<link rel="stylesheet" href="/wp-content/themes/private@example.test.css">"#,
+        );
+        let findings = response_findings("cms-detection", &positive, &signals(&positive), 7);
+        assert_eq!(findings[0].key, "cms-signal-observed");
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = response(r#"<meta name="generator" content="Private Site Builder">"#);
+        assert!(finding_keys("cms-detection", &negative).is_empty());
+
+        let edge = response(r#"<meta name="generator" content="Joomla! 5">"#);
+        assert_eq!(
+            finding_keys("cms-detection", &edge),
+            BTreeSet::from(["cms-signal-observed".into()])
+        );
+
+        let malformed = response("wp-content belongs to private@example.test");
+        assert!(finding_keys("cms-detection", &malformed).is_empty());
+    }
+
+    #[test]
+    fn crawl_rules_requires_a_valid_robots_policy_document() {
+        let robots = |body: &str| {
+            let mut response = response(body);
+            response.final_url = Url::parse("https://example.test/robots.txt")
+                .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+            response
+        };
+        let positive = robots("User-agent: *\nDisallow: /private@example.test\n");
+        let findings = response_findings("crawl-rules", &positive, &signals(&positive), 7);
+        assert_eq!(findings[0].key, "crawl-rules-observed");
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let mut negative = robots("User-agent: *\nDisallow: /private\n");
+        negative.status = 404;
+        assert!(finding_keys("crawl-rules", &negative).is_empty());
+
+        let edge = robots(
+            "# bounded fixture\r\nUser-agent: ExampleBot\r\nAllow: /\r\nSitemap: https://example.test/map.xml\r\n",
+        );
+        assert_eq!(
+            finding_keys("crawl-rules", &edge),
+            BTreeSet::from(["crawl-rules-observed".into()])
+        );
+
+        let malformed = robots("<html><p>User-agent: private@example.test</p></html>");
+        assert!(finding_keys("crawl-rules", &malformed).is_empty());
+    }
+
+    #[test]
+    fn crawler_reports_only_links_from_successful_html_documents() {
+        let positive =
+            response(r#"<html><a href="/account?email=private@example.test">Account</a></html>"#);
+        let findings = response_findings("crawler", &positive, &signals(&positive), 7);
+        assert_eq!(findings[0].key, "crawlable-links-observed");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = response("<html><p>No links</p></html>");
+        assert!(finding_keys("crawler", &negative).is_empty());
+
+        let mut edge = positive.clone();
+        edge.status = 304;
+        assert!(finding_keys("crawler", &edge).is_empty());
+
+        let mut malformed = positive;
+        malformed.status = 700;
+        assert!(finding_keys("crawler", &malformed).is_empty());
+    }
+
+    #[test]
+    fn csp_deep_analyzer_parses_policy_tokens_without_echoing_values() {
+        let html = |policy_name: &str, policy: &str| {
+            let mut response = response("<html><body>fixture</body></html>");
+            response
+                .headers
+                .insert("content-type".into(), "text/html".into());
+            response.headers.insert(policy_name.into(), policy.into());
+            response
+        };
+        let positive = html(
+            "content-security-policy",
+            "default-src * 'unsafe-inline'; script-src 'unsafe-eval' https://private@example.test",
+        );
+        let findings = response_findings("csp-deep-analyzer", &positive, &signals(&positive), 7);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "csp-unsafe-eval",
+                "csp-unsafe-inline",
+                "csp-wildcard-source",
+            ])
+        );
+        assert!(findings.iter().all(|finding| finding.evidence == [7]));
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private@example.test")
+        );
+
+        let negative = html(
+            "content-security-policy",
+            "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        );
+        assert!(finding_keys("csp-deep-analyzer", &negative).is_empty());
+
+        let edge = html("content-security-policy-report-only", "default-src 'none'");
+        assert_eq!(
+            finding_keys("csp-deep-analyzer", &edge),
+            BTreeSet::from(["csp-not-enforced".into()])
+        );
+
+        let malformed = html(
+            "content-security-policy",
+            "report-uri https://private@example.test/collector",
+        );
+        assert_eq!(
+            finding_keys("csp-deep-analyzer", &malformed),
+            BTreeSet::from(["csp-no-effective-directive".into()])
+        );
     }
 
     #[test]
@@ -1941,9 +2577,16 @@ mod tests {
 
     #[test]
     fn comparisons_require_meaningful_differences() {
-        let first = sample("first".into(), &response("one"));
-        let same = sample("same".into(), &response("one"));
-        let different = sample("different".into(), &response("two"));
+        let cacheable = |body: &str| {
+            let mut response = response(body);
+            response
+                .headers
+                .insert("cache-control".into(), "max-age=60".into());
+            response
+        };
+        let first = sample("first".into(), &cacheable("one"));
+        let same = sample("same".into(), &cacheable("one"));
+        let different = sample("different".into(), &cacheable("two"));
 
         assert!(
             aggregate_findings(

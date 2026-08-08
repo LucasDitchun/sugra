@@ -14,9 +14,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
     Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
-    HttpMethod, HttpRequest, LocalInputPort, LocalInputRequest, PortError, PortErrorKind,
-    ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner, ScannerRegistry,
-    ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
+    HttpMethod, HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, PortError,
+    PortErrorKind, ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner,
+    ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -27,7 +27,8 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::dns_analysis::{
-    dkim_selector_owners, dnssec_findings, dual_stack_finding, email_config_findings, ttl_finding,
+    dkim_selector_owners, dnssec_findings, dual_stack_finding, email_config_findings,
+    scanner_findings as dns_scanner_findings, summarize_dns_evidence, ttl_finding,
     typosquat_resolution_finding,
 };
 use crate::network_analysis::{
@@ -40,13 +41,16 @@ use crate::provider_plan::{
 };
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
 use crate::tls_analysis::{
-    CipherSummary, NegotiatedProtocol, ResumptionSummary, TlsAnalysisError, analyze_pinning,
-    negotiated_cipher, negotiated_protocol, summarize_resumption,
+    TlsAnalysisError, TlsSemanticError, analyze_http2_http3_checker,
+    analyze_network_certificate_inventory, analyze_pinning, analyze_ssl_chain, analyze_ssl_expiry,
+    analyze_tls_cipher_suites, analyze_tls_handshake as analyze_tls_handshake_semantics,
+    analyze_tls_security_config, analyze_tls_session_resumption_map, summarize_tls_evidence,
 };
 use crate::web::{WebProbe, discovered, plan_for, should_sample};
 use crate::web_analysis::{
-    WebSample, aggregate_findings as aggregate_web_findings, observation as web_observation,
-    response_findings as web_response_findings, sample as web_sample, signals as web_signals,
+    WebSample, aggregate_findings as aggregate_web_findings, is_crawlable_response,
+    observation as web_observation, response_findings as web_response_findings,
+    sample as web_sample, signals as web_signals,
 };
 
 const fn operation_family(operation: Operation) -> BoundaryFamily {
@@ -289,6 +293,7 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut diagnostics = Vec::new();
         let mut findings = Vec::new();
+        let mut first_error = None;
         let original_name = dns_name(&request.target).ok();
         let mut aggregate_records = Vec::new();
         for query in plan.into_iter().take(request.budget.max_requests) {
@@ -314,21 +319,27 @@ impl BuiltinScanner {
                         &mut findings,
                     );
                     aggregate_records.extend(records.iter().cloned());
+                    let summary =
+                        summarize_dns_evidence(&query.name, &query.record_types, &records);
                     evidence.push(Evidence {
                         kind: "dns-records".into(),
                         source: query.name,
                         observation: json!({
-                            "requested_types": query.record_types,
-                            "records": records,
+                            "summary": summary,
                             "duration_ms": millis(started.elapsed().as_millis()),
                         }),
                         observed_at: context.clock.now(),
                     });
                 }
-                Err(error) => diagnostics.push(Diagnostic {
-                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                    message: format!("{}: {}", query.name, error.message),
-                }),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(scan_error_from_port(error.clone()));
+                    }
+                    diagnostics.push(Diagnostic {
+                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                        message: format!("{}: {}", query.name, error.message),
+                    });
+                }
             }
         }
         if matches!(id, "email-config" | "spf-dkim-dmarc-validator")
@@ -337,12 +348,9 @@ impl BuiltinScanner {
             findings.extend(email_config_findings(domain, &aggregate_records, 0));
         }
         if evidence.is_empty() {
-            let message = diagnostics
-                .first()
-                .map_or("all DNS observations failed", |value| {
-                    value.message.as_str()
-                });
-            return Err(ScanError::new(ScanErrorKind::Transport, message));
+            return Err(first_error.unwrap_or_else(|| {
+                ScanError::new(ScanErrorKind::Transport, "all DNS observations failed")
+            }));
         }
         Ok(ScanResult {
             status: completion_status(&diagnostics),
@@ -411,7 +419,7 @@ impl BuiltinScanner {
                     let index = evidence.len();
                     let signals = web_signals(&response);
                     findings.extend(web_response_findings(id, &response, &signals, index));
-                    if crawl && method == HttpMethod::Get && depth < max_depth {
+                    if should_discover_links(crawl, method, depth, max_depth, &response) {
                         for url in discover_links(
                             &response.final_url,
                             &base,
@@ -486,17 +494,21 @@ impl BuiltinScanner {
             )
             .map_err(scan_error_from_tls_analysis)?
         } else {
-            analyze_tls(analyzer, &observation, context.clock.now().unix_timestamp())
+            analyze_tls_observation(
+                self.descriptor.id.as_str(),
+                analyzer,
+                &observation,
+                context.clock.now().unix_timestamp(),
+            )
+            .map_err(scan_error_from_tls_semantic)?
         };
+        let summary = summarize_tls_evidence(&observation).map_err(scan_error_from_tls_semantic)?;
         Ok(ScanResult::completed(
             vec![Evidence {
                 kind: "tls-handshake".into(),
                 source: format!("{host}:{port}"),
-                observation: serde_json::to_value(observation).map_err(|_| {
-                    ScanError::new(
-                        ScanErrorKind::Internal,
-                        "TLS observation serialization failed",
-                    )
+                observation: serde_json::to_value(summary).map_err(|_| {
+                    ScanError::new(ScanErrorKind::Internal, "TLS evidence serialization failed")
                 })?,
                 observed_at: context.clock.now(),
             }],
@@ -842,6 +854,7 @@ impl BuiltinScanner {
         let mut diagnostics = Vec::new();
         let mut attempts = 0_usize;
         let mut tls_samples = Vec::new();
+        let mut tls_evidence = Vec::new();
         for host in targets {
             for port in &ports {
                 for _ in 0..samples {
@@ -863,25 +876,32 @@ impl BuiltinScanner {
                     {
                         Ok(observation) => {
                             let index = evidence.len();
+                            let summary = summarize_tls_evidence(&observation)
+                                .map_err(scan_error_from_tls_semantic)?;
                             if analyzer == Analyzer::TcpCertificate {
                                 let now = context.clock.now().unix_timestamp();
-                                let mut observed = analyze_tls_chain(&observation);
-                                observed.extend(analyze_tls_expiry(&observation, now));
-                                reindex_findings(&mut observed, index);
-                                findings.extend(observed);
+                                findings.extend(
+                                    analyze_ssl_chain(&observation, index)
+                                        .map_err(scan_error_from_tls_semantic)?,
+                                );
+                                findings.extend(
+                                    analyze_ssl_expiry(&observation, now, index)
+                                        .map_err(scan_error_from_tls_semantic)?,
+                                );
                             }
                             evidence.push(Evidence {
                                 kind: "network-tls-observation".into(),
                                 source: format!("{host}:{port}"),
-                                observation: serde_json::to_value(&observation).map_err(|_| {
+                                observation: serde_json::to_value(summary).map_err(|_| {
                                     ScanError::new(
                                         ScanErrorKind::Internal,
-                                        "TLS observation serialization failed",
+                                        "TLS evidence serialization failed",
                                     )
                                 })?,
                                 observed_at: context.clock.now(),
                             });
                             tls_samples.push(observation);
+                            tls_evidence.push(index);
                         }
                         Err(error) => {
                             push_network_diagnostic(&mut diagnostics, &host, *port, &error);
@@ -890,15 +910,25 @@ impl BuiltinScanner {
                 }
             }
         }
-        if analyzer == Analyzer::TcpTlsState
-            && summarize_resumption(&tls_samples) == ResumptionSummary::FullOnlyObserved
-        {
-            findings.push(Finding {
-                key: "tls-session-not-resumed".into(),
-                title: "No TLS session resumption was observed in the bounded sample".into(),
-                severity: Severity::Info,
-                confidence: Confidence::Unknown,
-                evidence: (0..evidence.len()).collect(),
+        if !tls_samples.is_empty() && analyzer == Analyzer::TcpTlsState {
+            findings.extend(
+                analyze_tls_session_resumption_map(&tls_samples, &tls_evidence)
+                    .map_err(scan_error_from_tls_semantic)?,
+            );
+        } else if !tls_samples.is_empty() && analyzer == Analyzer::TcpCertificate {
+            let inventory = analyze_network_certificate_inventory(&tls_samples, &tls_evidence)
+                .map_err(scan_error_from_tls_semantic)?;
+            findings.extend(inventory.findings);
+            evidence.push(Evidence {
+                kind: "certificate-inventory-summary".into(),
+                source: self.descriptor.id.to_string(),
+                observation: serde_json::to_value(inventory.summary).map_err(|_| {
+                    ScanError::new(
+                        ScanErrorKind::Internal,
+                        "TLS inventory serialization failed",
+                    )
+                })?,
+                observed_at: context.clock.now(),
             });
         }
         network_result(evidence, findings, diagnostics)
@@ -1092,157 +1122,22 @@ fn merge_scan_result(target: &mut ScanResult, mut source: ScanResult) {
     target.diagnostics.append(&mut source.diagnostics);
 }
 
-fn analyze_tls(analyzer: Analyzer, observation: &TlsObservation, now: i64) -> Vec<Finding> {
+fn analyze_tls_observation(
+    scanner_id: &str,
+    analyzer: Analyzer,
+    observation: &TlsObservation,
+    now: i64,
+) -> Result<Vec<Finding>, TlsSemanticError> {
     match analyzer {
-        Analyzer::TlsHandshake => analyze_tls_handshake(observation),
-        Analyzer::TlsChain => analyze_tls_chain(observation),
-        Analyzer::TlsExpiry => analyze_tls_expiry(observation, now),
-        Analyzer::TlsCipher => analyze_tls_cipher(observation),
-        Analyzer::TlsProtocol => analyze_tls_protocol(observation),
-        _ => Vec::new(),
-    }
-}
-
-fn analyze_tls_handshake(observation: &TlsObservation) -> Vec<Finding> {
-    if observation.protocol == "unknown" || observation.cipher_suite == "unknown" {
-        vec![finding(
-            "tls-negotiation-incomplete",
-            "TLS negotiation metadata is incomplete",
-            Severity::Medium,
-            Confidence::Confirmed,
-            0,
-        )]
-    } else {
-        Vec::new()
-    }
-}
-
-fn analyze_tls_chain(observation: &TlsObservation) -> Vec<Finding> {
-    match observation.certificates.first() {
-        None => vec![finding(
-            "tls-chain-metadata-unavailable",
-            "The peer certificate chain could not be inspected",
-            Severity::Medium,
-            Confidence::Confirmed,
-            0,
-        )],
-        Some(leaf) => {
-            let mut findings = Vec::new();
-            if leaf.is_ca == Some(true) {
-                findings.push(finding(
-                    "tls-leaf-is-ca",
-                    "The TLS leaf certificate is marked as a certificate authority",
-                    Severity::High,
-                    Confidence::Confirmed,
-                    0,
-                ));
-            }
-            if leaf.subject == leaf.issuer {
-                findings.push(finding(
-                    "tls-self-issued-leaf",
-                    "The TLS leaf certificate is self-issued",
-                    Severity::Medium,
-                    Confidence::Confirmed,
-                    0,
-                ));
-            }
-            findings
+        Analyzer::TlsHandshake => analyze_tls_handshake_semantics(observation, 0),
+        Analyzer::TlsChain => analyze_ssl_chain(observation, 0),
+        Analyzer::TlsExpiry => analyze_ssl_expiry(observation, now, 0),
+        Analyzer::TlsCipher if scanner_id == "tls-security-config" => {
+            analyze_tls_security_config(observation, 0)
         }
-    }
-}
-
-fn analyze_tls_expiry(observation: &TlsObservation, now: i64) -> Vec<Finding> {
-    match observation.certificates.first() {
-        None => vec![finding(
-            "tls-validity-metadata-unavailable",
-            "Certificate validity metadata is unavailable",
-            Severity::Medium,
-            Confidence::Confirmed,
-            0,
-        )],
-        Some(leaf) if now < leaf.not_before => vec![finding(
-            "tls-certificate-not-yet-valid",
-            "The TLS certificate is not yet valid",
-            Severity::High,
-            Confidence::Confirmed,
-            0,
-        )],
-        Some(leaf) if now >= leaf.not_after => vec![finding(
-            "tls-certificate-expired",
-            "The TLS certificate has expired",
-            Severity::Critical,
-            Confidence::Confirmed,
-            0,
-        )],
-        Some(leaf) => {
-            let days = (leaf.not_after - now) / 86_400;
-            let risk = if days <= 7 {
-                Some((Severity::High, "The TLS certificate expires within 7 days"))
-            } else if days <= 30 {
-                Some((
-                    Severity::Medium,
-                    "The TLS certificate expires within 30 days",
-                ))
-            } else if days <= 90 {
-                Some((Severity::Low, "The TLS certificate expires within 90 days"))
-            } else {
-                None
-            };
-            risk.map_or_else(Vec::new, |(severity, title)| {
-                vec![finding(
-                    "tls-certificate-expiring",
-                    title,
-                    severity,
-                    Confidence::Confirmed,
-                    0,
-                )]
-            })
-        }
-    }
-}
-
-fn analyze_tls_cipher(observation: &TlsObservation) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    match negotiated_protocol(observation) {
-        NegotiatedProtocol::Legacy => findings.push(finding(
-            "tls-obsolete-protocol",
-            "An obsolete TLS protocol version was negotiated",
-            Severity::High,
-            Confidence::Confirmed,
-            0,
-        )),
-        NegotiatedProtocol::Tls12 => findings.push(finding(
-            "tls-modernization",
-            "TLS 1.2 was negotiated; verify TLS 1.3 availability",
-            Severity::Info,
-            Confidence::Confirmed,
-            0,
-        )),
-        NegotiatedProtocol::Tls13 | NegotiatedProtocol::Unknown => {}
-    }
-    if negotiated_cipher(observation) == CipherSummary::KnownWeak {
-        findings.push(finding(
-            "tls-weak-cipher",
-            "A weak TLS cipher suite was negotiated",
-            Severity::High,
-            Confidence::Confirmed,
-            0,
-        ));
-    }
-    findings
-}
-
-fn analyze_tls_protocol(observation: &TlsObservation) -> Vec<Finding> {
-    if observation.alpn.as_deref() == Some("h2") {
-        Vec::new()
-    } else {
-        vec![finding(
-            "http2-not-negotiated",
-            "HTTP/2 was not negotiated over TLS",
-            Severity::Info,
-            Confidence::Confirmed,
-            0,
-        )]
+        Analyzer::TlsCipher => analyze_tls_cipher_suites(observation, 0),
+        Analyzer::TlsProtocol => analyze_http2_http3_checker(observation, 0),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1502,54 +1397,21 @@ fn analyze_dns(
     evidence: usize,
     findings: &mut Vec<Finding>,
 ) {
-    let missing = records.is_empty();
     match id {
         "dnssec" => findings.extend(dnssec_findings(&query.name, records, evidence)),
-        "dns-caa-checker" if missing => findings.push(finding(
-            "caa-not-observed",
-            "No CAA policy was observed",
-            Severity::Low,
-            Confidence::Confirmed,
-            evidence,
-        )),
-        "reverse-dns-scan" if missing => findings.push(finding(
-            "ptr-not-observed",
-            "No reverse DNS record was observed",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        )),
-        "spf-network-extractor"
-            if !records
-                .iter()
-                .any(|record| record.value.to_ascii_lowercase().contains("v=spf1")) =>
-        {
-            findings.push(finding(
-                "spf-not-observed",
-                "No SPF policy was observed",
-                Severity::Low,
-                Confidence::Confirmed,
-                evidence,
-            ));
+        "dns-caa-checker"
+        | "dns-records"
+        | "decoy-dns-beacon"
+        | "domain-info"
+        | "reverse-dns-scan"
+        | "rogue-subdomain-resolver"
+        | "spf-network-extractor"
+        | "subdomain-takeover"
+        | "txt-records" => {
+            findings.extend(dns_scanner_findings(id, &query.name, records, evidence));
         }
         "dual-stack-behavior-profiler" | "dual-stack-diff" => {
             if let Some(finding) = dual_stack_finding(records, evidence) {
-                findings.push(finding);
-            }
-        }
-        "rogue-subdomain-resolver" | "decoy-dns-beacon"
-            if query.name.starts_with("_sugra-scope-probe.") && !missing =>
-        {
-            findings.push(finding(
-                "unexpected-probe-answer",
-                "A deterministic nonexistent-label probe returned DNS data",
-                Severity::Low,
-                Confidence::Inferred,
-                evidence,
-            ));
-        }
-        "subdomain-takeover" => {
-            if let Some(finding) = analyze_dns_takeover(records, evidence) {
                 findings.push(finding);
             }
         }
@@ -1567,30 +1429,6 @@ fn analyze_dns(
         }
         _ => {}
     }
-}
-
-fn analyze_dns_takeover(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
-    let external_alias = records.iter().any(|record| {
-        let value = record.value.to_ascii_lowercase();
-        [
-            "github.io",
-            "herokuapp.com",
-            "azurewebsites.net",
-            "cloudfront.net",
-            "s3.amazonaws.com",
-        ]
-        .iter()
-        .any(|suffix| value.contains(suffix))
-    });
-    external_alias.then(|| {
-        finding(
-            "external-service-alias",
-            "A DNS alias points to an external service and requires ownership review",
-            Severity::Medium,
-            Confidence::Inferred,
-            evidence,
-        )
-    })
 }
 
 fn doh_provider(value: &str) -> Option<&'static str> {
@@ -1744,6 +1582,16 @@ fn safe_url_label(url: &Url) -> String {
     safe.set_query(None);
     safe.set_fragment(None);
     safe.to_string()
+}
+
+fn should_discover_links(
+    crawl: bool,
+    method: HttpMethod,
+    depth: usize,
+    max_depth: usize,
+    response: &HttpResponse,
+) -> bool {
+    crawl && method == HttpMethod::Get && depth < max_depth && is_crawlable_response(response)
 }
 
 #[derive(Clone)]
@@ -2922,12 +2770,6 @@ fn host_limit(request: &ScanRequest) -> usize {
         .min(request.budget.max_requests)
 }
 
-fn reindex_findings(findings: &mut [Finding], evidence: usize) {
-    for finding in findings {
-        finding.evidence = vec![evidence];
-    }
-}
-
 fn finding(
     key: &str,
     title: &str,
@@ -2980,6 +2822,10 @@ fn scan_error_from_tls_analysis(error: TlsAnalysisError) -> ScanError {
         TlsAnalysisError::InvalidObservedSha256 => ScanErrorKind::InvalidResponse,
     };
     ScanError::new(kind, error.to_string())
+}
+
+fn scan_error_from_tls_semantic(error: TlsSemanticError) -> ScanError {
+    ScanError::new(ScanErrorKind::InvalidResponse, error.to_string())
 }
 
 fn safe_text(bytes: &[u8], limit: usize) -> String {
@@ -3486,36 +3332,48 @@ mod tests {
     }
 
     #[test]
-    fn tls_expiry_analysis_distinguishes_expired_and_expiring_certificates() {
+    fn tls_expiry_analysis_distinguishes_expired_and_expiring_certificates()
+    -> Result<(), Box<dyn std::error::Error>> {
         let expired = tls_observation(Some(tls_certificate(-10_000, -1)));
-        let expired_findings = analyze_tls(Analyzer::TlsExpiry, &expired, 0);
+        let expired_findings =
+            analyze_tls_observation("ssl-expiry", Analyzer::TlsExpiry, &expired, 0)?;
         assert_eq!(expired_findings[0].key, "tls-certificate-expired");
         assert_eq!(expired_findings[0].severity, Severity::Critical);
 
         let expiring = tls_observation(Some(tls_certificate(-10_000, 6 * 86_400)));
-        let expiring_findings = analyze_tls(Analyzer::TlsExpiry, &expiring, 0);
+        let expiring_findings =
+            analyze_tls_observation("ssl-expiry", Analyzer::TlsExpiry, &expiring, 0)?;
         assert_eq!(expiring_findings[0].key, "tls-certificate-expiring");
         assert_eq!(expiring_findings[0].severity, Severity::High);
+        Ok(())
     }
 
     #[test]
-    fn tls_chain_analysis_flags_a_ca_leaf() {
+    fn tls_chain_analysis_flags_a_ca_leaf() -> Result<(), Box<dyn std::error::Error>> {
         let mut certificate = tls_certificate(-10_000, 365 * 86_400);
         certificate.is_ca = Some(true);
-        let findings = analyze_tls(Analyzer::TlsChain, &tls_observation(Some(certificate)), 0);
+        let findings = analyze_tls_observation(
+            "ssl-chain",
+            Analyzer::TlsChain,
+            &tls_observation(Some(certificate)),
+            0,
+        )?;
         assert!(
             findings
                 .iter()
                 .any(|finding| finding.key == "tls-leaf-is-ca")
         );
+        Ok(())
     }
 
     #[test]
-    fn tls_cipher_analysis_flags_obsolete_protocols_and_weak_suites() {
+    fn tls_cipher_analysis_flags_obsolete_protocols_and_weak_suites()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut observation = tls_observation(None);
         observation.protocol = "TLSv1_0".into();
         observation.cipher_suite = "TLS_RSA_WITH_3DES_EDE_CBC_SHA".into();
-        let findings = analyze_tls(Analyzer::TlsCipher, &observation, 0);
+        let findings =
+            analyze_tls_observation("tls-security-config", Analyzer::TlsCipher, &observation, 0)?;
         assert!(
             findings
                 .iter()
@@ -3526,6 +3384,7 @@ mod tests {
                 .iter()
                 .any(|finding| finding.key == "tls-weak-cipher")
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3612,6 +3471,60 @@ mod tests {
         assert_eq!(error.kind, ScanErrorKind::InvalidInput);
         assert!(!error.message.contains("Sensitive.Value"));
         Ok(())
+    }
+
+    #[test]
+    fn decoy_dns_runtime_rejects_unrelated_and_malformed_answers() {
+        let query = DnsPlannedQuery {
+            name: "_sugra-scope-probe.example.com".into(),
+            record_types: vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
+        };
+        let mut findings = Vec::new();
+        analyze_dns(
+            "decoy-dns-beacon",
+            Some("example.com"),
+            &query,
+            &[
+                DnsRecord {
+                    name: "other.example".into(),
+                    record_type: DnsRecordType::A,
+                    value: "192.0.2.20".into(),
+                    ttl: Some(300),
+                },
+                DnsRecord {
+                    name: query.name.clone(),
+                    record_type: DnsRecordType::Txt,
+                    value: "192.0.2.20".into(),
+                    ttl: Some(300),
+                },
+                DnsRecord {
+                    name: query.name.clone(),
+                    record_type: DnsRecordType::A,
+                    value: "not-an-address".into(),
+                    ttl: Some(300),
+                },
+            ],
+            0,
+            &mut findings,
+        );
+        assert!(findings.is_empty());
+
+        analyze_dns(
+            "decoy-dns-beacon",
+            Some("example.com"),
+            &query,
+            &[DnsRecord {
+                name: query.name.clone(),
+                record_type: DnsRecordType::A,
+                value: "192.0.2.20".into(),
+                ttl: Some(300),
+            }],
+            1,
+            &mut findings,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].key, "unexpected-probe-answer");
+        assert_eq!(findings[0].evidence, [1]);
     }
 
     #[tokio::test]

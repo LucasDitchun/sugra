@@ -1,11 +1,63 @@
 //! Pure, scanner-specific analysis for bounded DNS observations.
 
+use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use serde_json::{Value, json};
 use sugra_core::{DnsRecord, DnsRecordType};
 use sugra_domain::{Confidence, Finding, Severity};
 use thiserror::Error;
 
 /// Maximum number of DKIM selectors accepted by one bounded DNS scan.
 pub(crate) const MAX_DKIM_SELECTORS: usize = 16;
+
+/// Builds a bounded, value-free summary suitable for persisted DNS evidence.
+///
+/// DNS record values may contain verification tokens, mail policy material, or
+/// internal names. Only structural counts and TTL bounds cross the evidence
+/// boundary; raw owners and values remain local to analysis.
+pub(crate) fn summarize_dns_evidence(
+    query_name: &str,
+    requested_types: &[DnsRecordType],
+    records: &[DnsRecord],
+) -> Value {
+    let owner = canonical_name(query_name);
+    let mut requested = requested_types
+        .iter()
+        .map(|record_type| record_type.as_str())
+        .collect::<Vec<_>>();
+    requested.sort_unstable();
+    requested.dedup();
+
+    let mut type_counts = BTreeMap::<&'static str, usize>::new();
+    let mut matching_owner_records = 0usize;
+    let mut usable_records = 0usize;
+    let mut minimum_ttl = None::<u32>;
+    let mut maximum_ttl = None::<u32>;
+    for record in records {
+        *type_counts.entry(record.record_type.as_str()).or_default() += 1;
+        if canonical_name(&record.name) == owner {
+            matching_owner_records += 1;
+            if !record.value.trim().is_empty() {
+                usable_records += 1;
+            }
+        }
+        if let Some(ttl) = record.ttl {
+            minimum_ttl = Some(minimum_ttl.map_or(ttl, |current| current.min(ttl)));
+            maximum_ttl = Some(maximum_ttl.map_or(ttl, |current| current.max(ttl)));
+        }
+    }
+
+    json!({
+        "requested_types": requested,
+        "response_record_count": records.len(),
+        "matching_owner_record_count": matching_owner_records,
+        "usable_record_count": usable_records,
+        "record_type_counts": type_counts,
+        "minimum_ttl": minimum_ttl,
+        "maximum_ttl": maximum_ttl,
+    })
+}
 
 /// Typed failures raised while constructing bounded DKIM query owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -243,6 +295,283 @@ pub(crate) fn typosquat_resolution_finding(
             evidence,
         )
     })
+}
+
+/// Derives scanner-specific findings from one bounded DNS answer set.
+pub(crate) fn scanner_findings(
+    scanner_id: &str,
+    query_name: &str,
+    records: &[DnsRecord],
+    evidence: usize,
+) -> Vec<Finding> {
+    let usable = |record: &&DnsRecord| {
+        canonical_name(&record.name) == canonical_name(query_name)
+            && !record.value.trim().is_empty()
+    };
+    let records_for_owner = records.iter().filter(usable).collect::<Vec<_>>();
+    match scanner_id {
+        "dns-caa-checker" => type_presence_findings(
+            &records_for_owner,
+            DnsRecordType::Caa,
+            "caa-policy-observed",
+            "A public CAA policy was observed",
+            "caa-not-observed",
+            "No CAA policy was observed",
+            Severity::Low,
+            evidence,
+        ),
+        "dns-records" => any_presence_findings(
+            &records_for_owner,
+            "dns-records-observed",
+            "Public DNS records were observed",
+            "dns-records-not-observed",
+            "No public DNS records were observed",
+            evidence,
+        ),
+        "domain-info" => domain_info_findings(&records_for_owner, evidence),
+        "reverse-dns-scan" => type_presence_findings(
+            &records_for_owner,
+            DnsRecordType::Ptr,
+            "ptr-observed",
+            "A reverse DNS record was observed",
+            "ptr-not-observed",
+            "No reverse DNS record was observed",
+            Severity::Info,
+            evidence,
+        ),
+        "decoy-dns-beacon" | "rogue-subdomain-resolver"
+            if query_name.starts_with("_sugra-scope-probe.") =>
+        {
+            let resolves = records_for_owner
+                .iter()
+                .any(|record| is_usable_resolution_answer(record));
+            resolves
+                .then(|| {
+                    finding(
+                        "unexpected-probe-answer",
+                        "A deterministic nonexistent-label probe returned DNS data",
+                        Severity::Low,
+                        Confidence::Inferred,
+                        evidence,
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
+        "spf-network-extractor" => spf_network_findings(&records_for_owner, evidence),
+        "txt-records" => type_presence_findings(
+            &records_for_owner,
+            DnsRecordType::Txt,
+            "txt-records-observed",
+            "Public TXT records were observed",
+            "txt-records-not-observed",
+            "No public TXT records were observed",
+            Severity::Info,
+            evidence,
+        ),
+        "subdomain-takeover" => takeover_findings(&records_for_owner, evidence),
+        _ => Vec::new(),
+    }
+}
+
+fn any_presence_findings(
+    records: &[&DnsRecord],
+    observed_key: &str,
+    observed_title: &str,
+    missing_key: &str,
+    missing_title: &str,
+    evidence: usize,
+) -> Vec<Finding> {
+    let (key, title) = if records.is_empty() {
+        (missing_key, missing_title)
+    } else {
+        (observed_key, observed_title)
+    };
+    vec![finding(
+        key,
+        title,
+        Severity::Info,
+        Confidence::Confirmed,
+        evidence,
+    )]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_presence_findings(
+    records: &[&DnsRecord],
+    record_type: DnsRecordType,
+    observed_key: &str,
+    observed_title: &str,
+    missing_key: &str,
+    missing_title: &str,
+    missing_severity: Severity,
+    evidence: usize,
+) -> Vec<Finding> {
+    let observed = records
+        .iter()
+        .any(|record| record.record_type == record_type);
+    let (key, title, severity) = if observed {
+        (observed_key, observed_title, Severity::Info)
+    } else {
+        (missing_key, missing_title, missing_severity)
+    };
+    vec![finding(
+        key,
+        title,
+        severity,
+        Confidence::Confirmed,
+        evidence,
+    )]
+}
+
+fn domain_info_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
+    let has_address = records.iter().any(|record| {
+        matches!(
+            record.record_type,
+            DnsRecordType::A | DnsRecordType::Aaaa | DnsRecordType::Cname
+        )
+    });
+    let has_authority = records
+        .iter()
+        .any(|record| matches!(record.record_type, DnsRecordType::Ns | DnsRecordType::Soa));
+    let mut findings = Vec::new();
+    if has_address {
+        findings.push(finding(
+            "domain-address-observed",
+            "A public address or canonical-name record was observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    } else {
+        findings.push(finding(
+            "domain-address-not-observed",
+            "No public address or canonical-name record was observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if has_authority {
+        findings.push(finding(
+            "domain-authority-observed",
+            "Public authoritative DNS metadata was observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    } else {
+        findings.push(finding(
+            "domain-authority-not-observed",
+            "No authoritative DNS metadata was observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    findings
+}
+
+fn spf_network_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
+    let policies = records
+        .iter()
+        .filter(|record| record.record_type == DnsRecordType::Txt)
+        .map(|record| normalized_txt(&record.value))
+        .filter(|value| value.split_ascii_whitespace().next() == Some("v=spf1"))
+        .collect::<Vec<_>>();
+    if policies.is_empty() {
+        return vec![finding(
+            "spf-not-observed",
+            "No SPF policy was observed",
+            Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        )];
+    }
+    let exposes_network_source = policies.iter().any(|policy| {
+        policy.split_ascii_whitespace().any(|mechanism| {
+            let mechanism = mechanism.trim_start_matches(['+', '-', '~', '?']);
+            mechanism == "a"
+                || mechanism.starts_with("a:")
+                || mechanism == "mx"
+                || mechanism.starts_with("mx:")
+                || mechanism.starts_with("ip4:")
+                || mechanism.starts_with("ip6:")
+                || mechanism.starts_with("include:")
+                || mechanism.starts_with("redirect=")
+        })
+    });
+    if exposes_network_source {
+        vec![finding(
+            "spf-network-sources-observed",
+            "The SPF policy exposes network sources for extraction",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )]
+    } else {
+        vec![finding(
+            "spf-network-sources-not-observed",
+            "The SPF policy exposes no network source for extraction",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )]
+    }
+}
+
+fn is_usable_resolution_answer(record: &DnsRecord) -> bool {
+    let value = record.value.trim().trim_end_matches('.');
+    match record.record_type {
+        DnsRecordType::A => value.parse::<Ipv4Addr>().is_ok(),
+        DnsRecordType::Aaaa => value.parse::<Ipv6Addr>().is_ok(),
+        DnsRecordType::Cname => is_valid_dns_name(value),
+        _ => false,
+    }
+}
+
+fn is_valid_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|character| character.is_ascii_alphanumeric() || character == b'-')
+        })
+}
+
+fn takeover_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
+    let external_alias = records.iter().any(|record| {
+        record.record_type == DnsRecordType::Cname
+            && [
+                "github.io",
+                "herokuapp.com",
+                "azurewebsites.net",
+                "cloudfront.net",
+                "s3.amazonaws.com",
+            ]
+            .iter()
+            .any(|suffix| {
+                let alias = canonical_name(&record.value);
+                alias == *suffix || alias.ends_with(&format!(".{suffix}"))
+            })
+    });
+    external_alias
+        .then(|| {
+            finding(
+                "external-service-alias",
+                "A DNS alias points to an external service and requires ownership review",
+                Severity::Medium,
+                Confidence::Inferred,
+                evidence,
+            )
+        })
+        .into_iter()
+        .collect()
 }
 
 fn has_record(domain: &str, records: &[DnsRecord], record_type: DnsRecordType) -> bool {
@@ -610,5 +939,278 @@ mod tests {
         assert!(
             typosquat_resolution_finding("example.com", "examplle.com", &txt_only, 0).is_none()
         );
+    }
+
+    #[test]
+    fn record_collectors_distinguish_usable_missing_and_wrong_type_answers() {
+        for (id, record_type, observed_key, missing_key) in [
+            (
+                "dns-caa-checker",
+                DnsRecordType::Caa,
+                "caa-policy-observed",
+                "caa-not-observed",
+            ),
+            (
+                "reverse-dns-scan",
+                DnsRecordType::Ptr,
+                "ptr-observed",
+                "ptr-not-observed",
+            ),
+            (
+                "txt-records",
+                DnsRecordType::Txt,
+                "txt-records-observed",
+                "txt-records-not-observed",
+            ),
+        ] {
+            let present = [record("example.com", record_type, "usable", None)];
+            assert_eq!(
+                keys(&scanner_findings(id, "example.com", &present, 2)),
+                vec![observed_key]
+            );
+            assert_eq!(
+                keys(&scanner_findings(id, "example.com", &[], 2)),
+                vec![missing_key]
+            );
+            let wrong_owner = [record("other.example", record_type, "usable", None)];
+            assert_eq!(
+                keys(&scanner_findings(id, "example.com", &wrong_owner, 2)),
+                vec![missing_key]
+            );
+            let empty = [record("example.com", record_type, " ", None)];
+            assert_eq!(
+                keys(&scanner_findings(id, "example.com", &empty, 2)),
+                vec![missing_key]
+            );
+        }
+
+        let address = [record("example.com", DnsRecordType::A, "192.0.2.1", None)];
+        assert_eq!(
+            keys(&scanner_findings("dns-records", "example.com", &address, 3)),
+            vec!["dns-records-observed"]
+        );
+        assert_eq!(
+            keys(&scanner_findings("dns-records", "example.com", &[], 3)),
+            vec!["dns-records-not-observed"]
+        );
+    }
+
+    #[test]
+    fn domain_info_reports_address_and_authority_gaps_independently() {
+        let complete = [
+            record("example.com", DnsRecordType::A, "192.0.2.1", None),
+            record("example.com", DnsRecordType::Ns, "ns.example.net", None),
+        ];
+        assert_eq!(
+            keys(&scanner_findings(
+                "domain-info",
+                "example.com",
+                &complete,
+                0
+            )),
+            vec!["domain-address-observed", "domain-authority-observed"]
+        );
+
+        let address_only = [record(
+            "example.com",
+            DnsRecordType::Aaaa,
+            "2001:db8::1",
+            None,
+        )];
+        assert_eq!(
+            keys(&scanner_findings(
+                "domain-info",
+                "example.com",
+                &address_only,
+                4
+            )),
+            vec!["domain-address-observed", "domain-authority-not-observed"]
+        );
+        assert_eq!(
+            keys(&scanner_findings("domain-info", "example.com", &[], 4)),
+            vec![
+                "domain-address-not-observed",
+                "domain-authority-not-observed"
+            ]
+        );
+    }
+
+    #[test]
+    fn rogue_probe_requires_an_exact_usable_address_answer() {
+        let probe = "_sugra-scope-probe.example.com";
+        let exact = [record(probe, DnsRecordType::A, "192.0.2.20", None)];
+        assert_eq!(
+            keys(&scanner_findings(
+                "rogue-subdomain-resolver",
+                probe,
+                &exact,
+                6
+            )),
+            vec!["unexpected-probe-answer"]
+        );
+        let wrong_owner = [record("example.com", DnsRecordType::A, "192.0.2.20", None)];
+        assert!(scanner_findings("rogue-subdomain-resolver", probe, &wrong_owner, 6).is_empty());
+        let metadata = [record(probe, DnsRecordType::Txt, "metadata", None)];
+        assert!(scanner_findings("rogue-subdomain-resolver", probe, &metadata, 6).is_empty());
+        let malformed_address = [record(probe, DnsRecordType::A, "not-an-address", None)];
+        assert!(
+            scanner_findings("rogue-subdomain-resolver", probe, &malformed_address, 6).is_empty()
+        );
+    }
+
+    #[test]
+    fn decoy_beacon_requires_exact_owner_resolution_type_and_value() {
+        let probe = "_sugra-scope-probe.example.com";
+        for answer in [
+            record(probe, DnsRecordType::A, "192.0.2.20", None),
+            record(probe, DnsRecordType::Aaaa, "2001:db8::20", None),
+            record(probe, DnsRecordType::Cname, "alias.example.net.", None),
+        ] {
+            assert_eq!(
+                keys(&scanner_findings("decoy-dns-beacon", probe, &[answer], 7)),
+                vec!["unexpected-probe-answer"]
+            );
+        }
+
+        for ignored in [
+            record("other.example", DnsRecordType::A, "192.0.2.20", None),
+            record(probe, DnsRecordType::Txt, "192.0.2.20", None),
+            record(probe, DnsRecordType::A, "not-an-address", None),
+            record(probe, DnsRecordType::Aaaa, "not-an-address", None),
+            record(probe, DnsRecordType::Cname, "invalid..name", None),
+            record(probe, DnsRecordType::Cname, " ", None),
+        ] {
+            assert!(scanner_findings("decoy-dns-beacon", probe, &[ignored], 7).is_empty());
+        }
+    }
+
+    #[test]
+    fn spf_network_extractor_requires_a_policy_and_network_mechanism() {
+        let with_network = [record(
+            "example.com",
+            DnsRecordType::Txt,
+            "v=spf1 ip4:192.0.2.0/24 include:_spf.example.net -all",
+            None,
+        )];
+        assert_eq!(
+            keys(&scanner_findings(
+                "spf-network-extractor",
+                "example.com",
+                &with_network,
+                0
+            )),
+            vec!["spf-network-sources-observed"]
+        );
+        let no_network = [record(
+            "example.com",
+            DnsRecordType::Txt,
+            "v=spf1 -all",
+            None,
+        )];
+        assert_eq!(
+            keys(&scanner_findings(
+                "spf-network-extractor",
+                "example.com",
+                &no_network,
+                0
+            )),
+            vec!["spf-network-sources-not-observed"]
+        );
+        assert_eq!(
+            keys(&scanner_findings(
+                "spf-network-extractor",
+                "example.com",
+                &[],
+                0
+            )),
+            vec!["spf-not-observed"]
+        );
+    }
+
+    #[test]
+    fn takeover_analysis_requires_an_exact_external_cname_suffix() {
+        let alias = [record(
+            "app.example.com",
+            DnsRecordType::Cname,
+            "tenant.github.io.",
+            None,
+        )];
+        assert_eq!(
+            keys(&scanner_findings(
+                "subdomain-takeover",
+                "app.example.com",
+                &alias,
+                8
+            )),
+            vec!["external-service-alias"]
+        );
+        let deceptive = [record(
+            "app.example.com",
+            DnsRecordType::Cname,
+            "github.io.attacker.example",
+            None,
+        )];
+        assert!(
+            scanner_findings("subdomain-takeover", "app.example.com", &deceptive, 8).is_empty()
+        );
+        let deceptive_prefix = [record(
+            "app.example.com",
+            DnsRecordType::Cname,
+            "tenant.evilgithub.io",
+            None,
+        )];
+        assert!(
+            scanner_findings(
+                "subdomain-takeover",
+                "app.example.com",
+                &deceptive_prefix,
+                8
+            )
+            .is_empty()
+        );
+        let txt = [record(
+            "app.example.com",
+            DnsRecordType::Txt,
+            "tenant.github.io",
+            None,
+        )];
+        assert!(scanner_findings("subdomain-takeover", "app.example.com", &txt, 8).is_empty());
+    }
+
+    #[test]
+    fn dns_evidence_summary_is_value_free_and_structurally_bounded() -> Result<(), serde_json::Error>
+    {
+        let marker = "fixture-private-dns-token";
+        let records = (0_u32..512)
+            .map(|index| {
+                record(
+                    if index % 2 == 0 {
+                        "example.com"
+                    } else {
+                        "other.example"
+                    },
+                    if index % 3 == 0 {
+                        DnsRecordType::Txt
+                    } else {
+                        DnsRecordType::A
+                    },
+                    marker,
+                    Some(index % 600),
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_dns_evidence(
+            "example.com",
+            &[DnsRecordType::Txt, DnsRecordType::Txt, DnsRecordType::A],
+            &records,
+        );
+        let serialized = serde_json::to_string(&summary)?;
+        assert!(!serialized.contains(marker));
+        assert!(serialized.len() < 512);
+        assert_eq!(summary["response_record_count"], 512);
+        assert_eq!(summary["matching_owner_record_count"], 256);
+        assert_eq!(summary["requested_types"], json!(["A", "TXT"]));
+        assert_eq!(summary["record_type_counts"]["TXT"], 171);
+        Ok(())
     }
 }
