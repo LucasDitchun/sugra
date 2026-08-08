@@ -85,3 +85,48 @@ const fn record_type(value: DnsRecordType) -> RecordType {
         DnsRecordType::Ptr => RecordType::PTR,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sugra_domain::Budget;
+
+    use super::*;
+
+    #[test]
+    fn every_public_record_type_maps_to_the_resolver_equivalent() {
+        let cases = [
+            (DnsRecordType::A, RecordType::A),
+            (DnsRecordType::Aaaa, RecordType::AAAA),
+            (DnsRecordType::Cname, RecordType::CNAME),
+            (DnsRecordType::Mx, RecordType::MX),
+            (DnsRecordType::Ns, RecordType::NS),
+            (DnsRecordType::Soa, RecordType::SOA),
+            (DnsRecordType::Txt, RecordType::TXT),
+            (DnsRecordType::Srv, RecordType::SRV),
+            (DnsRecordType::Caa, RecordType::CAA),
+            (DnsRecordType::Dnskey, RecordType::DNSKEY),
+            (DnsRecordType::Ds, RecordType::DS),
+            (DnsRecordType::Ptr, RecordType::PTR),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(record_type(input), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_record_set_completes_without_a_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dns = HickoryDns::system()?;
+        let records = dns
+            .query(DnsQuery {
+                name: "invalid name that must not be queried".into(),
+                record_types: Vec::new(),
+                budget: Budget::default(),
+            })
+            .await?;
+
+        assert!(records.is_empty());
+        Ok(())
+    }
+}

@@ -181,7 +181,67 @@ fn certificate_metadata(der: &[u8]) -> Result<TlsCertificate, PortError> {
 
 #[cfg(test)]
 mod tests {
+    use sugra_domain::{Budget, ScopeGrant};
+
     use super::*;
+
+    fn request(host: &str, server_name: Option<&str>, scope: ScopeGrant) -> TlsRequest {
+        TlsRequest {
+            host: host.into(),
+            server_name: server_name.map(str::to_owned),
+            port: 443,
+            budget: Budget::default(),
+            scope,
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_hosts_scope_and_server_names_fail_before_connecting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tls = match RustlsTls::native() {
+            Ok(tls) => tls,
+            Err(TlsAdapterError::NoTrustAnchors) => return Ok(()),
+        };
+        let allowed = Target::parse(TargetKind::Domain, "example.com")?;
+        let other = Target::parse(TargetKind::Domain, "other.example")?;
+
+        let Err(invalid_host) = tls
+            .handshake(request(
+                "bad host",
+                None,
+                ScopeGrant::exact(&allowed, false, time::OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("invalid host was accepted".into());
+        };
+        assert_eq!(invalid_host.kind, PortErrorKind::InvalidResponse);
+
+        let Err(out_of_scope) = tls
+            .handshake(request(
+                "example.com",
+                None,
+                ScopeGrant::exact(&other, false, time::OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("out-of-scope host was accepted".into());
+        };
+        assert_eq!(out_of_scope.kind, PortErrorKind::OutOfScope);
+
+        let Err(invalid_name) = tls
+            .handshake(request(
+                "example.com",
+                Some("bad name"),
+                ScopeGrant::exact(&allowed, false, time::OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("invalid server name was accepted".into());
+        };
+        assert_eq!(invalid_name.kind, PortErrorKind::InvalidResponse);
+        Ok(())
+    }
 
     #[test]
     fn invalid_certificate_metadata_is_rejected_without_raw_details()

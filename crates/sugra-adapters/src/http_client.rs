@@ -353,6 +353,54 @@ mod tests {
 
     use super::*;
 
+    async fn local_server(
+        responses: Vec<&'static [u8]>,
+    ) -> Result<
+        (
+            url::Url,
+            tokio::task::JoinHandle<Result<Vec<Vec<u8>>, std::io::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = vec![0_u8; 4096];
+                let length = stream.read(&mut request).await?;
+                request.truncate(length);
+                requests.push(request);
+                stream.write_all(response).await?;
+            }
+            Ok(requests)
+        });
+        Ok((url::Url::parse(&format!("http://{address}/"))?, server))
+    }
+
+    fn scoped_request(
+        url: url::Url,
+        method: HttpMethod,
+        max_redirects: usize,
+        max_response_bytes: usize,
+    ) -> Result<HttpRequest, Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Url, url.as_str())?;
+        Ok(HttpRequest {
+            url,
+            method,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            max_redirects,
+            budget: Budget {
+                timeout_ms: 1_000,
+                max_response_bytes,
+                ..Budget::default()
+            },
+            scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+        })
+    }
+
     #[test]
     fn cookie_values_are_discarded_but_security_attributes_remain()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -368,6 +416,17 @@ mod tests {
         assert_eq!(cookie.same_site.as_deref(), Some("lax"));
         assert_eq!(cookie.max_age_seconds, Some(600));
         assert!(!serde_json::to_string(&cookie)?.contains("secret"));
+
+        assert!(parse_cookie_metadata("missing-assignment").is_none());
+        assert!(parse_cookie_metadata("=value").is_none());
+        let bounded = parse_cookie_metadata(&format!(
+            "id=value; Domain={}; SameSite=None; Max-Age=invalid; Unknown=ignored",
+            "a".repeat(300)
+        ))
+        .ok_or("bounded cookie metadata was not parsed")?;
+        assert_eq!(bounded.domain.as_deref().map(str::len), Some(256));
+        assert_eq!(bounded.same_site.as_deref(), Some("none"));
+        assert_eq!(bounded.max_age_seconds, None);
         Ok(())
     }
 
@@ -467,6 +526,116 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn successful_post_returns_body_headers_and_redacted_cookie_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (url, server) = local_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Result: ready\r\nSet-Cookie: session=secret; Secure; HttpOnly\r\nConnection: close\r\n\r\nhello",
+        ])
+        .await?;
+        let mut request = scoped_request(url, HttpMethod::Post, 0, 1_024)?;
+        request.headers.insert("x-request".into(), "fixture".into());
+        request.body = b"payload".to_vec();
+
+        let response = ReqwestHttp::new()?.execute(request).await?;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        assert_eq!(
+            response.headers.get("x-result").map(String::as_str),
+            Some("ready")
+        );
+        assert_eq!(response.cookies.len(), 1);
+        assert_eq!(
+            response.headers.get("set-cookie").map(String::as_str),
+            Some("<redacted>; count=1")
+        );
+
+        let requests = server.await??;
+        let wire = String::from_utf8_lossy(&requests[0]);
+        assert!(wire.starts_with("POST / HTTP/1.1"));
+        assert!(wire.contains("x-request: fixture"));
+        assert!(wire.ends_with("payload"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_scope_303_redirect_is_followed_as_get() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (url, server) = local_server(vec![
+            b"HTTP/1.1 303 See Other\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ])
+        .await?;
+        let mut request = scoped_request(url, HttpMethod::Post, 2, 1_024)?;
+        request.body = b"payload".to_vec();
+
+        let response = ReqwestHttp::new()?.execute(request).await?;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        assert_eq!(response.redirects.len(), 1);
+        assert_eq!(
+            response.redirects[0].decision,
+            HttpRedirectDecision::Followed
+        );
+
+        let requests = server.await??;
+        assert!(String::from_utf8_lossy(&requests[0]).starts_with("POST / HTTP/1.1"));
+        assert!(String::from_utf8_lossy(&requests[1]).starts_with("GET /final HTTP/1.1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_returns_the_terminal_redirect() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (url, server) = local_server(vec![
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: /later\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ])
+        .await?;
+
+        let response = ReqwestHttp::new()?
+            .execute(scoped_request(url, HttpMethod::Get, 0, 1_024)?)
+            .await?;
+        assert_eq!(response.status, 301);
+        assert_eq!(response.redirects.len(), 1);
+        assert_eq!(
+            response.redirects[0].decision,
+            HttpRedirectDecision::LimitReached
+        );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declared_and_streamed_oversized_bodies_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (declared_url, declared_server) = local_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nexcess",
+        ])
+        .await?;
+        let Err(declared) = ReqwestHttp::new()?
+            .execute(scoped_request(declared_url, HttpMethod::Get, 0, 5)?)
+            .await
+        else {
+            return Err("declared oversized response was accepted".into());
+        };
+        assert_eq!(declared.kind, PortErrorKind::TooLarge);
+        declared_server.await??;
+
+        let (streamed_url, streamed_server) = local_server(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nexcess\r\n0\r\n\r\n",
+        ])
+        .await?;
+        let Err(streamed) = ReqwestHttp::new()?
+            .execute(scoped_request(streamed_url, HttpMethod::Get, 0, 5)?)
+            .await
+        else {
+            return Err("streamed oversized response was accepted".into());
+        };
+        assert_eq!(streamed.kind, PortErrorKind::TooLarge);
+        streamed_server.await??;
+        Ok(())
+    }
+
     #[test]
     fn redirect_classification_is_explicit() {
         for status in [301, 302, 303, 307, 308] {
@@ -475,5 +644,11 @@ mod tests {
         for status in [200, 304, 400] {
             assert!(!is_redirect(status));
         }
+        assert_eq!(reqwest_method(HttpMethod::Get), Method::GET);
+        assert_eq!(reqwest_method(HttpMethod::Head), Method::HEAD);
+        assert_eq!(reqwest_method(HttpMethod::Options), Method::OPTIONS);
+        assert_eq!(reqwest_method(HttpMethod::Post), Method::POST);
+        assert_eq!(millis(42), 42);
+        assert_eq!(millis(u128::MAX), u64::MAX);
     }
 }

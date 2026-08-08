@@ -77,3 +77,110 @@ fn command_line(kind: CommandKind, target: &str) -> (&'static str, Vec<&str>) {
         CommandKind::SshKeyscan => ("ssh-keyscan", vec![target]),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sugra_core::CommandKind;
+    use sugra_domain::{Budget, ScopeGrant, Target, TargetKind};
+    use time::OffsetDateTime;
+
+    use super::*;
+
+    fn request(target: Target, scope: ScopeGrant) -> CommandRequest {
+        CommandRequest {
+            kind: CommandKind::Ping,
+            target,
+            budget: Budget::default(),
+            scope,
+        }
+    }
+
+    #[cfg(feature = "local-exec")]
+    #[test]
+    fn every_command_kind_maps_to_an_allowlisted_program_without_a_shell() {
+        let target = "example.com";
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                command_line(CommandKind::Ping, target),
+                ("ping", vec!["-n", "1", target])
+            );
+            assert_eq!(
+                command_line(CommandKind::Traceroute, target),
+                ("tracert", vec![target])
+            );
+        } else {
+            assert_eq!(
+                command_line(CommandKind::Ping, target),
+                ("ping", vec!["-c", "1", target])
+            );
+            assert_eq!(
+                command_line(CommandKind::Traceroute, target),
+                ("traceroute", vec![target])
+            );
+        }
+        assert_eq!(
+            command_line(CommandKind::Whois, target),
+            ("whois", vec![target])
+        );
+        assert_eq!(
+            command_line(CommandKind::SshKeyscan, target),
+            ("ssh-keyscan", vec![target])
+        );
+    }
+
+    #[cfg(feature = "local-exec")]
+    #[tokio::test]
+    async fn command_execution_requires_both_scope_and_active_authorization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let other = Target::parse(TargetKind::Domain, "other.example")?;
+        let issued_at = OffsetDateTime::UNIX_EPOCH;
+
+        let Err(out_of_scope) = SystemCommand
+            .execute(request(
+                target.clone(),
+                ScopeGrant::exact(&other, true, issued_at),
+            ))
+            .await
+        else {
+            return Err("out-of-scope command was accepted".into());
+        };
+        assert_eq!(out_of_scope.kind, PortErrorKind::OutOfScope);
+
+        let Err(unauthorized) = SystemCommand
+            .execute(request(
+                target.clone(),
+                ScopeGrant::exact(&target, false, issued_at),
+            ))
+            .await
+        else {
+            return Err("unauthorized command was accepted".into());
+        };
+        assert_eq!(unauthorized.kind, PortErrorKind::OutOfScope);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "local-exec"))]
+    #[tokio::test]
+    async fn command_execution_reports_disabled_build_support()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let Err(error) = SystemCommand
+            .execute(request(
+                target.clone(),
+                ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("disabled command support was accepted".into());
+        };
+
+        assert_eq!(error.kind, PortErrorKind::Unavailable);
+        assert_eq!(
+            error.message,
+            "local command support is disabled at build time"
+        );
+        Ok(())
+    }
+}

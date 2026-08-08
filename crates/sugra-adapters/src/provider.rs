@@ -325,10 +325,13 @@ fn inject_secret(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use serde_json::{Value, json};
-    use sugra_core::ProviderRequest;
+    use sugra_core::{Clock, HttpPort, HttpRequest, HttpResponse, ProviderRequest};
     use sugra_domain::Budget;
+    use time::OffsetDateTime;
 
     use super::*;
 
@@ -340,6 +343,58 @@ mod tests {
             secret_env: None,
             budget: Budget::default(),
         }
+    }
+
+    #[derive(Clone)]
+    struct FakeHttp {
+        response: Result<HttpResponse, PortError>,
+        requests: Arc<Mutex<Vec<HttpRequest>>>,
+    }
+
+    #[async_trait]
+    impl HttpPort for FakeHttp {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, PortError> {
+            self.requests
+                .lock()
+                .map_err(|_| PortError::new(PortErrorKind::Internal, "test request lock failed"))?
+                .push(request);
+            self.response.clone()
+        }
+    }
+
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH
+        }
+    }
+
+    fn response(status: u16, body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            final_url: Url::parse("https://provider.example/result")
+                .unwrap_or_else(|error| unreachable!("valid test URL: {error}")),
+            status,
+            headers: BTreeMap::new(),
+            cookies: Vec::new(),
+            redirects: Vec::new(),
+            body: body.to_vec(),
+            duration_ms: 7,
+        }
+    }
+
+    fn provider(
+        response: Result<HttpResponse, PortError>,
+    ) -> (ReqwestProvider, Arc<Mutex<Vec<HttpRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeHttp {
+            response,
+            requests: Arc::clone(&requests),
+        };
+        (
+            ReqwestProvider::new(Arc::new(http), Arc::new(FixedClock)),
+            requests,
+        )
     }
 
     #[test]
@@ -470,6 +525,144 @@ mod tests {
             headers.get("content-type").map(String::as_str),
             Some("application/x-www-form-urlencoded")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_builds_a_scoped_request_and_parses_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (provider, requests) = provider(Ok(response(200, br#"{"Status": 0}"#)));
+        let provider_response = provider
+            .query(request(
+                "cloudflare-doh",
+                "resolve",
+                BTreeMap::from([
+                    ("name".into(), json!("example.com")),
+                    ("type".into(), json!("AAAA")),
+                ]),
+            ))
+            .await?;
+
+        assert_eq!(provider_response.provider, "cloudflare-doh");
+        assert_eq!(provider_response.data, json!({"Status": 0}));
+        let requests = requests.lock().map_err(|_| "test request lock failed")?;
+        let sent = requests.first().ok_or("provider did not issue a request")?;
+        assert_eq!(sent.method, HttpMethod::Get);
+        assert_eq!(sent.max_redirects, 2);
+        assert_eq!(
+            sent.headers.get("accept").map(String::as_str),
+            Some("application/dns-json")
+        );
+        assert_eq!(sent.url.host_str(), Some("cloudflare-dns.com"));
+        let target = Target::parse(TargetKind::Url, sent.url.as_str())?;
+        assert!(sent.scope.allows(&target));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_classifies_status_body_and_transport_failures() {
+        let cases = [
+            (
+                Ok(response(429, b"{}")),
+                PortErrorKind::RateLimited,
+                "provider rate limit reached",
+            ),
+            (
+                Ok(response(503, b"{}")),
+                PortErrorKind::InvalidResponse,
+                "provider returned HTTP 503",
+            ),
+            (
+                Ok(response(200, b"not-json")),
+                PortErrorKind::InvalidResponse,
+                "provider returned invalid JSON",
+            ),
+            (
+                Err(PortError::new(
+                    PortErrorKind::Timeout,
+                    "provider boundary timed out",
+                )),
+                PortErrorKind::Timeout,
+                "provider boundary timed out",
+            ),
+        ];
+
+        for (response, expected_kind, expected_message) in cases {
+            let (provider, _) = provider(response);
+            let result = provider
+                .query(request(
+                    "rdap",
+                    "domain",
+                    BTreeMap::from([("target".into(), json!("example.com"))]),
+                ))
+                .await;
+            let Err(error) = result else {
+                unreachable!("provider failure fixture unexpectedly succeeded");
+            };
+            assert_eq!(error.kind, expected_kind);
+            assert_eq!(error.message, expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_fail_before_the_http_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (provider, requests) = provider(Ok(response(200, b"{}")));
+        let mut request = request(
+            "shodan",
+            "host",
+            BTreeMap::from([("target".into(), json!("192.0.2.1"))]),
+        );
+        request.secret_env = Some("SUGRA_TEST_CREDENTIAL_THAT_MUST_NOT_EXIST_7F4A".into());
+
+        let Err(error) = provider.query(request).await else {
+            return Err("missing credential unexpectedly succeeded".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::Unavailable);
+        assert_eq!(error.message, "provider credential is not configured");
+        assert!(
+            requests
+                .lock()
+                .map_err(|_| "test request lock failed")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_authenticated_provider_uses_its_declared_credential_location()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let header_cases = [
+            ("hibp", "hibp-api-key", "fixture"),
+            ("abuseipdb", "key", "fixture"),
+            ("otx", "x-otx-api-key", "fixture"),
+            ("cloudflare-radar", "authorization", "Bearer fixture"),
+            ("urlscan", "api-key", "fixture"),
+        ];
+        for (provider, header, expected) in header_cases {
+            let mut url = Url::parse("https://provider.example/resource")?;
+            let mut headers = BTreeMap::new();
+            inject_secret(provider, &mut url, &mut headers, "fixture")?;
+            assert_eq!(headers.get(header).map(String::as_str), Some(expected));
+        }
+
+        let mut shodan = Url::parse("https://provider.example/resource")?;
+        inject_secret("shodan", &mut shodan, &mut BTreeMap::new(), "fixture")?;
+        assert_eq!(shodan.query(), Some("key=fixture"));
+
+        let mut ipinfo = Url::parse("https://provider.example/resource")?;
+        inject_secret("ipinfo", &mut ipinfo, &mut BTreeMap::new(), "fixture")?;
+        assert_eq!(ipinfo.query(), Some("token=fixture"));
+
+        let Err(error) = inject_secret(
+            "unknown-provider",
+            &mut Url::parse("https://provider.example/resource")?,
+            &mut BTreeMap::new(),
+            "fixture",
+        ) else {
+            return Err("unknown provider accepted a credential".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::Unavailable);
         Ok(())
     }
 }
