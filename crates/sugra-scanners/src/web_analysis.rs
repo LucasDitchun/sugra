@@ -58,6 +58,7 @@ pub(crate) struct WebSample {
     pub(crate) duration_ms: u64,
     pub(crate) bytes: usize,
     pub(crate) redirect_count: usize,
+    has_security_contact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +207,7 @@ pub(crate) fn sample(label: String, response: &HttpResponse) -> WebSample {
         duration_ms: response.duration_ms,
         bytes: response.body.len(),
         redirect_count: response.redirects.len(),
+        has_security_contact: has_valid_security_contact(&response.body),
     }
 }
 
@@ -809,7 +811,7 @@ fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Fi
             headers.push("strict-transport-security");
         }
         for header in headers {
-            if !response.headers.contains_key(header) {
+            if !effective_security_header(id, response, header) {
                 findings.push(finding(
                     &format!("missing-{header}"),
                     &format!("Security header {header} was not observed"),
@@ -820,14 +822,7 @@ fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Fi
             }
         }
     }
-    if id == "clickjacking-test"
-        && is_html_response(response)
-        && !response.headers.contains_key("x-frame-options")
-        && !response
-            .headers
-            .get("content-security-policy")
-            .is_some_and(|value| value.to_ascii_lowercase().contains("frame-ancestors"))
-    {
+    if id == "clickjacking-test" && is_html_response(response) && !framing_is_restricted(response) {
         findings.push(finding(
             "framing-not-restricted",
             "No framing restriction was observed",
@@ -840,7 +835,7 @@ fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Fi
         && response
             .headers
             .get("access-control-allow-origin")
-            .is_some_and(|value| value == "*" || value == "https://scope-check.invalid")
+            .is_some_and(|value| permits_untrusted_cors_origin(value))
     {
         findings.push(finding(
             "permissive-cors",
@@ -853,16 +848,145 @@ fn header_findings(id: &str, response: &HttpResponse, evidence: usize) -> Vec<Fi
     findings
 }
 
-fn is_html_response(response: &HttpResponse) -> bool {
-    response.headers.get("content-type").is_some_and(|value| {
-        let value = value.to_ascii_lowercase();
-        value.contains("text/html") || value.contains("application/xhtml+xml")
-    }) || response
-        .body
+fn permits_untrusted_cors_origin(value: &str) -> bool {
+    let value = value.trim();
+    if value == "*" {
+        return true;
+    }
+    let (Ok(candidate), Ok(probe)) = (Url::parse(value), Url::parse("https://scope-check.invalid"))
+    else {
+        return false;
+    };
+    candidate.username().is_empty()
+        && candidate.password().is_none()
+        && candidate.path() == "/"
+        && candidate.query().is_none()
+        && candidate.fragment().is_none()
+        && candidate.origin() == probe.origin()
+}
+
+fn framing_is_restricted(response: &HttpResponse) -> bool {
+    let x_frame_options = response
+        .headers
+        .get("x-frame-options")
+        .map(|value| value.trim())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("deny") || value.eq_ignore_ascii_case("sameorigin")
+        });
+    if x_frame_options {
+        return true;
+    }
+
+    response
+        .headers
+        .get("content-security-policy")
+        .and_then(|value| {
+            value.split(';').find_map(|directive| {
+                let mut parts = directive.split_ascii_whitespace();
+                parts
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("frame-ancestors"))
+                    .then(|| parts.collect::<Vec<_>>())
+            })
+        })
+        .is_some_and(|sources| !sources.is_empty() && !sources.contains(&"*"))
+}
+
+fn effective_security_header(id: &str, response: &HttpResponse, header: &str) -> bool {
+    let Some(value) = response.headers.get(header) else {
+        return false;
+    };
+    if id != "http-security" {
+        return true;
+    }
+
+    match header {
+        "content-security-policy" => has_restrictive_csp_directive(value),
+        "strict-transport-security" => value.split(';').any(|directive| {
+            let Some((name, seconds)) = directive.split_once('=') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("max-age")
+                && seconds
+                    .trim()
+                    .parse::<u64>()
+                    .is_ok_and(|seconds| seconds > 0)
+        }),
+        "x-content-type-options" => value.trim().eq_ignore_ascii_case("nosniff"),
+        _ => true,
+    }
+}
+
+fn has_restrictive_csp_directive(value: &str) -> bool {
+    value.split(';').any(|directive| {
+        let mut parts = directive.split_ascii_whitespace();
+        let Some(name) = parts.next() else {
+            return false;
+        };
+        if [
+            "sandbox",
+            "upgrade-insecure-requests",
+            "block-all-mixed-content",
+        ]
         .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'<')
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        {
+            return true;
+        }
+        let restrictive_source_directive = [
+            "default-src",
+            "script-src",
+            "style-src",
+            "img-src",
+            "connect-src",
+            "font-src",
+            "object-src",
+            "media-src",
+            "frame-src",
+            "child-src",
+            "worker-src",
+            "manifest-src",
+            "base-uri",
+            "form-action",
+            "frame-ancestors",
+            "require-trusted-types-for",
+            "trusted-types",
+        ]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate));
+        if !restrictive_source_directive {
+            return false;
+        }
+        let sources = parts.collect::<Vec<_>>();
+        !sources.is_empty() && !sources.contains(&"*")
+    })
+}
+
+fn is_html_response(response: &HttpResponse) -> bool {
+    if !(200..=399).contains(&response.status) {
+        return false;
+    }
+    if let Some(value) = response.headers.get("content-type") {
+        let media_type = value.split(';').next().unwrap_or_default().trim();
+        return media_type.eq_ignore_ascii_case("text/html")
+            || media_type.eq_ignore_ascii_case("application/xhtml+xml");
+    }
+
+    let prefix = String::from_utf8_lossy(&response.body);
+    let prefix = prefix.trim_start_matches(char::is_whitespace);
+    ["<!doctype html", "<html", "<head", "<body"]
+        .iter()
+        .any(|tag| html_prefix_matches(prefix, tag))
+}
+
+fn html_prefix_matches(value: &str, tag: &str) -> bool {
+    value
+        .get(..tag.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+        && value
+            .as_bytes()
+            .get(tag.len())
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'>' | b'/'))
 }
 
 fn inventory_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Finding> {
@@ -979,7 +1103,7 @@ fn metadata_findings(
             )
         }
         "security-txt" | "security-contact-gap-finder"
-            if response.status == 200 && lower.contains("contact:") =>
+            if response.status == 200 && has_valid_security_contact(&response.body) =>
         {
             one(
                 "security-contact-observed",
@@ -993,6 +1117,31 @@ fn metadata_findings(
     }
 }
 
+fn has_valid_security_contact(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with('#') || line.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("contact") {
+            return false;
+        }
+        let value = value.trim();
+        !value.is_empty()
+            && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+            && Url::parse(value).is_ok_and(|contact| {
+                !contact.scheme().is_empty()
+                    && (contact.host_str().is_some() || !contact.path().is_empty())
+            })
+    })
+}
+
 fn privacy_findings(
     id: &str,
     response: &HttpResponse,
@@ -1001,34 +1150,38 @@ fn privacy_findings(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     if matches!(id, "cookies" | "session-hijacking-passive") {
-        for cookie in &response.cookies {
-            if !cookie.secure {
-                findings.push(finding(
-                    "cookie-secure-missing",
-                    "A response cookie does not declare Secure",
-                    Severity::Medium,
-                    Confidence::Confirmed,
-                    evidence,
-                ));
-            }
-            if !cookie.http_only {
-                findings.push(finding(
-                    "cookie-httponly-missing",
-                    "A response cookie does not declare HttpOnly",
-                    Severity::Medium,
-                    Confidence::Confirmed,
-                    evidence,
-                ));
-            }
-            if cookie.same_site.is_none() {
-                findings.push(finding(
-                    "cookie-samesite-missing",
-                    "A response cookie does not declare SameSite",
-                    Severity::Low,
-                    Confidence::Confirmed,
-                    evidence,
-                ));
-            }
+        if response.cookies.iter().any(|cookie| !cookie.secure) {
+            findings.push(finding(
+                "cookie-secure-missing",
+                "A response cookie does not declare Secure",
+                Severity::Medium,
+                Confidence::Confirmed,
+                evidence,
+            ));
+        }
+        if response.cookies.iter().any(|cookie| !cookie.http_only) {
+            findings.push(finding(
+                "cookie-httponly-missing",
+                "A response cookie does not declare HttpOnly",
+                Severity::Medium,
+                Confidence::Confirmed,
+                evidence,
+            ));
+        }
+        if response.cookies.iter().any(|cookie| {
+            !cookie.same_site.as_deref().is_some_and(|value| {
+                value.eq_ignore_ascii_case("strict")
+                    || value.eq_ignore_ascii_case("lax")
+                    || value.eq_ignore_ascii_case("none")
+            })
+        }) {
+            findings.push(finding(
+                "cookie-samesite-missing",
+                "A response cookie does not declare a valid SameSite policy",
+                Severity::Low,
+                Confidence::Confirmed,
+                evidence,
+            ));
         }
     }
     if id == "session-cookie-lifetime-checker"
@@ -1269,9 +1422,11 @@ fn baseline_diff(
 
 fn security_contact_gap(samples: &[WebSample]) -> Vec<Finding> {
     if !samples.is_empty()
-        && !samples
-            .iter()
-            .any(|sample| sample.status == 200 && sample.label.contains("well-known"))
+        && !samples.iter().any(|sample| {
+            sample.status == 200
+                && is_canonical_security_txt_probe(&sample.label)
+                && sample.has_security_contact
+        })
     {
         aggregate_one(
             "security-contact-not-observed",
@@ -1283,6 +1438,15 @@ fn security_contact_gap(samples: &[WebSample]) -> Vec<Finding> {
     } else {
         Vec::new()
     }
+}
+
+fn is_canonical_security_txt_probe(label: &str) -> bool {
+    label
+        .strip_prefix("path-")
+        .and_then(|label| label.split_once(':'))
+        .is_some_and(|(index, path)| {
+            index.parse::<usize>().is_ok() && path == "/.well-known/security.txt"
+        })
 }
 
 fn one(
@@ -1336,6 +1500,31 @@ mod tests {
             redirects: Vec::new(),
             body: body.as_bytes().to_vec(),
             duration_ms: 25,
+        }
+    }
+
+    fn finding_keys(id: &str, response: &HttpResponse) -> BTreeSet<String> {
+        let response_signals = signals(response);
+        response_findings(id, response, &response_signals, 7)
+            .into_iter()
+            .map(|finding| finding.key)
+            .collect()
+    }
+
+    fn cookie(
+        secure: bool,
+        http_only: bool,
+        same_site: Option<&str>,
+        max_age_seconds: Option<i64>,
+    ) -> HttpCookie {
+        HttpCookie {
+            name_sha256: "safe-cookie-fingerprint".into(),
+            domain: None,
+            path: Some("/".into()),
+            secure,
+            http_only,
+            same_site: same_site.map(str::to_owned),
+            max_age_seconds,
         }
     }
 
@@ -1414,6 +1603,340 @@ mod tests {
         assert!(keys.contains("missing-content-security-policy"));
         assert!(keys.contains("missing-strict-transport-security"));
         assert!(keys.contains("missing-x-content-type-options"));
+    }
+
+    #[test]
+    fn http_headers_only_reports_missing_controls_for_html_media_types() {
+        let mut html = response("not needed for an explicit media type");
+        html.headers
+            .insert("content-type".into(), "text/html; charset=utf-8".into());
+        assert_eq!(
+            finding_keys("http-headers", &html),
+            BTreeSet::from([
+                "missing-content-security-policy".into(),
+                "missing-strict-transport-security".into(),
+                "missing-x-content-type-options".into(),
+            ])
+        );
+
+        html.headers.insert(
+            "content-security-policy".into(),
+            "default-src 'self'".into(),
+        );
+        html.headers.insert(
+            "strict-transport-security".into(),
+            "max-age=31536000".into(),
+        );
+        html.headers
+            .insert("x-content-type-options".into(), "nosniff".into());
+        assert!(finding_keys("http-headers", &html).is_empty());
+
+        let mut malformed = response("plain text");
+        malformed
+            .headers
+            .insert("content-type".into(), "application/not-text/htmlish".into());
+        assert!(finding_keys("http-headers", &malformed).is_empty());
+
+        let mut failure = response("<html>upstream diagnostic: secret-token</html>");
+        failure.status = 500;
+        assert!(finding_keys("http-headers", &failure).is_empty());
+    }
+
+    #[test]
+    fn http_security_requires_effective_header_values() {
+        let mut secure = response("<html><body>ok</body></html>");
+        secure.headers.insert(
+            "content-security-policy".into(),
+            "default-src 'self'; object-src 'none'".into(),
+        );
+        secure.headers.insert(
+            "strict-transport-security".into(),
+            "max-age=31536000; includeSubDomains".into(),
+        );
+        secure
+            .headers
+            .insert("x-content-type-options".into(), "nosniff".into());
+        assert!(finding_keys("http-security", &secure).is_empty());
+
+        let mut malformed = secure.clone();
+        malformed.headers.insert(
+            "content-security-policy".into(),
+            "report-uri https://collector.invalid/?token=csp-secret".into(),
+        );
+        malformed
+            .headers
+            .insert("strict-transport-security".into(), "max-age=0".into());
+        malformed
+            .headers
+            .insert("x-content-type-options".into(), "nosniff-ish".into());
+        assert_eq!(
+            finding_keys("http-security", &malformed),
+            BTreeSet::from([
+                "missing-content-security-policy".into(),
+                "missing-strict-transport-security".into(),
+                "missing-x-content-type-options".into(),
+            ])
+        );
+        let findings = response_findings("http-security", &malformed, &signals(&malformed), 7);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("csp-secret")
+        );
+
+        let mut http = malformed;
+        http.final_url = Url::parse("http://example.test/")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        assert_eq!(
+            finding_keys("http-security", &http),
+            BTreeSet::from([
+                "missing-content-security-policy".into(),
+                "missing-x-content-type-options".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn clickjacking_requires_a_valid_framing_restriction_directive() {
+        let vulnerable = response("<html><body>frameable</body></html>");
+        assert_eq!(
+            finding_keys("clickjacking-test", &vulnerable),
+            BTreeSet::from(["framing-not-restricted".into()])
+        );
+
+        let mut xfo = vulnerable.clone();
+        xfo.headers
+            .insert("x-frame-options".into(), " SAMEORIGIN ".into());
+        assert!(finding_keys("clickjacking-test", &xfo).is_empty());
+
+        let mut csp = vulnerable.clone();
+        csp.headers.insert(
+            "content-security-policy".into(),
+            "default-src 'self'; frame-ancestors 'none'".into(),
+        );
+        assert!(finding_keys("clickjacking-test", &csp).is_empty());
+
+        let mut nearby_substring = vulnerable.clone();
+        nearby_substring.headers.insert(
+            "content-security-policy".into(),
+            "default-src 'self'; report-uri /frame-ancestors-report".into(),
+        );
+        assert_eq!(
+            finding_keys("clickjacking-test", &nearby_substring),
+            BTreeSet::from(["framing-not-restricted".into()])
+        );
+
+        let mut malformed = vulnerable;
+        malformed.headers.insert(
+            "x-frame-options".into(),
+            "ALLOW-FROM https://example.test".into(),
+        );
+        malformed
+            .headers
+            .insert("content-security-policy".into(), "frame-ancestors *".into());
+        assert_eq!(
+            finding_keys("clickjacking-test", &malformed),
+            BTreeSet::from(["framing-not-restricted".into()])
+        );
+    }
+
+    #[test]
+    fn cors_only_accepts_wildcard_or_the_exact_untrusted_probe_origin() {
+        let mut reflected = response("public response");
+        reflected.headers.insert(
+            "access-control-allow-origin".into(),
+            "  HTTPS://SCOPE-CHECK.INVALID:443  ".into(),
+        );
+        assert_eq!(
+            finding_keys("cors-misconfiguration-scanner", &reflected),
+            BTreeSet::from(["permissive-cors".into()])
+        );
+
+        reflected.headers.insert(
+            "access-control-allow-origin".into(),
+            "https://scope-check.invalid.example".into(),
+        );
+        assert!(finding_keys("cors-misconfiguration-scanner", &reflected).is_empty());
+
+        reflected.headers.insert(
+            "access-control-allow-origin".into(),
+            "https://scope-check.invalid, https://example.test".into(),
+        );
+        assert!(finding_keys("cors-misconfiguration-scanner", &reflected).is_empty());
+
+        reflected
+            .headers
+            .insert("access-control-allow-origin".into(), " * ".into());
+        let findings = response_findings(
+            "cors-misconfiguration-scanner",
+            &reflected,
+            &signals(&reflected),
+            7,
+        );
+        assert_eq!(findings[0].key, "permissive-cors");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("scope-check.invalid")
+        );
+    }
+
+    #[test]
+    fn security_txt_recognizes_only_a_valid_contact_field() {
+        let published = response(
+            "# security policy\r\nContact: mailto:private-security@example.test\r\nExpires: 2030-01-01T00:00:00Z\r\n",
+        );
+        let findings = response_findings("security-txt", &published, &signals(&published), 7);
+        assert_eq!(findings[0].key, "security-contact-observed");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("private-security@example.test")
+        );
+
+        for body in [
+            "# Contact: mailto:security@example.test",
+            "X-Contact: mailto:security@example.test",
+            "Contact:",
+            "Contact: not an absolute URI",
+        ] {
+            let nearby = response(body);
+            assert!(
+                finding_keys("security-txt", &nearby).is_empty(),
+                "nearby or malformed field was accepted: {body}"
+            );
+        }
+
+        let mut invalid_utf8 = response("");
+        invalid_utf8.body = vec![b'C', b'o', b'n', b't', b'a', b'c', b't', b':', b' ', 0xff];
+        assert!(finding_keys("security-txt", &invalid_utf8).is_empty());
+    }
+
+    #[test]
+    fn security_contact_gap_requires_a_valid_contact_at_the_canonical_path() {
+        let valid_body = "Contact: https://example.test/security-report\n";
+        let canonical = sample(
+            "path-0:/.well-known/security.txt".into(),
+            &response(valid_body),
+        );
+        assert!(
+            aggregate_findings(
+                "security-contact-gap-finder",
+                std::slice::from_ref(&canonical),
+                &BTreeMap::new(),
+            )
+            .is_empty()
+        );
+
+        let nearby_label = sample(
+            "path-0:/.well-known/security.txt.backup".into(),
+            &response(valid_body),
+        );
+        assert_eq!(
+            aggregate_findings(
+                "security-contact-gap-finder",
+                &[nearby_label],
+                &BTreeMap::new(),
+            )[0]
+            .key,
+            "security-contact-not-observed"
+        );
+
+        let malformed = sample(
+            "path-0:/.well-known/security.txt".into(),
+            &response("# Contact: mailto:hidden@example.test"),
+        );
+        let findings = aggregate_findings(
+            "security-contact-gap-finder",
+            &[malformed],
+            &BTreeMap::new(),
+        );
+        assert_eq!(findings[0].key, "security-contact-not-observed");
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("hidden@example.test")
+        );
+
+        assert!(
+            aggregate_findings("security-contact-gap-finder", &[], &BTreeMap::new(),).is_empty()
+        );
+    }
+
+    #[test]
+    fn cookies_reports_each_missing_security_attribute_once_per_response() {
+        let mut insecure = response("ok");
+        insecure.cookies.push(cookie(false, false, None, None));
+        assert_eq!(
+            finding_keys("cookies", &insecure),
+            BTreeSet::from([
+                "cookie-httponly-missing".into(),
+                "cookie-samesite-missing".into(),
+                "cookie-secure-missing".into(),
+            ])
+        );
+
+        let mut hardened = response("ok");
+        hardened
+            .cookies
+            .push(cookie(true, true, Some("Strict"), None));
+        assert!(finding_keys("cookies", &hardened).is_empty());
+
+        let mut malformed = response("ok");
+        malformed
+            .cookies
+            .push(cookie(true, true, Some("strict-ish"), None));
+        assert_eq!(
+            finding_keys("cookies", &malformed),
+            BTreeSet::from(["cookie-samesite-missing".into()])
+        );
+
+        insecure.cookies.push(cookie(false, false, None, None));
+        insecure.cookies[0].name_sha256 = "must-not-leak-cookie-name".into();
+        let findings = response_findings("cookies", &insecure, &signals(&insecure), 7);
+        assert_eq!(findings.len(), 3);
+        assert!(findings.iter().all(|finding| finding.evidence == [7]));
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("must-not-leak-cookie-name")
+        );
+    }
+
+    #[test]
+    fn session_cookie_lifetime_uses_an_exclusive_thirty_day_boundary() {
+        const THIRTY_DAYS: i64 = 30 * 24 * 60 * 60;
+
+        let mut long_lived = response("ok");
+        long_lived
+            .cookies
+            .push(cookie(true, true, Some("Lax"), Some(THIRTY_DAYS + 1)));
+        long_lived.cookies[0].name_sha256 = "must-not-leak-session-name".into();
+        let findings = response_findings(
+            "session-cookie-lifetime-checker",
+            &long_lived,
+            &signals(&long_lived),
+            7,
+        );
+        assert_eq!(findings[0].key, "long-lived-cookie");
+        assert_eq!(findings[0].evidence, [7]);
+        assert!(
+            !serde_json::to_string(&findings)
+                .unwrap_or_else(|error| unreachable!("serializable findings: {error}"))
+                .contains("must-not-leak-session-name")
+        );
+
+        let mut boundary = response("ok");
+        boundary
+            .cookies
+            .push(cookie(true, true, Some("Lax"), Some(THIRTY_DAYS)));
+        boundary
+            .cookies
+            .push(cookie(true, true, Some("Lax"), Some(0)));
+        boundary.cookies.push(cookie(true, true, Some("Lax"), None));
+        assert!(finding_keys("session-cookie-lifetime-checker", &boundary).is_empty());
     }
 
     #[test]
