@@ -61,7 +61,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "DNS Over HTTPS",
             Operation::Dns,
             vec![TargetKind::Domain],
-            vec![Capability::PassiveNetwork],
+            vec![Capability::ThirdPartyApi],
             &["providers", "qtype", "timeout"],
         )?,
         definition(
@@ -241,7 +241,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "Recursive Nameserver Leak Test",
             Operation::Dns,
             vec![TargetKind::Domain],
-            vec![Capability::PassiveNetwork],
+            vec![Capability::ActiveProtocol],
             &["timeout"],
         )?,
         definition(
@@ -1216,7 +1216,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "Typosquat Domain Checker",
             Operation::Dns,
             vec![TargetKind::Domain],
-            vec![Capability::PassiveNetwork, Capability::LocalAnalysis],
+            vec![Capability::ActiveFuzz, Capability::LocalAnalysis],
             &["max_variants"],
         )?,
         definition(
@@ -1287,7 +1287,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "ip-reputation-check",
             "ip_reputation_check",
             Operation::Intelligence,
-            vec![TargetKind::Domain, TargetKind::Url],
+            vec![TargetKind::Ip],
             vec![Capability::ThirdPartyApi],
             &[],
         )?,
@@ -1474,5 +1474,41 @@ fn secret_default(name: &str) -> Option<String> {
         "shodan_key" => Some("SHODAN_API_KEY".into()),
         "censys_key" => Some("CENSYS_API_SECRET".into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_and_third_party_scanners_publish_required_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = definitions()?;
+        for (id, capability) in [
+            ("dns-over-https", Capability::ThirdPartyApi),
+            ("recursive-nameserver-leak-test", Capability::ActiveProtocol),
+            ("typosquat-domain-checker", Capability::ActiveFuzz),
+        ] {
+            let descriptor = definitions
+                .iter()
+                .find(|definition| definition.descriptor.id.as_str() == id)
+                .map(|definition| &definition.descriptor)
+                .ok_or_else(|| format!("missing descriptor {id}"))?;
+            assert!(descriptor.capabilities.contains(&capability));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn address_reputation_rejects_non_address_targets() -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = definitions()?;
+        let descriptor = definitions
+            .iter()
+            .find(|definition| definition.descriptor.id.as_str() == "ip-reputation-check")
+            .map(|definition| &definition.descriptor)
+            .ok_or("missing address reputation descriptor")?;
+        assert_eq!(descriptor.target_kinds, vec![TargetKind::Ip]);
+        Ok(())
     }
 }
