@@ -200,3 +200,58 @@ const fn is_redirect(status: u16) -> bool {
 fn millis(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+
+    use super::*;
+
+    #[test]
+    fn cookie_values_are_redacted_but_security_attributes_remain() {
+        assert_eq!(
+            redact_cookie("session=secret; Secure; HttpOnly; SameSite=Lax"),
+            "<redacted>; Secure; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(redact_cookie("session=secret"), "<redacted>");
+    }
+
+    #[test]
+    fn response_headers_never_expose_cookie_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SET_COOKIE,
+            HeaderValue::from_static("session=secret; Secure; HttpOnly"),
+        );
+        let safe = response_headers(&headers);
+        assert_eq!(
+            safe.get("set-cookie").map(String::as_str),
+            Some("<redacted>; Secure; HttpOnly")
+        );
+    }
+
+    #[test]
+    fn invalid_outbound_header_values_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let result = request_headers(&BTreeMap::from([(
+            "authorization".into(),
+            "Bearer fixture\nInjected: true".into(),
+        )]));
+        let Err(error) = result else {
+            return Err("newline crossed the HTTP header boundary".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::InvalidResponse);
+        Ok(())
+    }
+
+    #[test]
+    fn redirect_classification_is_explicit() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(is_redirect(status));
+        }
+        for status in [200, 304, 400] {
+            assert!(!is_redirect(status));
+        }
+    }
+}

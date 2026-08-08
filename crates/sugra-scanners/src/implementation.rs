@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -10,9 +11,9 @@ use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
-    Catalog, CommandKind, CommandRequest, DnsQuery, DnsRecordType, HttpMethod, HttpRequest,
-    PortError, PortErrorKind, ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner,
-    ScannerRegistry, ServiceBundle, TcpRequest, TlsRequest, UdpRequest,
+    Catalog, CommandKind, CommandRequest, DnsQuery, DnsRecord, DnsRecordType, HttpMethod,
+    HttpRequest, PortError, PortErrorKind, ProviderRequest, ScanContext, ScanError, ScanErrorKind,
+    Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -22,6 +23,20 @@ use url::Url;
 
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
+use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
+
+const fn operation_family(operation: Operation) -> BoundaryFamily {
+    match operation {
+        Operation::Dns => BoundaryFamily::Dns,
+        Operation::Http => BoundaryFamily::Http,
+        Operation::Tls => BoundaryFamily::Tls,
+        Operation::Registry | Operation::Intelligence => BoundaryFamily::Provider,
+        Operation::Tcp => BoundaryFamily::Tcp,
+        Operation::Udp => BoundaryFamily::Udp,
+        Operation::Command => BoundaryFamily::Command,
+        Operation::Local => BoundaryFamily::Local,
+    }
+}
 
 /// Constructs the complete validated built-in catalog and implementation registry.
 ///
@@ -38,10 +53,10 @@ pub fn build_builtins(services: &ServiceBundle) -> Result<Builtins, BuiltinError
     let catalog = Catalog::new(descriptors)?.require_count(147)?;
     let scanners: Vec<Arc<dyn Scanner>> = definitions
         .into_iter()
-        .map(|definition| {
-            Arc::new(BuiltinScanner::new(definition, services.clone())) as Arc<dyn Scanner>
+        .map(|definition| -> Result<Arc<dyn Scanner>, BuiltinError> {
+            Ok(Arc::new(BuiltinScanner::new(definition, services.clone())?) as Arc<dyn Scanner>)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let registry = ScannerRegistry::new(scanners)?;
     if registry.len() != catalog.len() {
         let missing = catalog
@@ -58,17 +73,24 @@ pub fn build_builtins(services: &ServiceBundle) -> Result<Builtins, BuiltinError
 
 struct BuiltinScanner {
     descriptor: ScannerDescriptor,
-    operation: Operation,
+    profile: SemanticProfile,
     services: ServiceBundle,
 }
 
 impl BuiltinScanner {
-    fn new(definition: ScannerDefinition, services: ServiceBundle) -> Self {
-        Self {
-            descriptor: definition.descriptor,
-            operation: definition.operation,
-            services,
+    fn new(definition: ScannerDefinition, services: ServiceBundle) -> Result<Self, BuiltinError> {
+        let profile = profile_for(definition.descriptor.id.as_str())
+            .ok_or_else(|| BuiltinError::MissingSemantics(definition.descriptor.id.clone()))?;
+        if operation_family(definition.operation) != profile.analyzer.family() {
+            return Err(BuiltinError::SemanticBoundaryMismatch(
+                definition.descriptor.id,
+            ));
         }
+        Ok(Self {
+            descriptor: definition.descriptor,
+            profile,
+            services,
+        })
     }
 }
 
@@ -92,73 +114,175 @@ impl Scanner for BuiltinScanner {
         if context.cancellation.is_cancelled() {
             return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
         }
-        match self.operation {
-            Operation::Dns => self.scan_dns(request, context).await,
-            Operation::Http => self.scan_http(request, context).await,
-            Operation::Tls => self.scan_tls(request, context).await,
-            Operation::Registry | Operation::Intelligence => {
-                self.scan_providers(request, context).await
-            }
-            Operation::Tcp => self.scan_tcp(request, context).await,
-            Operation::Udp => self.scan_udp(request, context).await,
-            Operation::Command => self.scan_command(request, context).await,
-            Operation::Local => self.scan_local(request, context),
-        }
+        let result = match self.profile.analyzer.family() {
+            BoundaryFamily::Dns => self.scan_dns(request, context).await,
+            BoundaryFamily::Http => self.scan_http(request, context).await,
+            BoundaryFamily::Tls => self.scan_tls(request, context).await,
+            BoundaryFamily::Provider => self.scan_providers(request, context).await,
+            BoundaryFamily::Tcp => self.scan_tcp(request, context).await,
+            BoundaryFamily::Udp => self.scan_udp(request, context).await,
+            BoundaryFamily::Command => self.scan_command(request, context).await,
+            BoundaryFamily::Local => self.scan_local(request, context),
+        }?;
+        Ok(self.annotate_result(result))
     }
 }
 
 impl BuiltinScanner {
+    fn annotate_result(&self, mut result: ScanResult) -> ScanResult {
+        for evidence in &mut result.evidence {
+            evidence.kind = format!("{}-{}", self.profile.id, evidence.kind);
+            let prior = std::mem::take(&mut evidence.observation);
+            evidence.observation = json!({
+                "scanner_id": self.profile.id,
+                "analysis": self.profile.analyzer.as_str(),
+                "purpose": self.profile.purpose,
+                "observation": prior,
+            });
+        }
+        result
+    }
+
     async fn scan_dns(
         &self,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        let name = dns_name(&request.target)?;
-        let record_types = dns_types(self.descriptor.id.as_str(), request);
-        let records = self
-            .services
-            .dns
-            .query(DnsQuery {
-                name: name.clone(),
-                record_types: record_types.clone(),
-                budget: request.budget,
-            })
-            .await
-            .map_err(scan_error_from_port)?;
-        let evidence = vec![Evidence {
-            kind: "dns-records".into(),
-            source: name,
-            observation: json!({
-                "requested_types": record_types,
-                "records": records,
-            }),
-            observed_at: context.clock.now(),
-        }];
-        let mut findings = Vec::new();
         let id = self.descriptor.id.as_str();
-        let records = evidence[0]
-            .observation
-            .get("records")
-            .and_then(Value::as_array);
-        if id == "dnssec" && !record_types.is_empty() && records.is_none_or(Vec::is_empty) {
-            findings.push(finding(
-                "dnssec-not-observed",
-                "DNSSEC material was not observed",
-                Severity::Low,
-                Confidence::Confirmed,
-                0,
+        if id == "dns-over-https" {
+            return self.scan_doh(request, context).await;
+        }
+        let plan = dns_query_plan(id, &request.target, request)?;
+        let mut evidence = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut findings = Vec::new();
+        for query in plan.into_iter().take(request.budget.max_requests) {
+            let started = Instant::now();
+            let result = self
+                .services
+                .dns
+                .query(DnsQuery {
+                    name: query.name.clone(),
+                    record_types: query.record_types.clone(),
+                    budget: request.budget,
+                })
+                .await;
+            match result {
+                Ok(records) => {
+                    let index = evidence.len();
+                    analyze_dns(id, &query, &records, index, &mut findings);
+                    evidence.push(Evidence {
+                        kind: "dns-records".into(),
+                        source: query.name,
+                        observation: json!({
+                            "requested_types": query.record_types,
+                            "records": records,
+                            "duration_ms": millis(started.elapsed().as_millis()),
+                        }),
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => diagnostics.push(Diagnostic {
+                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                    message: format!("{}: {}", query.name, error.message),
+                }),
+            }
+        }
+        if evidence.is_empty() {
+            let message = diagnostics
+                .first()
+                .map_or("all DNS observations failed", |value| {
+                    value.message.as_str()
+                });
+            return Err(ScanError::new(ScanErrorKind::Transport, message));
+        }
+        Ok(ScanResult {
+            status: if diagnostics.is_empty() {
+                ExecutionStatus::Completed
+            } else {
+                ExecutionStatus::Partial
+            },
+            findings,
+            evidence,
+            diagnostics,
+        })
+    }
+
+    async fn scan_doh(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        let name = dns_name(&request.target)?;
+        let qtype = request
+            .options
+            .get("qtype")
+            .and_then(Value::as_str)
+            .unwrap_or("A");
+        let providers = request
+            .options
+            .get("providers")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(doh_provider)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|items| !items.is_empty())
+            .unwrap_or_else(|| vec!["cloudflare-doh", "google-doh"]);
+        let mut evidence = Vec::new();
+        let mut diagnostics = Vec::new();
+        for provider in providers.into_iter().take(request.budget.max_requests) {
+            let response = self
+                .services
+                .provider
+                .query(ProviderRequest {
+                    provider: provider.into(),
+                    operation: "resolve".into(),
+                    query: BTreeMap::from([
+                        ("name".into(), Value::String(name.clone())),
+                        ("type".into(), Value::String(qtype.into())),
+                    ]),
+                    secret_env: None,
+                    budget: request.budget,
+                })
+                .await;
+            match response {
+                Ok(response) => evidence.push(Evidence {
+                    kind: "dns-over-https".into(),
+                    source: response.provider,
+                    observation: redact_json(response.data),
+                    observed_at: context.clock.now(),
+                }),
+                Err(error) => diagnostics.push(Diagnostic {
+                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                    message: error.message,
+                }),
+            }
+        }
+        if evidence.is_empty() {
+            let message = diagnostics
+                .first()
+                .map_or("all DNS-over-HTTPS providers failed", |value| {
+                    value.message.as_str()
+                });
+            return Err(ScanError::new(
+                ScanErrorKind::DependencyUnavailable,
+                message,
             ));
         }
-        if id == "dns-caa-checker" && records.is_some_and(Vec::is_empty) {
-            findings.push(finding(
-                "caa-not-observed",
-                "No CAA policy was observed",
-                Severity::Low,
-                Confidence::Confirmed,
-                0,
-            ));
-        }
-        Ok(ScanResult::completed(evidence, findings))
+        Ok(ScanResult {
+            status: if diagnostics.is_empty() {
+                ExecutionStatus::Completed
+            } else {
+                ExecutionStatus::Partial
+            },
+            findings: Vec::new(),
+            evidence,
+            diagnostics,
+        })
     }
 
     async fn scan_http(
@@ -278,16 +402,11 @@ impl BuiltinScanner {
             })
             .await
             .map_err(scan_error_from_port)?;
-        let mut findings = Vec::new();
-        if observation.protocol.contains("TLSv1_2") {
-            findings.push(finding(
-                "tls-modernization",
-                "TLS 1.2 was negotiated; verify TLS 1.3 availability",
-                Severity::Info,
-                Confidence::Confirmed,
-                0,
-            ));
-        }
+        let findings = analyze_tls(
+            self.profile.analyzer,
+            &observation,
+            context.clock.now().unix_timestamp(),
+        );
         Ok(ScanResult::completed(
             vec![Evidence {
                 kind: "tls-handshake".into(),
@@ -509,6 +628,180 @@ impl BuiltinScanner {
     }
 }
 
+fn analyze_tls(analyzer: Analyzer, observation: &TlsObservation, now: i64) -> Vec<Finding> {
+    match analyzer {
+        Analyzer::TlsHandshake => analyze_tls_handshake(observation),
+        Analyzer::TlsChain => analyze_tls_chain(observation),
+        Analyzer::TlsExpiry => analyze_tls_expiry(observation, now),
+        Analyzer::TlsCipher => analyze_tls_cipher(observation),
+        Analyzer::TlsProtocol => analyze_tls_protocol(observation),
+        Analyzer::TlsPinning => analyze_tls_pinning(observation),
+        _ => Vec::new(),
+    }
+}
+
+fn analyze_tls_handshake(observation: &TlsObservation) -> Vec<Finding> {
+    if observation.protocol == "unknown" || observation.cipher_suite == "unknown" {
+        vec![finding(
+            "tls-negotiation-incomplete",
+            "TLS negotiation metadata is incomplete",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn analyze_tls_chain(observation: &TlsObservation) -> Vec<Finding> {
+    match observation.certificates.first() {
+        None => vec![finding(
+            "tls-chain-metadata-unavailable",
+            "The peer certificate chain could not be inspected",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        )],
+        Some(leaf) => {
+            let mut findings = Vec::new();
+            if leaf.is_ca == Some(true) {
+                findings.push(finding(
+                    "tls-leaf-is-ca",
+                    "The TLS leaf certificate is marked as a certificate authority",
+                    Severity::High,
+                    Confidence::Confirmed,
+                    0,
+                ));
+            }
+            if leaf.subject == leaf.issuer {
+                findings.push(finding(
+                    "tls-self-issued-leaf",
+                    "The TLS leaf certificate is self-issued",
+                    Severity::Medium,
+                    Confidence::Confirmed,
+                    0,
+                ));
+            }
+            findings
+        }
+    }
+}
+
+fn analyze_tls_expiry(observation: &TlsObservation, now: i64) -> Vec<Finding> {
+    match observation.certificates.first() {
+        None => vec![finding(
+            "tls-validity-metadata-unavailable",
+            "Certificate validity metadata is unavailable",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        )],
+        Some(leaf) if now < leaf.not_before => vec![finding(
+            "tls-certificate-not-yet-valid",
+            "The TLS certificate is not yet valid",
+            Severity::High,
+            Confidence::Confirmed,
+            0,
+        )],
+        Some(leaf) if now >= leaf.not_after => vec![finding(
+            "tls-certificate-expired",
+            "The TLS certificate has expired",
+            Severity::Critical,
+            Confidence::Confirmed,
+            0,
+        )],
+        Some(leaf) => {
+            let days = (leaf.not_after - now) / 86_400;
+            let risk = if days <= 7 {
+                Some((Severity::High, "The TLS certificate expires within 7 days"))
+            } else if days <= 30 {
+                Some((
+                    Severity::Medium,
+                    "The TLS certificate expires within 30 days",
+                ))
+            } else if days <= 90 {
+                Some((Severity::Low, "The TLS certificate expires within 90 days"))
+            } else {
+                None
+            };
+            risk.map_or_else(Vec::new, |(severity, title)| {
+                vec![finding(
+                    "tls-certificate-expiring",
+                    title,
+                    severity,
+                    Confidence::Confirmed,
+                    0,
+                )]
+            })
+        }
+    }
+}
+
+fn analyze_tls_cipher(observation: &TlsObservation) -> Vec<Finding> {
+    let protocol = observation.protocol.to_ascii_lowercase();
+    let cipher = observation.cipher_suite.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    if protocol.contains("tlsv1_0") || protocol.contains("tlsv1_1") {
+        findings.push(finding(
+            "tls-obsolete-protocol",
+            "An obsolete TLS protocol version was negotiated",
+            Severity::High,
+            Confidence::Confirmed,
+            0,
+        ));
+    } else if protocol.contains("tlsv1_2") {
+        findings.push(finding(
+            "tls-modernization",
+            "TLS 1.2 was negotiated; verify TLS 1.3 availability",
+            Severity::Info,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    if ["rc4", "3des", "des_cbc", "null", "export"]
+        .iter()
+        .any(|marker| cipher.contains(marker))
+    {
+        findings.push(finding(
+            "tls-weak-cipher",
+            "A weak TLS cipher suite was negotiated",
+            Severity::High,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    findings
+}
+
+fn analyze_tls_protocol(observation: &TlsObservation) -> Vec<Finding> {
+    if observation.alpn.as_deref() == Some("h2") {
+        Vec::new()
+    } else {
+        vec![finding(
+            "http2-not-negotiated",
+            "HTTP/2 was not negotiated over TLS",
+            Severity::Info,
+            Confidence::Confirmed,
+            0,
+        )]
+    }
+}
+
+fn analyze_tls_pinning(observation: &TlsObservation) -> Vec<Finding> {
+    if observation.certificate_sha256.is_empty() {
+        vec![finding(
+            "tls-pinning-material-unavailable",
+            "No certificate fingerprint is available for pinning review",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 fn dns_name(target: &Target) -> Result<String, ScanError> {
     match target {
         Target::Domain(value) => Ok(value.clone()),
@@ -549,6 +842,83 @@ fn reverse_name(address: std::net::IpAddr) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DnsPlannedQuery {
+    name: String,
+    record_types: Vec<DnsRecordType>,
+}
+
+fn dns_query_plan(
+    id: &str,
+    target: &Target,
+    request: &ScanRequest,
+) -> Result<Vec<DnsPlannedQuery>, ScanError> {
+    if id == "reverse-dns-scan" {
+        let addresses: Vec<_> = match target {
+            Target::Ip(address) => vec![*address],
+            Target::Cidr(network) => network.hosts().take(request.budget.max_requests).collect(),
+            _ => {
+                return Err(ScanError::new(
+                    ScanErrorKind::InvalidInput,
+                    "reverse DNS scan requires an address or network",
+                ));
+            }
+        };
+        return Ok(addresses
+            .into_iter()
+            .map(|address| DnsPlannedQuery {
+                name: reverse_name(address),
+                record_types: vec![DnsRecordType::Ptr],
+            })
+            .collect());
+    }
+
+    let name = dns_name(target)?;
+    let query =
+        |name: String, record_types: Vec<DnsRecordType>| DnsPlannedQuery { name, record_types };
+    let plan = match id {
+        "dns-sla-latency-monitor" => {
+            let samples = request
+                .options
+                .get("samples")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(3)
+                .clamp(1, 10);
+            (0..samples)
+                .map(|_| query(name.clone(), vec![DnsRecordType::A, DnsRecordType::Aaaa]))
+                .collect()
+        }
+        "spf-dkim-dmarc-validator" => vec![
+            query(name.clone(), vec![DnsRecordType::Txt]),
+            query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
+            query(
+                format!("default._domainkey.{name}"),
+                vec![DnsRecordType::Txt],
+            ),
+        ],
+        "email-config" => vec![
+            query(
+                name.clone(),
+                vec![DnsRecordType::Mx, DnsRecordType::Txt, DnsRecordType::Caa],
+            ),
+            query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
+        ],
+        "rogue-subdomain-resolver" | "subdomain-takeover" | "decoy-dns-beacon" => vec![
+            query(
+                name.clone(),
+                vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
+            ),
+            query(
+                format!("_sugra-scope-probe.{name}"),
+                vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
+            ),
+        ],
+        _ => vec![query(name, dns_types(id, request))],
+    };
+    Ok(plan)
+}
+
 fn dns_types(id: &str, request: &ScanRequest) -> Vec<DnsRecordType> {
     if id == "dns-records" {
         if let Some(values) = request.options.get("types").and_then(Value::as_array) {
@@ -571,18 +941,194 @@ fn dns_types(id: &str, request: &ScanRequest) -> Vec<DnsRecordType> {
             DnsRecordType::Soa,
         ];
     }
-    if id.contains("dnssec") {
-        vec![DnsRecordType::Ds, DnsRecordType::Dnskey]
-    } else if id.contains("caa") {
-        vec![DnsRecordType::Caa]
-    } else if id.contains("txt") || id.contains("spf") || id == "email-config" {
-        vec![DnsRecordType::Txt, DnsRecordType::Mx]
-    } else if id.contains("reverse") {
-        vec![DnsRecordType::Ptr]
-    } else if id.contains("nameserver") || id.starts_with("ns-") {
-        vec![DnsRecordType::Ns, DnsRecordType::A, DnsRecordType::Aaaa]
-    } else {
-        vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname]
+    match id {
+        "dnssec" => vec![DnsRecordType::Ds, DnsRecordType::Dnskey],
+        "dns-caa-checker" => vec![DnsRecordType::Caa],
+        "txt-records" | "spf-network-extractor" => vec![DnsRecordType::Txt],
+        "domain-info" => vec![
+            DnsRecordType::A,
+            DnsRecordType::Aaaa,
+            DnsRecordType::Cname,
+            DnsRecordType::Mx,
+            DnsRecordType::Ns,
+            DnsRecordType::Soa,
+            DnsRecordType::Txt,
+            DnsRecordType::Caa,
+        ],
+        "geo-dns-footprint" => vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Ns],
+        "ttl-analysis" => vec![
+            DnsRecordType::A,
+            DnsRecordType::Aaaa,
+            DnsRecordType::Mx,
+            DnsRecordType::Ns,
+        ],
+        "dual-stack-behavior-profiler" | "dual-stack-diff" => {
+            vec![DnsRecordType::A, DnsRecordType::Aaaa]
+        }
+        "recursive-nameserver-leak-test" => {
+            vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Ns]
+        }
+        _ => vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
+    }
+}
+
+fn analyze_dns(
+    id: &str,
+    query: &DnsPlannedQuery,
+    records: &[DnsRecord],
+    evidence: usize,
+    findings: &mut Vec<Finding>,
+) {
+    let missing = records.is_empty();
+    match id {
+        "dnssec" if missing => findings.push(finding(
+            "dnssec-not-observed",
+            "DNSSEC material was not observed",
+            Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        )),
+        "dns-caa-checker" if missing => findings.push(finding(
+            "caa-not-observed",
+            "No CAA policy was observed",
+            Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        )),
+        "reverse-dns-scan" if missing => findings.push(finding(
+            "ptr-not-observed",
+            "No reverse DNS record was observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )),
+        "spf-network-extractor"
+            if !records
+                .iter()
+                .any(|record| record.value.to_ascii_lowercase().contains("v=spf1")) =>
+        {
+            findings.push(finding(
+                "spf-not-observed",
+                "No SPF policy was observed",
+                Severity::Low,
+                Confidence::Confirmed,
+                evidence,
+            ));
+        }
+        "spf-dkim-dmarc-validator" if missing => findings.push(finding(
+            "mail-policy-not-observed",
+            "A sender-authentication policy record was not observed",
+            Severity::Low,
+            Confidence::Confirmed,
+            evidence,
+        )),
+        "email-config"
+            if query.record_types.contains(&DnsRecordType::Mx)
+                && !records
+                    .iter()
+                    .any(|record| record.record_type == DnsRecordType::Mx) =>
+        {
+            findings.push(finding(
+                "mail-exchanger-not-observed",
+                "No mail exchanger was observed",
+                Severity::Low,
+                Confidence::Confirmed,
+                evidence,
+            ));
+        }
+        "dual-stack-behavior-profiler" | "dual-stack-diff" => {
+            if let Some(finding) = analyze_dns_dual_stack(records, evidence) {
+                findings.push(finding);
+            }
+        }
+        "rogue-subdomain-resolver" | "decoy-dns-beacon"
+            if query.name.starts_with("_sugra-scope-probe.") && !missing =>
+        {
+            findings.push(finding(
+                "unexpected-probe-answer",
+                "A deterministic nonexistent-label probe returned DNS data",
+                Severity::Low,
+                Confidence::Inferred,
+                evidence,
+            ));
+        }
+        "subdomain-takeover" => {
+            if let Some(finding) = analyze_dns_takeover(records, evidence) {
+                findings.push(finding);
+            }
+        }
+        "ttl-analysis" => {
+            if let Some(finding) = analyze_dns_ttl(records, evidence) {
+                findings.push(finding);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn analyze_dns_dual_stack(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
+    let ipv4 = records
+        .iter()
+        .any(|record| record.record_type == DnsRecordType::A);
+    let ipv6 = records
+        .iter()
+        .any(|record| record.record_type == DnsRecordType::Aaaa);
+    (ipv4 != ipv6).then(|| {
+        finding(
+            "address-family-asymmetry",
+            "IPv4 and IPv6 publication differs",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )
+    })
+}
+
+fn analyze_dns_takeover(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
+    let external_alias = records.iter().any(|record| {
+        let value = record.value.to_ascii_lowercase();
+        [
+            "github.io",
+            "herokuapp.com",
+            "azurewebsites.net",
+            "cloudfront.net",
+            "s3.amazonaws.com",
+        ]
+        .iter()
+        .any(|suffix| value.contains(suffix))
+    });
+    external_alias.then(|| {
+        finding(
+            "external-service-alias",
+            "A DNS alias points to an external service and requires ownership review",
+            Severity::Medium,
+            Confidence::Inferred,
+            evidence,
+        )
+    })
+}
+
+fn analyze_dns_ttl(records: &[DnsRecord], evidence: usize) -> Option<Finding> {
+    records
+        .iter()
+        .filter_map(|record| record.ttl)
+        .any(|ttl| ttl < 60)
+        .then(|| {
+            finding(
+                "short-dns-ttl",
+                "A DNS record uses a time-to-live below 60 seconds",
+                Severity::Info,
+                Confidence::Confirmed,
+                evidence,
+            )
+        })
+}
+
+fn doh_provider(value: &str) -> Option<&'static str> {
+    match value.to_ascii_lowercase().as_str() {
+        "cloudflare" | "cloudflare-doh" => Some("cloudflare-doh"),
+        "google" | "google-doh" => Some("google-doh"),
+        _ => None,
     }
 }
 
@@ -1116,6 +1662,10 @@ fn wordlist(value: &str) -> Vec<String> {
     values.into_iter().take(256).collect()
 }
 
+fn millis(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn network_result(
     evidence: Vec<Evidence>,
     diagnostics: Vec<Diagnostic>,
@@ -1234,8 +1784,8 @@ mod tests {
     use sugra_core::{
         Clock, CommandPort, CommandResponse, DnsPort, DnsQuery, DnsRecord, DnsRecordType, HttpPort,
         HttpRequest, HttpResponse, PortError, ProviderPort, ProviderRequest, ProviderResponse,
-        TcpPort, TcpRequest, TcpResponse, TlsObservation, TlsPort, TlsRequest, UdpPort, UdpRequest,
-        UdpResponse,
+        TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest,
+        UdpPort, UdpRequest, UdpResponse,
     };
     use sugra_domain::{Budget, ScanRequest, ScopeGrant, Target, TargetKind};
     use time::OffsetDateTime;
@@ -1327,6 +1877,7 @@ mod tests {
                 cipher_suite: "TLS_AES_256_GCM_SHA384".into(),
                 alpn: Some("h2".into()),
                 certificate_sha256: vec!["00".repeat(32)],
+                certificates: Vec::new(),
                 duration_ms: 1,
             })
         }
@@ -1386,6 +1937,75 @@ mod tests {
             TargetKind::Opaque => Target::parse(kind, "example-fixture")?,
         };
         Ok(target)
+    }
+
+    fn tls_observation(certificate: Option<TlsCertificate>) -> TlsObservation {
+        TlsObservation {
+            protocol: "TLSv1_3".into(),
+            cipher_suite: "TLS_AES_256_GCM_SHA384".into(),
+            alpn: Some("h2".into()),
+            certificate_sha256: vec!["00".repeat(32)],
+            certificates: certificate.into_iter().collect(),
+            duration_ms: 1,
+        }
+    }
+
+    fn tls_certificate(not_before: i64, not_after: i64) -> TlsCertificate {
+        TlsCertificate {
+            sha256: "00".repeat(32),
+            subject: "CN=example.com".into(),
+            issuer: "CN=Fixture CA".into(),
+            serial: "01".into(),
+            not_before,
+            not_after,
+            dns_names: vec!["example.com".into()],
+            signature_algorithm: "1.2.840.113549.1.1.11".into(),
+            public_key_algorithm: "1.2.840.113549.1.1.1".into(),
+            is_ca: Some(false),
+        }
+    }
+
+    #[test]
+    fn tls_expiry_analysis_distinguishes_expired_and_expiring_certificates() {
+        let expired = tls_observation(Some(tls_certificate(-10_000, -1)));
+        let expired_findings = analyze_tls(Analyzer::TlsExpiry, &expired, 0);
+        assert_eq!(expired_findings[0].key, "tls-certificate-expired");
+        assert_eq!(expired_findings[0].severity, Severity::Critical);
+
+        let expiring = tls_observation(Some(tls_certificate(-10_000, 6 * 86_400)));
+        let expiring_findings = analyze_tls(Analyzer::TlsExpiry, &expiring, 0);
+        assert_eq!(expiring_findings[0].key, "tls-certificate-expiring");
+        assert_eq!(expiring_findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn tls_chain_analysis_flags_a_ca_leaf() {
+        let mut certificate = tls_certificate(-10_000, 365 * 86_400);
+        certificate.is_ca = Some(true);
+        let findings = analyze_tls(Analyzer::TlsChain, &tls_observation(Some(certificate)), 0);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.key == "tls-leaf-is-ca")
+        );
+    }
+
+    #[test]
+    fn tls_cipher_analysis_flags_obsolete_protocols_and_weak_suites() {
+        let mut observation = tls_observation(None);
+        observation.protocol = "TLSv1_0".into();
+        observation.cipher_suite = "TLS_RSA_WITH_3DES_EDE_CBC_SHA".into();
+        let findings = analyze_tls(Analyzer::TlsCipher, &observation, 0);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.key == "tls-obsolete-protocol")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.key == "tls-weak-cipher")
+        );
     }
 
     #[tokio::test]

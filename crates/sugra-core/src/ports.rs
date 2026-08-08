@@ -272,6 +272,31 @@ pub struct TlsRequest {
     pub scope: ScopeGrant,
 }
 
+/// Parsed metadata for one validated peer certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsCertificate {
+    /// Lowercase SHA-256 fingerprint of the DER certificate.
+    pub sha256: String,
+    /// Distinguished subject name.
+    pub subject: String,
+    /// Distinguished issuer name.
+    pub issuer: String,
+    /// Printable certificate serial number.
+    pub serial: String,
+    /// Validity start as a Unix timestamp.
+    pub not_before: i64,
+    /// Validity end as a Unix timestamp.
+    pub not_after: i64,
+    /// Bounded DNS subject alternative names.
+    pub dns_names: Vec<String>,
+    /// Signature algorithm object identifier.
+    pub signature_algorithm: String,
+    /// Subject public-key algorithm object identifier.
+    pub public_key_algorithm: String,
+    /// Whether Basic Constraints identifies a certificate authority.
+    pub is_ca: Option<bool>,
+}
+
 /// Safe metadata from a validated TLS handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsObservation {
@@ -283,6 +308,8 @@ pub struct TlsObservation {
     pub alpn: Option<String>,
     /// SHA-256 fingerprints of the peer certificate chain.
     pub certificate_sha256: Vec<String>,
+    /// Parsed bounded metadata for the peer certificate chain.
+    pub certificates: Vec<TlsCertificate>,
     /// Observed duration in milliseconds.
     pub duration_ms: u64,
 }

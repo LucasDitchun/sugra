@@ -57,4 +57,10 @@ pub enum BuiltinError {
     /// Descriptor and implementation sets differ.
     #[error("descriptor and implementation sets differ at scanner {0}")]
     SetMismatch(ScannerId),
+    /// A scanner has no explicit semantic ownership contract.
+    #[error("scanner has no explicit semantic contract: {0}")]
+    MissingSemantics(ScannerId),
+    /// Compiled operation and semantic boundary disagree.
+    #[error("scanner operation disagrees with its semantic boundary: {0}")]
+    SemanticBoundaryMismatch(ScannerId),
 }

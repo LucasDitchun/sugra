@@ -6,11 +6,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha256};
-use sugra_core::{PortError, PortErrorKind, TlsObservation, TlsPort, TlsRequest};
+use sugra_core::{PortError, PortErrorKind, TlsCertificate, TlsObservation, TlsPort, TlsRequest};
 use sugra_domain::{Target, TargetKind};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use x509_parser::extensions::GeneralName;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 /// TLS adapter construction failure.
 #[derive(Debug, Error)]
@@ -40,9 +42,10 @@ impl RustlsTls {
         if added == 0 {
             return Err(TlsAdapterError::NoTrustAnchors);
         }
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
         })
@@ -97,18 +100,98 @@ impl TlsPort for RustlsTls {
         let alpn = connection
             .alpn_protocol()
             .map(|value| String::from_utf8_lossy(value).into_owned());
-        let certificate_sha256 = connection
+        let certificates = connection
             .peer_certificates()
             .unwrap_or_default()
             .iter()
-            .map(|certificate| hex::encode(Sha256::digest(certificate.as_ref())))
+            .map(|certificate| certificate_metadata(certificate.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let certificate_sha256 = certificates
+            .iter()
+            .map(|certificate| certificate.sha256.clone())
             .collect();
         Ok(TlsObservation {
             protocol,
             cipher_suite,
             alpn,
             certificate_sha256,
+            certificates,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
+    }
+}
+
+fn certificate_metadata(der: &[u8]) -> Result<TlsCertificate, PortError> {
+    let (_, certificate) = X509Certificate::from_der(der).map_err(|_| {
+        PortError::new(
+            PortErrorKind::InvalidResponse,
+            "TLS peer certificate metadata is invalid",
+        )
+    })?;
+    let dns_names = certificate
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|extension| {
+            extension
+                .value
+                .general_names
+                .iter()
+                .filter_map(|name| match name {
+                    GeneralName::DNSName(value) => Some((*value).to_owned()),
+                    _ => None,
+                })
+                .take(256)
+                .collect()
+        })
+        .unwrap_or_default();
+    let is_ca = certificate
+        .basic_constraints()
+        .ok()
+        .flatten()
+        .map(|extension| extension.value.ca);
+    Ok(TlsCertificate {
+        sha256: hex::encode(Sha256::digest(der)),
+        subject: certificate.subject().to_string(),
+        issuer: certificate.issuer().to_string(),
+        serial: certificate.raw_serial_as_string(),
+        not_before: certificate.validity().not_before.timestamp(),
+        not_after: certificate.validity().not_after.timestamp(),
+        dns_names,
+        signature_algorithm: certificate.signature_algorithm.algorithm.to_id_string(),
+        public_key_algorithm: certificate.public_key().algorithm.algorithm.to_id_string(),
+        is_ca,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_certificate_metadata_is_rejected_without_raw_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Err(error) = certificate_metadata(b"not-a-certificate") else {
+            return Err("invalid DER was accepted".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::InvalidResponse);
+        assert_eq!(error.message, "TLS peer certificate metadata is invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn native_certificate_metadata_is_bounded_and_fingerprinted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let loaded = rustls_native_certs::load_native_certs();
+        let Some(certificate) = loaded.certs.first() else {
+            return Ok(());
+        };
+        let metadata = certificate_metadata(certificate.as_ref())?;
+        assert_eq!(metadata.sha256.len(), 64);
+        assert!(!metadata.subject.is_empty());
+        assert!(!metadata.issuer.is_empty());
+        assert!(metadata.dns_names.len() <= 256);
+        assert!(metadata.not_after > metadata.not_before);
+        Ok(())
     }
 }
