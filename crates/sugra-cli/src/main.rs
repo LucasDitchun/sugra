@@ -9,8 +9,8 @@ use std::sync::Arc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use sugra_adapters::{
-    HickoryDns, ReqwestHttp, ReqwestProvider, RustlsTls, SystemClock, SystemCommand, TokioTcp,
-    TokioUdp,
+    HickoryDns, ReqwestHttp, ReqwestProvider, RustlsTls, SystemClock, SystemCommand,
+    SystemLocalInput, TokioTcp, TokioUdp,
 };
 use sugra_core::{
     Catalog, Engine, RunStore, ServiceBundle, render_csv, render_html, render_terminal,
@@ -337,6 +337,7 @@ fn build_application() -> Result<(Builtins, Arc<SystemClock>, ServiceBundle), Cl
         tls,
         command: Arc::new(SystemCommand),
         provider,
+        local_input: Arc::new(SystemLocalInput),
         clock: clock.clone(),
     };
     let builtins = build_builtins(&services).map_err(|error| CliError::Initialization {

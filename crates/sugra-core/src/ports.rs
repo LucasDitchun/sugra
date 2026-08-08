@@ -1,6 +1,7 @@
 //! Narrow I/O boundaries consumed by scanner implementations.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -435,6 +436,30 @@ pub trait CommandPort: Send + Sync {
     async fn execute(&self, request: CommandRequest) -> Result<CommandResponse, PortError>;
 }
 
+/// One explicit, bounded local text-file read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalInputRequest {
+    /// Absolute path selected by the operator.
+    pub path: PathBuf,
+    /// Shared byte and line limits.
+    pub budget: Budget,
+}
+
+/// Normalized lines read from a local input file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalInputResponse {
+    /// UTF-8 lines without line terminators.
+    pub lines: Vec<String>,
+}
+
+/// Bounded local text-input boundary.
+#[async_trait]
+pub trait LocalInputPort: Send + Sync {
+    /// Reads one explicitly selected regular file without exposing its path in errors.
+    async fn read_lines(&self, request: LocalInputRequest)
+    -> Result<LocalInputResponse, PortError>;
+}
+
 /// Generic request to an optional intelligence provider.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderRequest {
@@ -491,6 +516,8 @@ pub struct ServiceBundle {
     pub command: Arc<dyn CommandPort>,
     /// Intelligence-provider boundary.
     pub provider: Arc<dyn ProviderPort>,
+    /// Explicit bounded local text-input boundary.
+    pub local_input: Arc<dyn LocalInputPort>,
     /// Clock boundary.
     pub clock: Arc<dyn Clock>,
 }
