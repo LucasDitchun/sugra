@@ -58,6 +58,8 @@ const STANDARD_SEMANTIC_GAPS: &[MissingFixture] = &[
     MissingFixture::EdgeCase,
 ];
 
+const NEGATIVE_CONTROL_GAP: &[MissingFixture] = &[MissingFixture::NegativeControl];
+
 const CONTRACT_GROUPS: &[(Boundary, &[&str])] = &[
     (
         Boundary::Provider,
@@ -265,7 +267,7 @@ fn supplemental_boundaries(id: &str) -> &'static [Boundary] {
         "cdn-detection" => &[Boundary::Dns],
         "attack-surface-delta" => &[Boundary::Provider, Boundary::Dns, Boundary::Tcp],
         "firewall-detection" => &[Boundary::Tcp],
-        "security-contact-gap-finder" => &[Boundary::Provider],
+        "performance-monitoring" | "security-contact-gap-finder" => &[Boundary::Provider],
         _ => &[],
     }
 }
@@ -278,9 +280,26 @@ fn supplemental_boundaries(id: &str) -> &'static [Boundary] {
 pub fn semantic_gaps() -> Vec<SemanticGap> {
     contracts()
         .into_iter()
-        .map(|contract| SemanticGap {
-            id: contract.id,
-            missing: STANDARD_SEMANTIC_GAPS,
+        .filter_map(|contract| {
+            let missing = match contract.id {
+                "dnssec"
+                | "dual-stack-behavior-profiler"
+                | "dual-stack-diff"
+                | "ttl-analysis"
+                | "typosquat-domain-checker"
+                | "passive-dns-history"
+                | "rpki-route-validity-check"
+                | "rogue-certificate-check"
+                | "performance-monitoring"
+                | "domain-reputation-check"
+                | "ip-reputation-check" => &[],
+                "email-config" => NEGATIVE_CONTROL_GAP,
+                _ => STANDARD_SEMANTIC_GAPS,
+            };
+            (!missing.is_empty()).then_some(SemanticGap {
+                id: contract.id,
+                missing,
+            })
         })
         .collect()
 }

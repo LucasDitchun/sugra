@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use sugra_domain::{ExecutionStatus, ScanResult};
+use serde_json::json;
+use sugra_core::{LocalInputRequest, ScanErrorKind};
+use sugra_domain::{Budget, ExecutionStatus, ScanRequest, ScanResult};
 use sugra_scanner_contracts::{Boundary, MissingFixture, contracts, semantic_gaps};
 use sugra_scanners::build_builtins;
 
@@ -37,13 +39,384 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
     let gaps = semantic_gaps();
     let gap_ids = gaps.iter().map(|gap| gap.id).collect::<BTreeSet<_>>();
 
-    assert_eq!(gap_ids, contract_ids);
-    assert_eq!(gaps.len(), 147);
-    for gap in gaps {
-        assert!(gap.missing.contains(&MissingFixture::PositiveSignal));
-        assert!(gap.missing.contains(&MissingFixture::NegativeControl));
-        assert!(gap.missing.contains(&MissingFixture::EdgeCase));
+    assert!(gap_ids.is_subset(&contract_ids));
+    assert_eq!(contracts().len(), 147);
+    assert_eq!(gaps.len(), 136);
+    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 406);
+
+    for covered in [
+        "dnssec",
+        "dual-stack-behavior-profiler",
+        "dual-stack-diff",
+        "ttl-analysis",
+        "typosquat-domain-checker",
+        "passive-dns-history",
+        "rpki-route-validity-check",
+        "rogue-certificate-check",
+        "performance-monitoring",
+        "domain-reputation-check",
+        "ip-reputation-check",
+    ] {
+        assert!(!gap_ids.contains(covered), "{covered} still has a gap");
     }
+    let email = gaps
+        .iter()
+        .find(|gap| gap.id == "email-config")
+        .unwrap_or_else(|| unreachable!("email-config must retain its real gap"));
+    assert_eq!(email.missing, &[MissingFixture::NegativeControl]);
+
+    let untouched = gaps
+        .iter()
+        .find(|gap| gap.id == "dns-records")
+        .unwrap_or_else(|| unreachable!("untested scanner gap must remain"));
+    assert_eq!(
+        untouched.missing,
+        &[
+            MissingFixture::PositiveSignal,
+            MissingFixture::NegativeControl,
+            MissingFixture::EdgeCase,
+        ]
+    );
+}
+
+async fn scan_fixture(
+    id: &str,
+    fixture: support::Fixture,
+    configure: impl FnOnce(&mut ScanRequest),
+) -> Result<ScanResult, Box<dyn std::error::Error>> {
+    let harness = support::Harness::fixture(fixture);
+    let builtins = build_builtins(&harness.services())?;
+    let scanner_id = sugra_domain::ScannerId::new(id)?;
+    let scanner = builtins
+        .registry
+        .get(&scanner_id)
+        .ok_or("fixture scanner is missing from the registry")?;
+    let mut request = support::request_for(scanner.descriptor())?;
+    configure(&mut request);
+    Ok(scanner.scan(&request, &support::context(false)).await?)
+}
+
+fn has_finding(result: &ScanResult, key: &str) -> bool {
+    result.findings.iter().any(|finding| finding.key == key)
+}
+
+fn assert_redacted(result: &ScanResult) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(!serde_json::to_string(result)?.contains(support::SECRET_MARKER));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dnssec_public_contract_covers_complete_missing_and_partial_material()
+-> Result<(), Box<dyn std::error::Error>> {
+    let complete = scan_fixture("dnssec", support::Fixture::DnssecComplete, |_| {}).await?;
+    assert!(complete.findings.is_empty());
+
+    let missing = scan_fixture("dnssec", support::Fixture::DnssecMissing, |_| {}).await?;
+    assert!(has_finding(&missing, "dnssec-not-observed"));
+
+    let incomplete = scan_fixture("dnssec", support::Fixture::DnssecIncomplete, |_| {}).await?;
+    assert!(has_finding(&incomplete, "dnssec-material-incomplete"));
+    assert_redacted(&incomplete)
+}
+
+#[tokio::test]
+async fn email_config_public_contract_keeps_the_unqueried_dkim_gap_explicit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let missing = scan_fixture("email-config", support::Fixture::EmailMissing, |_| {}).await?;
+    for key in [
+        "spf-not-observed",
+        "dkim-not-observed",
+        "dmarc-not-observed",
+        "caa-not-observed",
+    ] {
+        assert!(has_finding(&missing, key), "missing {key}");
+    }
+
+    let weak = scan_fixture("email-config", support::Fixture::EmailWeak, |_| {}).await?;
+    assert!(has_finding(&weak, "spf-permissive-all"));
+    assert!(has_finding(&weak, "dmarc-monitoring-only"));
+    assert!(has_finding(&weak, "dkim-not-observed"));
+    assert!(!has_finding(&weak, "caa-not-observed"));
+    assert_redacted(&weak)
+}
+
+#[tokio::test]
+async fn dual_stack_public_contract_covers_symmetric_asymmetric_and_empty_answers()
+-> Result<(), Box<dyn std::error::Error>> {
+    for id in ["dual-stack-behavior-profiler", "dual-stack-diff"] {
+        let complete = scan_fixture(id, support::Fixture::DualStackComplete, |_| {}).await?;
+        assert!(!has_finding(&complete, "address-family-asymmetry"));
+
+        let asymmetric = scan_fixture(id, support::Fixture::DualStackIpv4Only, |_| {}).await?;
+        assert!(has_finding(&asymmetric, "address-family-asymmetry"));
+
+        let empty = scan_fixture(id, support::Fixture::DualStackEmpty, |_| {}).await?;
+        assert!(!has_finding(&empty, "address-family-asymmetry"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ttl_public_contract_covers_short_boundary_and_zero_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let healthy = scan_fixture("ttl-analysis", support::Fixture::TtlHealthy, |_| {}).await?;
+    assert!(!has_finding(&healthy, "short-dns-ttl"));
+
+    let short = scan_fixture("ttl-analysis", support::Fixture::TtlShort, |_| {}).await?;
+    assert!(has_finding(&short, "short-dns-ttl"));
+
+    let zero = scan_fixture("ttl-analysis", support::Fixture::TtlZero, |_| {}).await?;
+    assert!(has_finding(&zero, "short-dns-ttl"));
+    assert_redacted(&zero)
+}
+
+#[tokio::test]
+async fn typosquat_public_contract_requires_the_exact_candidate_to_resolve()
+-> Result<(), Box<dyn std::error::Error>> {
+    let resolved = scan_fixture(
+        "typosquat-domain-checker",
+        support::Fixture::TyposquatResolved,
+        |_| {},
+    )
+    .await?;
+    assert!(has_finding(&resolved, "resolving-typo-candidate"));
+
+    let empty = scan_fixture(
+        "typosquat-domain-checker",
+        support::Fixture::TyposquatEmpty,
+        |_| {},
+    )
+    .await?;
+    assert!(!has_finding(&empty, "resolving-typo-candidate"));
+
+    let wrong_owner = scan_fixture(
+        "typosquat-domain-checker",
+        support::Fixture::TyposquatWrongOwner,
+        |_| {},
+    )
+    .await?;
+    assert!(!has_finding(&wrong_owner, "resolving-typo-candidate"));
+    assert_redacted(&wrong_owner)
+}
+
+#[tokio::test]
+async fn passive_dns_history_public_contract_is_bounded_and_redacted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let present = scan_fixture(
+        "passive-dns-history",
+        support::Fixture::PassiveDnsHistoryPresent,
+        |_| {},
+    )
+    .await?;
+    assert!(has_finding(&present, "historical-dns-observations"));
+
+    let empty = scan_fixture(
+        "passive-dns-history",
+        support::Fixture::PassiveDnsHistoryEmpty,
+        |_| {},
+    )
+    .await?;
+    assert!(empty.findings.is_empty());
+
+    let malformed = scan_fixture(
+        "passive-dns-history",
+        support::Fixture::PassiveDnsHistoryMalformed,
+        |_| {},
+    )
+    .await?;
+    assert!(malformed.findings.is_empty());
+    assert_redacted(&malformed)
+}
+
+#[tokio::test]
+async fn rpki_public_contract_distinguishes_invalid_valid_and_unknown_routes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let invalid = scan_fixture(
+        "rpki-route-validity-check",
+        support::Fixture::RpkiInvalid,
+        |_| {},
+    )
+    .await?;
+    assert!(has_finding(&invalid, "rpki-route-invalid"));
+
+    let valid = scan_fixture(
+        "rpki-route-validity-check",
+        support::Fixture::RpkiValid,
+        |_| {},
+    )
+    .await?;
+    assert!(!has_finding(&valid, "rpki-route-invalid"));
+
+    let malformed = scan_fixture(
+        "rpki-route-validity-check",
+        support::Fixture::RpkiMalformed,
+        |_| {},
+    )
+    .await?;
+    assert!(!has_finding(&malformed, "rpki-route-invalid"));
+    assert_redacted(&malformed)
+}
+
+#[tokio::test]
+async fn rogue_certificate_public_contract_uses_the_operator_issuer_baseline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let configure = |request: &mut ScanRequest| {
+        request
+            .options
+            .insert("expected_issuers".into(), json!(["Expected CA"]));
+    };
+    let unexpected = scan_fixture(
+        "rogue-certificate-check",
+        support::Fixture::RogueCertificateUnexpected,
+        configure,
+    )
+    .await?;
+    assert!(has_finding(&unexpected, "unexpected-certificate-issuer"));
+
+    let expected = scan_fixture(
+        "rogue-certificate-check",
+        support::Fixture::RogueCertificateExpected,
+        configure,
+    )
+    .await?;
+    assert!(!has_finding(&expected, "unexpected-certificate-issuer"));
+
+    let malformed = scan_fixture(
+        "rogue-certificate-check",
+        support::Fixture::RogueCertificateMalformed,
+        configure,
+    )
+    .await?;
+    assert!(malformed.findings.is_empty());
+    assert_redacted(&malformed)
+}
+
+#[tokio::test]
+async fn performance_monitoring_public_contract_covers_http_and_pagespeed_signals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let slow = scan_fixture(
+        "performance-monitoring",
+        support::Fixture::PerformanceSlow,
+        |_| {},
+    )
+    .await?;
+    assert!(has_finding(&slow, "slow-response-observed"));
+    assert!(has_finding(&slow, "low-performance-score"));
+
+    let healthy = scan_fixture(
+        "performance-monitoring",
+        support::Fixture::PerformanceHealthy,
+        |_| {},
+    )
+    .await?;
+    assert!(healthy.findings.is_empty());
+
+    let malformed = scan_fixture(
+        "performance-monitoring",
+        support::Fixture::PerformanceMalformed,
+        |_| {},
+    )
+    .await?;
+    assert!(malformed.findings.is_empty());
+    assert_redacted(&malformed)?;
+
+    let harness = support::Harness::fixture(support::Fixture::PerformanceHealthy);
+    let builtins = build_builtins(&harness.services())?;
+    let id = sugra_domain::ScannerId::new("performance-monitoring")?;
+    let scanner = builtins.registry.get(&id).ok_or("scanner is missing")?;
+    let mut request = support::request_for(scanner.descriptor())?;
+    request
+        .options
+        .insert("strategies".into(), json!(["tablet"]));
+    let Err(error) = scanner.scan(&request, &support::context(false)).await else {
+        return Err("invalid PageSpeed strategy was accepted".into());
+    };
+    assert_eq!(error.kind, ScanErrorKind::InvalidInput);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reputation_public_contract_handles_risky_clean_and_malformed_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    for id in ["domain-reputation-check", "ip-reputation-check"] {
+        let risky = scan_fixture(id, support::Fixture::ReputationRisk, |_| {}).await?;
+        assert!(has_finding(&risky, "provider-reputation-risk"));
+
+        let clean = scan_fixture(id, support::Fixture::ReputationClean, |_| {}).await?;
+        assert!(!has_finding(&clean, "provider-reputation-risk"));
+
+        let malformed = scan_fixture(id, support::Fixture::ReputationMalformed, |_| {}).await?;
+        assert!(!has_finding(&malformed, "provider-reputation-risk"));
+        assert_redacted(&malformed)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn scanner_specific_boundary_failures_keep_their_public_error_kinds()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (id, expected) in [
+        ("dnssec", ScanErrorKind::Transport),
+        ("email-config", ScanErrorKind::Transport),
+        ("dual-stack-behavior-profiler", ScanErrorKind::Transport),
+        ("dual-stack-diff", ScanErrorKind::Transport),
+        ("ttl-analysis", ScanErrorKind::Transport),
+        ("typosquat-domain-checker", ScanErrorKind::Transport),
+        ("passive-dns-history", ScanErrorKind::DependencyUnavailable),
+        (
+            "rpki-route-validity-check",
+            ScanErrorKind::DependencyUnavailable,
+        ),
+        (
+            "rogue-certificate-check",
+            ScanErrorKind::DependencyUnavailable,
+        ),
+        ("performance-monitoring", ScanErrorKind::Transport),
+        (
+            "domain-reputation-check",
+            ScanErrorKind::DependencyUnavailable,
+        ),
+        ("ip-reputation-check", ScanErrorKind::DependencyUnavailable),
+    ] {
+        let harness = support::Harness::failing();
+        let builtins = build_builtins(&harness.services())?;
+        let scanner_id = sugra_domain::ScannerId::new(id)?;
+        let scanner = builtins
+            .registry
+            .get(&scanner_id)
+            .ok_or("scanner is missing")?;
+        let request = support::request_for(scanner.descriptor())?;
+        let Err(error) = scanner.scan(&request, &support::context(false)).await else {
+            return Err(format!("{id} converted a boundary failure into success").into());
+        };
+        assert_eq!(error.kind, expected, "{id}");
+        assert!(!error.message.contains(support::SECRET_MARKER), "{id}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_input_fake_supports_configured_and_empty_lines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = LocalInputRequest {
+        path: "/fixture/input.txt".into(),
+        budget: Budget::default(),
+    };
+    let configured = support::Harness::successful()
+        .with_local_input_lines(vec!["one".into(), "two".into()])
+        .services()
+        .local_input
+        .read_lines(request.clone())
+        .await?;
+    assert_eq!(configured.lines, ["one", "two"]);
+
+    let empty = support::Harness::successful()
+        .services()
+        .local_input
+        .read_lines(request)
+        .await?;
+    assert!(empty.lines.is_empty());
+    Ok(())
 }
 
 #[test]
