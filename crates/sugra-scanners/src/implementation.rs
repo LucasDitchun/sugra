@@ -2696,9 +2696,10 @@ mod tests {
     use serde_json::json;
     use sugra_core::{
         Clock, CommandPort, CommandResponse, DnsPort, DnsQuery, DnsRecord, DnsRecordType, HttpPort,
-        HttpRequest, HttpResponse, PortError, ProviderPort, ProviderRequest, ProviderResponse,
-        TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest,
-        UdpPort, UdpRequest, UdpResponse,
+        HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse,
+        PortError, ProviderPort, ProviderRequest, ProviderResponse, TcpPort, TcpRequest,
+        TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest, UdpPort, UdpRequest,
+        UdpResponse,
     };
     use sugra_domain::{Budget, ScanRequest, ScopeGrant, ScopeRule, Target, TargetKind};
     use time::OffsetDateTime;
@@ -2859,6 +2860,17 @@ mod tests {
         }
     }
 
+    struct FakeLocalInput;
+    #[async_trait]
+    impl LocalInputPort for FakeLocalInput {
+        async fn read_lines(
+            &self,
+            _request: LocalInputRequest,
+        ) -> Result<LocalInputResponse, PortError> {
+            Ok(LocalInputResponse { lines: Vec::new() })
+        }
+    }
+
     fn services() -> ServiceBundle {
         ServiceBundle {
             dns: Arc::new(FakeDns),
@@ -2868,6 +2880,7 @@ mod tests {
             tls: Arc::new(FakeTls),
             command: Arc::new(FakeCommand),
             provider: Arc::new(FakeProvider),
+            local_input: Arc::new(FakeLocalInput),
             clock: Arc::new(FixedClock),
         }
     }
