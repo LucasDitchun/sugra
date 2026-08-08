@@ -90,6 +90,7 @@ impl ProviderPort for ReqwestProvider {
                 "provider returned invalid JSON",
             )
         })?;
+        let data = normalize_provider_data(&request, data);
         Ok(ProviderResponse {
             provider: request.provider,
             data,
@@ -136,6 +137,10 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
             ),
             ("cloudflare-doh", "resolve") => ("https://cloudflare-dns.com/dns-query", &[]),
             ("google-doh", "resolve") => ("https://dns.google/resolve", &[]),
+            ("pagespeed", "analyze") => (
+                "https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed",
+                &[("category", "performance")],
+            ),
             _ => {
                 return Err(PortError::new(
                     PortErrorKind::Unavailable,
@@ -278,7 +283,7 @@ fn inject_secret(
     secret: &str,
 ) -> Result<(), PortError> {
     match provider {
-        "shodan" => {
+        "shodan" | "pagespeed" => {
             url.query_pairs_mut().append_pair("key", secret);
         }
         "virustotal" => {
@@ -320,6 +325,36 @@ fn inject_secret(
         }
     }
     Ok(())
+}
+
+fn normalize_provider_data(request: &ProviderRequest, value: Value) -> Value {
+    if request.provider != "pagespeed" {
+        return value;
+    }
+
+    let lighthouse = value.get("lighthouseResult").unwrap_or(&Value::Null);
+    let audits = lighthouse.get("audits").unwrap_or(&Value::Null);
+    let metric = |name: &str| {
+        audits
+            .get(name)
+            .and_then(|audit| audit.get("numericValue"))
+            .and_then(Value::as_f64)
+    };
+    serde_json::json!({
+        "performance_score": lighthouse
+            .pointer("/categories/performance/score")
+            .and_then(Value::as_f64),
+        "loading_experience": value
+            .pointer("/loadingExperience/overall_category")
+            .and_then(Value::as_str),
+        "metrics": {
+            "cumulative_layout_shift": metric("cumulative-layout-shift"),
+            "first_contentful_paint_ms": metric("first-contentful-paint"),
+            "largest_contentful_paint_ms": metric("largest-contentful-paint"),
+            "speed_index_ms": metric("speed-index"),
+            "total_blocking_time_ms": metric("total-blocking-time"),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -428,6 +463,32 @@ mod tests {
     }
 
     #[test]
+    fn pagespeed_endpoint_is_allowlisted_and_uses_a_bounded_strategy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = endpoint_for(&request(
+            "pagespeed",
+            "analyze",
+            BTreeMap::from([
+                ("url".into(), json!("https://example.com/")),
+                ("strategy".into(), json!("mobile")),
+            ]),
+        ))?;
+        assert_eq!(endpoint.host_str(), Some("pagespeedonline.googleapis.com"));
+        assert_eq!(endpoint.path(), "/pagespeedonline/v5/runPagespeed");
+        let pairs: BTreeMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("url").map(String::as_str),
+            Some("https://example.com/")
+        );
+        assert_eq!(pairs.get("strategy").map(String::as_str), Some("mobile"));
+        assert_eq!(
+            pairs.get("category").map(String::as_str),
+            Some("performance")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn secret_injection_uses_provider_specific_locations() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut endpoint = Url::parse("https://example.com/")?;
@@ -443,7 +504,45 @@ mod tests {
             return Err("public provider accepted an unsupported credential".into());
         };
         assert_eq!(error.kind, PortErrorKind::InvalidResponse);
+
+        let mut pagespeed = Url::parse("https://pagespeedonline.googleapis.com/")?;
+        inject_secret("pagespeed", &mut pagespeed, &mut headers, "fixture-secret")?;
+        assert_eq!(pagespeed.query(), Some("key=fixture-secret"));
         Ok(())
+    }
+
+    #[test]
+    fn pagespeed_response_is_reduced_to_non_sensitive_metrics() {
+        let request = request("pagespeed", "analyze", BTreeMap::new());
+        let normalized = normalize_provider_data(
+            &request,
+            json!({
+                "id": "https://example.com/private?token=secret",
+                "loadingExperience": {"overall_category": "FAST"},
+                "lighthouseResult": {
+                    "finalUrl": "https://example.com/private?token=secret",
+                    "categories": {"performance": {"score": 0.91}},
+                    "audits": {
+                        "cumulative-layout-shift": {"numericValue": 0.03},
+                        "first-contentful-paint": {"numericValue": 812.0},
+                        "largest-contentful-paint": {"numericValue": 1420.0},
+                        "speed-index": {"numericValue": 1100.0},
+                        "total-blocking-time": {"numericValue": 25.0},
+                        "screenshot-thumbnails": {"details": {"items": ["large"]}}
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(normalized["performance_score"], json!(0.91));
+        assert_eq!(normalized["loading_experience"], json!("FAST"));
+        assert_eq!(
+            normalized["metrics"]["largest_contentful_paint_ms"],
+            json!(1420.0)
+        );
+        assert!(normalized.get("id").is_none());
+        assert!(!normalized.to_string().contains("secret"));
+        assert!(!normalized.to_string().contains("screenshot"));
     }
 
     #[test]
