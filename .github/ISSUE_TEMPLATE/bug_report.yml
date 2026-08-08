@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible defect that is safe to discuss publicly.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not disclose vulnerabilities, credentials, or sensitive target data here. Use the private process in SECURITY.md for security reports.
+  - type: input
+    id: version
+    attributes:
+      label: Sugra version
+      description: Output of `sugra --version`, a release tag, or a commit identifier.
+      placeholder: sugra 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Explain the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Safe reproduction
+      description: Use synthetic or redacted inputs and include the smallest reproducing command.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Include redacted logs, scanner ID, target kind, and installation method if relevant.
+  - type: checkboxes
+    id: authorization
+    attributes:
+      label: Authorization and privacy
+      options:
+        - label: The reproduction uses only systems I own or am explicitly authorized to assess.
+          required: true
+        - label: I removed credentials and sensitive target data from this report.
+          required: true

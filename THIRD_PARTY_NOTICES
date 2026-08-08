@@ -1,15 +1,51 @@
-Sugra is an independent Rust reimplementation inspired by the publicly documented capabilities of Argus:
-https://github.com/LucasDitchun/Argus
+Sugra third-party notices
+=========================
+
+Project origin
+--------------
+
+Sugra is an independent Rust implementation inspired by the publicly documented capabilities of
+Argus: https://github.com/LucasDitchun/Argus
 
 Argus is distributed under the MIT License. Sugra does not copy Argus source code or Git history.
 
-Rust dependencies retain their respective licenses. Exact dependency and license information is available from Cargo metadata and release SBOM artifacts.
+Rust dependencies
+-----------------
 
-Optional provider integrations return data owned and licensed by their respective operators. Users are responsible for their account terms, quotas, attribution, and lawful use:
+Rust dependencies remain under their respective licenses and copyright notices. The exact resolved
+dependency set is recorded in Cargo.lock. License expressions and source repositories can be
+inspected with `cargo metadata --format-version 1`; repository policy is enforced with
+`cargo deny check`.
 
-- RIPEstat Data API: https://stat.ripe.net/docs/data-api/
-- Have I Been Pwned: https://haveibeenpwned.com/API/v3 (breach data is attributed to Have I Been Pwned and is subject to its documented Creative Commons Attribution terms)
-- urlscan.io: https://urlscan.io/docs/api/
+Release archives may contain third-party components. Redistributors must retain all notices and
+license texts required by those components. Sugra's MIT License applies only to Sugra itself and does
+not replace third-party terms.
+
+External data and services
+--------------------------
+
+Optional scanners can query external services. Responses, datasets, trademarks, and service access
+remain subject to each operator's terms, quotas, attribution requirements, and privacy policies.
+Users are responsible for lawful use and for complying with those terms.
+
+- AbuseIPDB API: https://docs.abuseipdb.com/
+- AlienVault Open Threat Exchange: https://otx.alienvault.com/api
 - Censys Platform API: https://docs.censys.com/reference/get-started
-- URLhaus by abuse.ch: https://urlhaus-api.abuse.ch/
+- Certificate Search: https://crt.sh/
+- Cloudflare DNS over HTTPS: https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/
 - Cloudflare Radar API: https://developers.cloudflare.com/api/resources/radar/
+- Google Public DNS over HTTPS: https://developers.google.com/speed/public-dns/docs/doh
+- Have I Been Pwned API: https://haveibeenpwned.com/API/v3
+- IPinfo API: https://ipinfo.io/developers
+- RDAP bootstrap service: https://rdap.org/
+- RIPEstat Data API: https://stat.ripe.net/docs/data-api/
+- Shodan API: https://developer.shodan.io/api
+- SSL Labs API: https://github.com/ssllabs/ssllabs-scan/blob/master/ssllabs-api-docs.md
+- URLhaus by abuse.ch: https://urlhaus-api.abuse.ch/
+- urlscan.io API: https://urlscan.io/docs/api/
+- VirusTotal API: https://docs.virustotal.com/reference/overview
+- Wayback Machine CDX API: https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server
+
+Have I Been Pwned breach data has specific attribution requirements documented by its operator.
+URLhaus data and other community threat feeds may use terms that differ from Sugra's license. Consult
+the linked service documentation before redistributing provider-derived output.

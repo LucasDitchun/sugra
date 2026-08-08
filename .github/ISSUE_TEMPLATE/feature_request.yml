@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a bounded scanner, interface, or platform improvement.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What authorized workflow or user need should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe inputs, outputs, target kinds, and the expected user experience.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Scope and safety considerations
+      description: Identify active capabilities, external providers, credentials, and sensible budgets.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note existing scanners or simpler approaches that could address the need.
