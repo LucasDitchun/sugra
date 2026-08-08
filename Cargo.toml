@@ -35,7 +35,7 @@ regex = "1.11.2"
 reqwest = { version = "0.13.0", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate"] }
 rustls = "0.23.43"
 rustls-native-certs = "0.8.4"
-scraper = "0.24.0"
+scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
