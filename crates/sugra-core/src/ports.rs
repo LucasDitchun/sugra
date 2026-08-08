@@ -202,6 +202,8 @@ pub struct TcpRequest {
     pub port: u16,
     /// Optional request bytes.
     pub payload: Vec<u8>,
+    /// Whether one bounded response read is required after connecting.
+    pub read_response: bool,
     /// Shared resource limits.
     pub budget: Budget,
     /// Scope applied before name resolution or connection.
@@ -262,8 +264,10 @@ pub trait UdpPort: Send + Sync {
 /// A validated TLS handshake request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsRequest {
-    /// Server name used for DNS, SNI, and certificate validation.
+    /// Host name or address used to establish the scoped connection.
     pub host: String,
+    /// Optional DNS name used for SNI and certificate validation.
+    pub server_name: Option<String>,
     /// TLS port, normally 443.
     pub port: u16,
     /// Shared resource limits.
@@ -297,9 +301,25 @@ pub struct TlsCertificate {
     pub is_ca: Option<bool>,
 }
 
+/// Negotiated TLS handshake mode without exposing library-specific types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsHandshakeKind {
+    /// A complete handshake was performed.
+    Full,
+    /// A complete handshake required a `HelloRetryRequest` round trip.
+    FullWithHelloRetryRequest,
+    /// A previously established session was resumed.
+    Resumed,
+    /// The TLS backend did not expose the handshake mode.
+    Unknown,
+}
+
 /// Safe metadata from a validated TLS handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsObservation {
+    /// Whether the connection used a full or resumed handshake.
+    pub handshake_kind: TlsHandshakeKind,
     /// Negotiated protocol version.
     pub protocol: String,
     /// Negotiated cipher suite.

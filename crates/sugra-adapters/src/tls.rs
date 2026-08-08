@@ -6,7 +6,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha256};
-use sugra_core::{PortError, PortErrorKind, TlsCertificate, TlsObservation, TlsPort, TlsRequest};
+use sugra_core::{
+    PortError, PortErrorKind, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest,
+};
 use sugra_domain::{Target, TargetKind};
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -67,7 +69,11 @@ impl TlsPort for RustlsTls {
                 "TLS host is outside the declared scope",
             ));
         }
-        let server_name = ServerName::try_from(request.host.clone()).map_err(|_| {
+        let validation_name = request
+            .server_name
+            .clone()
+            .unwrap_or_else(|| request.host.clone());
+        let server_name = ServerName::try_from(validation_name).map_err(|_| {
             PortError::new(PortErrorKind::InvalidResponse, "TLS server name is invalid")
         })?;
         let started = Instant::now();
@@ -91,6 +97,14 @@ impl TlsPort for RustlsTls {
             )
         })?;
         let connection = stream.get_ref().1;
+        let handshake_kind = match connection.handshake_kind() {
+            Some(rustls::HandshakeKind::Full) => TlsHandshakeKind::Full,
+            Some(rustls::HandshakeKind::FullWithHelloRetryRequest) => {
+                TlsHandshakeKind::FullWithHelloRetryRequest
+            }
+            Some(rustls::HandshakeKind::Resumed) => TlsHandshakeKind::Resumed,
+            None => TlsHandshakeKind::Unknown,
+        };
         let protocol = connection
             .protocol_version()
             .map_or_else(|| "unknown".into(), |value| format!("{value:?}"));
@@ -111,6 +125,7 @@ impl TlsPort for RustlsTls {
             .map(|certificate| certificate.sha256.clone())
             .collect();
         Ok(TlsObservation {
+            handshake_kind,
             protocol,
             cipher_suite,
             alpn,

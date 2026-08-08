@@ -143,7 +143,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Command,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::LocalExec],
-            &[],
+            &["max_hosts", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(38),
@@ -170,7 +170,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tcp,
             vec![TargetKind::Cidr, TargetKind::Ip],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["max_hosts", "ports", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(25),
@@ -188,7 +188,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tcp,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["max_hosts", "ports", "server_name", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(29),
@@ -215,7 +215,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Udp,
             vec![TargetKind::Ip, TargetKind::Domain],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Catalog(9),
@@ -224,7 +224,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tcp,
             vec![TargetKind::Ip, TargetKind::Domain],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["ports", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(23),
@@ -296,7 +296,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Udp,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["max_hosts", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(31),
@@ -314,7 +314,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Command,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::LocalExec],
-            &[],
+            &["max_hosts", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(12),
@@ -359,7 +359,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tcp,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["max_hosts", "ports", "samples", "server_name", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(16),
@@ -368,7 +368,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Command,
             vec![TargetKind::Domain, TargetKind::Ip],
             vec![Capability::LocalExec],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Catalog(17),
@@ -386,7 +386,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Udp,
             vec![TargetKind::Domain, TargetKind::Ip, TargetKind::Cidr],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["max_hosts", "ports", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(18),
@@ -395,7 +395,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Command,
             vec![TargetKind::Domain, TargetKind::Ip],
             vec![Capability::LocalExec],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Catalog(19),
@@ -404,7 +404,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tcp,
             vec![TargetKind::Domain],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Catalog(82),
@@ -1307,7 +1307,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Udp,
             vec![TargetKind::Ip, TargetKind::Domain],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Additional(10),
@@ -1325,7 +1325,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Udp,
             vec![TargetKind::Ip, TargetKind::Domain],
             vec![Capability::ActiveProtocol],
-            &[],
+            &["timeout"],
         )?,
         definition(
             LegacyId::Additional(12),

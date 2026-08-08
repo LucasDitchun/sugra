@@ -11,9 +11,10 @@ use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
-    Catalog, CommandKind, CommandRequest, DnsQuery, DnsRecord, DnsRecordType, HttpMethod,
-    HttpRequest, PortError, PortErrorKind, ProviderRequest, ScanContext, ScanError, ScanErrorKind,
-    Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
+    Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
+    HttpMethod, HttpRequest, PortError, PortErrorKind, ProviderRequest, ScanContext, ScanError,
+    ScanErrorKind, Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsHandshakeKind,
+    TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -396,6 +397,7 @@ impl BuiltinScanner {
             .tls
             .handshake(TlsRequest {
                 host: host.clone(),
+                server_name: None,
                 port,
                 budget: request.budget,
                 scope: request.scope.clone(),
@@ -503,47 +505,183 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        let targets = network_hosts(&request.target, request.budget.max_requests)?;
+        if matches!(
+            self.profile.analyzer,
+            Analyzer::TcpCertificate | Analyzer::TcpTlsState
+        ) {
+            return self.scan_network_tls(request, context).await;
+        }
+        let targets = network_hosts(&request.target, host_limit(request))?;
         let ports = tcp_ports(self.descriptor.id.as_str(), request);
         let mut evidence = Vec::new();
+        let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut attempts = 0_usize;
         for host in targets {
             for port in &ports {
-                if evidence.len() + diagnostics.len() >= request.budget.max_requests {
+                if attempts >= request.budget.max_requests {
                     break;
                 }
+                attempts += 1;
                 let response = self
                     .services
                     .tcp
                     .execute(TcpRequest {
                         host: host.clone(),
                         port: *port,
-                        payload: tcp_payload(self.descriptor.id.as_str(), *port),
+                        payload: tcp_payload(self.profile.analyzer, &host, *port)?,
+                        read_response: tcp_reads_response(self.profile.analyzer, *port),
                         budget: request.budget,
                         scope: request.scope.clone(),
                     })
                     .await;
                 match response {
-                    Ok(response) => evidence.push(Evidence {
-                        kind: "tcp-observation".into(),
-                        source: response.endpoint,
-                        observation: json!({
-                            "open": true,
-                            "bytes": response.bytes.len(),
-                            "sha256": hex::encode(Sha256::digest(&response.bytes)),
-                            "banner": safe_text(&response.bytes, 512),
-                            "duration_ms": response.duration_ms,
-                        }),
-                        observed_at: context.clock.now(),
-                    }),
-                    Err(error) => diagnostics.push(Diagnostic {
-                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                        message: format!("{host}:{port}: {}", error.message),
-                    }),
+                    Ok(response) => {
+                        let index = evidence.len();
+                        let transfer_accepted = self.profile.analyzer == Analyzer::TcpDnsTransfer
+                            && dns_transfer_accepted(&response.bytes);
+                        if transfer_accepted {
+                            findings.push(finding(
+                                "dns-zone-transfer-accepted",
+                                "The authoritative server returned zone-transfer records",
+                                Severity::High,
+                                Confidence::Confirmed,
+                                index,
+                            ));
+                        } else if matches!(
+                            self.profile.analyzer,
+                            Analyzer::TcpPorts | Analyzer::TcpRange
+                        ) {
+                            findings.push(finding(
+                                "tcp-port-open",
+                                &format!("TCP port {port} accepted a connection"),
+                                Severity::Info,
+                                Confidence::Confirmed,
+                                index,
+                            ));
+                        }
+                        evidence.push(Evidence {
+                            kind: "tcp-observation".into(),
+                            source: response.endpoint,
+                            observation: json!({
+                                "state": "open",
+                                "bytes": response.bytes.len(),
+                                "sha256": hex::encode(Sha256::digest(&response.bytes)),
+                                "transfer_accepted": transfer_accepted,
+                                "duration_ms": response.duration_ms,
+                            }),
+                            observed_at: context.clock.now(),
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            self.profile.analyzer,
+                            Analyzer::TcpPorts | Analyzer::TcpRange
+                        ) && matches!(
+                            error.kind,
+                            PortErrorKind::Transport | PortErrorKind::Timeout
+                        ) =>
+                    {
+                        evidence.push(Evidence {
+                            kind: "tcp-observation".into(),
+                            source: format!("{host}:{port}"),
+                            observation: json!({
+                                "state": if error.kind == PortErrorKind::Timeout {
+                                    "filtered-or-unreachable"
+                                } else {
+                                    "closed-or-unreachable"
+                                },
+                            }),
+                            observed_at: context.clock.now(),
+                        });
+                    }
+                    Err(error) => push_network_diagnostic(&mut diagnostics, &host, *port, &error),
                 }
             }
         }
-        network_result(evidence, diagnostics)
+        network_result(evidence, findings, diagnostics)
+    }
+
+    async fn scan_network_tls(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        let targets = network_hosts(&request.target, host_limit(request))?;
+        let ports = tcp_ports(self.descriptor.id.as_str(), request);
+        let samples = if self.profile.analyzer == Analyzer::TcpTlsState {
+            usize_option(&request.options, "samples", 2).clamp(2, 8)
+        } else {
+            1
+        };
+        let server_name = request
+            .options
+            .get("server_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut attempts = 0_usize;
+        let mut resumed = false;
+        for host in targets {
+            for port in &ports {
+                for _ in 0..samples {
+                    if attempts >= request.budget.max_requests {
+                        break;
+                    }
+                    attempts += 1;
+                    match self
+                        .services
+                        .tls
+                        .handshake(TlsRequest {
+                            host: host.clone(),
+                            server_name: server_name.clone(),
+                            port: *port,
+                            budget: request.budget,
+                            scope: request.scope.clone(),
+                        })
+                        .await
+                    {
+                        Ok(observation) => {
+                            let index = evidence.len();
+                            resumed |= observation.handshake_kind == TlsHandshakeKind::Resumed;
+                            if self.profile.analyzer == Analyzer::TcpCertificate {
+                                let now = context.clock.now().unix_timestamp();
+                                let mut observed = analyze_tls_chain(&observation);
+                                observed.extend(analyze_tls_expiry(&observation, now));
+                                reindex_findings(&mut observed, index);
+                                findings.extend(observed);
+                            }
+                            evidence.push(Evidence {
+                                kind: "network-tls-observation".into(),
+                                source: format!("{host}:{port}"),
+                                observation: serde_json::to_value(observation).map_err(|_| {
+                                    ScanError::new(
+                                        ScanErrorKind::Internal,
+                                        "TLS observation serialization failed",
+                                    )
+                                })?,
+                                observed_at: context.clock.now(),
+                            });
+                        }
+                        Err(error) => {
+                            push_network_diagnostic(&mut diagnostics, &host, *port, &error);
+                        }
+                    }
+                }
+            }
+        }
+        if self.profile.analyzer == Analyzer::TcpTlsState && !evidence.is_empty() && !resumed {
+            findings.push(Finding {
+                key: "tls-session-not-resumed".into(),
+                title: "No TLS session resumption was observed in the bounded sample".into(),
+                severity: Severity::Info,
+                confidence: Confidence::Unknown,
+                evidence: (0..evidence.len()).collect(),
+            });
+        }
+        network_result(evidence, findings, diagnostics)
     }
 
     async fn scan_udp(
@@ -551,43 +689,59 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        let targets = network_hosts(&request.target, request.budget.max_requests)?;
-        let ports = udp_ports(self.descriptor.id.as_str());
+        let targets = network_hosts(&request.target, host_limit(request))?;
+        let ports = udp_ports(self.descriptor.id.as_str(), request);
         let mut evidence = Vec::new();
+        let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut attempts = 0_usize;
         for host in targets {
             for port in &ports {
+                if attempts >= request.budget.max_requests {
+                    break;
+                }
+                attempts += 1;
                 let response = self
                     .services
                     .udp
                     .execute(UdpRequest {
                         host: host.clone(),
                         port: *port,
-                        payload: udp_payload(*port),
+                        payload: udp_payload(
+                            self.profile.analyzer,
+                            self.descriptor.id.as_str(),
+                            *port,
+                        )?,
                         budget: request.budget,
                         scope: request.scope.clone(),
                     })
                     .await;
                 match response {
-                    Ok(response) => evidence.push(Evidence {
-                        kind: "udp-observation".into(),
-                        source: response.endpoint,
-                        observation: json!({
-                            "responded": true,
-                            "bytes": response.bytes.len(),
-                            "sha256": hex::encode(Sha256::digest(&response.bytes)),
-                            "duration_ms": response.duration_ms,
-                        }),
-                        observed_at: context.clock.now(),
-                    }),
-                    Err(error) => diagnostics.push(Diagnostic {
-                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                        message: format!("{host}:{port}: {}", error.message),
-                    }),
+                    Ok(response) => {
+                        let index = evidence.len();
+                        findings.extend(analyze_udp_response(
+                            self.profile.analyzer,
+                            &response.bytes,
+                            index,
+                        ));
+                        evidence.push(Evidence {
+                            kind: "udp-observation".into(),
+                            source: response.endpoint,
+                            observation: json!({
+                                "responded": true,
+                                "bytes": response.bytes.len(),
+                                "sha256": hex::encode(Sha256::digest(&response.bytes)),
+                                "protocol": udp_observation(self.profile.analyzer, &response.bytes),
+                                "duration_ms": response.duration_ms,
+                            }),
+                            observed_at: context.clock.now(),
+                        });
+                    }
+                    Err(error) => push_network_diagnostic(&mut diagnostics, &host, *port, &error),
                 }
             }
         }
-        network_result(evidence, diagnostics)
+        network_result(evidence, findings, diagnostics)
     }
 
     async fn scan_command(
@@ -596,31 +750,40 @@ impl BuiltinScanner {
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
         let kind = command_kind(self.descriptor.id.as_str());
-        let response = self
-            .services
-            .command
-            .execute(CommandRequest {
-                kind,
-                target: request.target.clone(),
-                budget: request.budget,
-                scope: request.scope.clone(),
-            })
-            .await
-            .map_err(scan_error_from_port)?;
-        Ok(ScanResult::completed(
-            vec![Evidence {
-                kind: "platform-command".into(),
-                source: format!("{kind:?}"),
-                observation: json!({
-                    "exit_code": response.exit_code,
-                    "stdout": redact_text(&response.stdout),
-                    "stderr": redact_text(&response.stderr),
-                    "duration_ms": response.duration_ms,
+        let targets = command_targets(&request.target, host_limit(request));
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        let mut diagnostics = Vec::new();
+        for target in targets.into_iter().take(request.budget.max_requests) {
+            let source = target.canonical();
+            match self
+                .services
+                .command
+                .execute(CommandRequest {
+                    kind,
+                    target,
+                    budget: request.budget,
+                    scope: request.scope.clone(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let index = evidence.len();
+                    findings.extend(analyze_command(kind, &response, index));
+                    evidence.push(Evidence {
+                        kind: "platform-command".into(),
+                        source: format!("{kind:?}:{source}"),
+                        observation: command_observation(kind, &response),
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => diagnostics.push(Diagnostic {
+                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                    message: format!("{source}: {}", error.message),
                 }),
-                observed_at: context.clock.now(),
-            }],
-            Vec::new(),
-        ))
+            }
+        }
+        network_result(evidence, findings, diagnostics)
     }
 
     fn scan_local(
@@ -1839,17 +2002,69 @@ fn tcp_ports(id: &str, request: &ScanRequest) -> Vec<u16> {
     }
 }
 
-fn tcp_payload(id: &str, port: u16) -> Vec<u8> {
-    if id.contains("zone") && port == 53 {
-        Vec::new()
-    } else if matches!(port, 80 | 8080) {
-        b"HEAD / HTTP/1.0\r\n\r\n".to_vec()
+fn tcp_payload(analyzer: Analyzer, host: &str, port: u16) -> Result<Vec<u8>, ScanError> {
+    if analyzer == Analyzer::TcpDnsTransfer && port == 53 {
+        dns_axfr_query(host)
     } else {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
-fn udp_ports(id: &str) -> Vec<u16> {
+fn tcp_reads_response(analyzer: Analyzer, port: u16) -> bool {
+    analyzer == Analyzer::TcpDnsTransfer && port == 53
+}
+
+fn dns_axfr_query(name: &str) -> Result<Vec<u8>, ScanError> {
+    let mut dns = vec![0x53, 0x55, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    let canonical = name.trim_end_matches('.');
+    for label in canonical.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidInput,
+                "zone-transfer target contains an invalid DNS label",
+            ));
+        }
+        dns.push(
+            u8::try_from(label.len()).map_err(|_| {
+                ScanError::new(ScanErrorKind::InvalidInput, "DNS label is too long")
+            })?,
+        );
+        dns.extend_from_slice(label.as_bytes());
+    }
+    dns.extend_from_slice(&[0, 0, 252, 0, 1]);
+    let length = u16::try_from(dns.len()).map_err(|_| {
+        ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "zone-transfer query is too large",
+        )
+    })?;
+    let mut framed = length.to_be_bytes().to_vec();
+    framed.extend(dns);
+    Ok(framed)
+}
+
+fn dns_transfer_accepted(response: &[u8]) -> bool {
+    if response.len() < 14 {
+        return false;
+    }
+    let header = &response[2..14];
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let answers = u16::from_be_bytes([header[6], header[7]]);
+    header[..2] == [0x53, 0x55] && flags & 0x8000 != 0 && flags.trailing_zeros() >= 4 && answers > 0
+}
+
+fn udp_ports(id: &str, request: &ScanRequest) -> Vec<u16> {
+    if let Some(values) = request.options.get("ports").and_then(Value::as_array) {
+        let ports: Vec<u16> = values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .collect();
+        if !ports.is_empty() {
+            return ports;
+        }
+    }
     if id.contains("ntp") {
         vec![123]
     } else if id.contains("snmp") {
@@ -1861,26 +2076,161 @@ fn udp_ports(id: &str) -> Vec<u16> {
     }
 }
 
-fn udp_payload(port: u16) -> Vec<u8> {
+fn udp_payload(analyzer: Analyzer, id: &str, port: u16) -> Result<Vec<u8>, ScanError> {
     match port {
         123 => {
             let mut packet = vec![0_u8; 48];
             packet[0] = 0x1b;
-            packet
+            Ok(packet)
         }
-        161 => vec![
-            0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0,
-            0x19, 0x02, 0x04, 0x70, 0x65, 0x65, 0x72, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30,
-            0x0b, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
-        ],
-        137 => vec![
+        161 => snmp_request(
+            "public",
+            analyzer == Analyzer::UdpSnmp && id == "snmp-bulk-walk",
+        ),
+        137 => Ok(vec![
             0x13, 0x37, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, b'C',
             b'K', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
             b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
             b'A', b'A', b'A', 0x00, 0x00, 0x21, 0x00, 0x01,
-        ],
-        _ => vec![0_u8; 12],
+        ]),
+        _ => Ok(vec![0_u8; 12]),
     }
+}
+
+fn snmp_request(community: &str, bulk: bool) -> Result<Vec<u8>, ScanError> {
+    if community.is_empty()
+        || community.len() > 64
+        || !community.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "SNMP community must contain 1 to 64 printable ASCII characters",
+        ));
+    }
+    let oid = ber_tlv(0x06, &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00]);
+    let mut variable = oid;
+    variable.extend(ber_tlv(0x05, &[]));
+    let binding = ber_tlv(0x30, &variable);
+    let bindings = ber_tlv(0x30, &binding);
+    let mut pdu = ber_tlv(0x02, &[0x53, 0x55, 0x47, 0x52]);
+    pdu.extend(ber_tlv(0x02, &[0]));
+    pdu.extend(ber_tlv(0x02, &[if bulk { 10 } else { 0 }]));
+    pdu.extend(bindings);
+    let pdu = ber_tlv(if bulk { 0xa5 } else { 0xa0 }, &pdu);
+    let mut message = ber_tlv(0x02, &[1]);
+    message.extend(ber_tlv(0x04, community.as_bytes()));
+    message.extend(pdu);
+    Ok(ber_tlv(0x30, &message))
+}
+
+fn ber_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![tag];
+    if body.len() < 128 {
+        encoded.push(u8::try_from(body.len()).unwrap_or(127));
+    } else {
+        encoded.extend_from_slice(&[
+            0x82,
+            u8::try_from((body.len() >> 8) & 0xff).unwrap_or(0xff),
+            u8::try_from(body.len() & 0xff).unwrap_or(0xff),
+        ]);
+    }
+    encoded.extend_from_slice(body);
+    encoded
+}
+
+fn udp_observation(analyzer: Analyzer, response: &[u8]) -> Value {
+    match analyzer {
+        Analyzer::UdpNtp if response.len() >= 48 => json!({
+            "mode": response[0] & 0x07,
+            "version": (response[0] >> 3) & 0x07,
+            "stratum": response[1],
+            "leap_indicator": response[0] >> 6,
+        }),
+        Analyzer::UdpSnmp => json!({
+            "response_valid": snmp_response_status(response).is_some(),
+            "error_status": snmp_response_status(response),
+        }),
+        Analyzer::UdpNetbios => json!({
+            "transaction_matches": response.starts_with(&[0x13, 0x37]),
+            "answer_count": response
+                .get(6..8)
+                .map_or(0, |value| u16::from_be_bytes([value[0], value[1]])),
+        }),
+        _ => json!({"classified": "bounded-datagram"}),
+    }
+}
+
+fn analyze_udp_response(analyzer: Analyzer, response: &[u8], evidence: usize) -> Vec<Finding> {
+    match analyzer {
+        Analyzer::UdpSnmp if snmp_response_status(response) == Some(0) => {
+            vec![finding(
+                "snmp-public-community-accepted",
+                "The SNMP service responded to the public community",
+                Severity::Medium,
+                Confidence::Confirmed,
+                evidence,
+            )]
+        }
+        Analyzer::UdpNtp if response.len() >= 48 => vec![finding(
+            "ntp-service-observed",
+            "An NTP service returned protocol metadata",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn snmp_response_status(response: &[u8]) -> Option<u8> {
+    let mut outer_offset = 0;
+    let (outer_tag, message) = ber_element(response, &mut outer_offset)?;
+    if outer_tag != 0x30 || outer_offset != response.len() {
+        return None;
+    }
+    let mut message_offset = 0;
+    let (version_tag, _) = ber_element(message, &mut message_offset)?;
+    let (community_tag, community) = ber_element(message, &mut message_offset)?;
+    let (pdu_tag, pdu) = ber_element(message, &mut message_offset)?;
+    if version_tag != 0x02 || community_tag != 0x04 || community != b"public" || pdu_tag != 0xa2 {
+        return None;
+    }
+    let mut pdu_offset = 0;
+    let (request_tag, request_id) = ber_element(pdu, &mut pdu_offset)?;
+    let (status_tag, status) = ber_element(pdu, &mut pdu_offset)?;
+    if request_tag != 0x02
+        || request_id != [0x53, 0x55, 0x47, 0x52]
+        || status_tag != 0x02
+        || status.len() != 1
+    {
+        return None;
+    }
+    status.first().copied()
+}
+
+fn ber_element<'a>(input: &'a [u8], offset: &mut usize) -> Option<(u8, &'a [u8])> {
+    let tag = *input.get(*offset)?;
+    *offset += 1;
+    let first_length = *input.get(*offset)?;
+    *offset += 1;
+    let length = if first_length & 0x80 == 0 {
+        usize::from(first_length)
+    } else {
+        let length_bytes = usize::from(first_length & 0x7f);
+        if length_bytes == 0 || length_bytes > 2 {
+            return None;
+        }
+        let mut length = 0_usize;
+        for byte in input.get(*offset..(*offset).checked_add(length_bytes)?)? {
+            length = length.checked_mul(256)?.checked_add(usize::from(*byte))?;
+        }
+        *offset += length_bytes;
+        length
+    };
+    let end = (*offset).checked_add(length)?;
+    let body = input.get(*offset..end)?;
+    *offset = end;
+    Some((tag, body))
 }
 
 fn command_kind(id: &str) -> CommandKind {
@@ -1892,6 +2242,99 @@ fn command_kind(id: &str) -> CommandKind {
         CommandKind::SshKeyscan
     } else {
         CommandKind::Ping
+    }
+}
+
+fn command_targets(target: &Target, limit: usize) -> Vec<Target> {
+    match target {
+        Target::Cidr(network) => network.hosts().take(limit).map(Target::Ip).collect(),
+        other => vec![other.clone()],
+    }
+}
+
+fn command_observation(kind: CommandKind, response: &CommandResponse) -> Value {
+    let details = match kind {
+        CommandKind::Ping => json!({"reachable": response.exit_code == Some(0)}),
+        CommandKind::Traceroute => json!({
+            "hop_lines": response
+                .stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                .saturating_sub(1),
+        }),
+        CommandKind::Whois => json!({"fields": safe_whois_fields(&response.stdout)}),
+        CommandKind::SshKeyscan => json!({"host_keys": ssh_key_metadata(&response.stdout)}),
+    };
+    json!({
+        "exit_code": response.exit_code,
+        "stdout_bytes": response.stdout.len(),
+        "stdout_sha256": hex::encode(Sha256::digest(response.stdout.as_bytes())),
+        "stderr": safe_text(response.stderr.as_bytes(), 512),
+        "details": details,
+        "duration_ms": response.duration_ms,
+    })
+}
+
+fn safe_whois_fields(output: &str) -> BTreeMap<String, String> {
+    const ALLOWED: &[&str] = &[
+        "domain name",
+        "registrar",
+        "creation date",
+        "updated date",
+        "registry expiry date",
+        "domain status",
+        "name server",
+        "dnssec",
+    ];
+    output
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter_map(|(key, value)| {
+            let normalized = key.trim().to_ascii_lowercase();
+            ALLOWED
+                .contains(&normalized.as_str())
+                .then(|| (normalized, value.trim().chars().take(256).collect()))
+        })
+        .take(64)
+        .collect()
+}
+
+fn ssh_key_metadata(output: &str) -> Vec<Value> {
+    output
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _host = fields.next()?;
+            let key_type = fields.next()?;
+            let encoded = fields.next()?;
+            Some(json!({
+                "type": key_type,
+                "sha256": hex::encode(Sha256::digest(encoded.as_bytes())),
+            }))
+        })
+        .take(64)
+        .collect()
+}
+
+fn analyze_command(kind: CommandKind, response: &CommandResponse, evidence: usize) -> Vec<Finding> {
+    match kind {
+        CommandKind::SshKeyscan if !ssh_key_metadata(&response.stdout).is_empty() => vec![finding(
+            "ssh-host-key-observed",
+            "One or more SSH host keys were observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )],
+        CommandKind::Ping if response.exit_code != Some(0) => vec![finding(
+            "icmp-unreachable",
+            "The target did not answer the bounded ICMP probe",
+            Severity::Info,
+            Confidence::Unknown,
+            evidence,
+        )],
+        _ => Vec::new(),
     }
 }
 
@@ -1919,6 +2362,12 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
         .ok_or_else(|| ScanError::new(ScanErrorKind::InvalidInput, "JWT header is invalid"))?;
     let payload = decode(parts[1])
         .ok_or_else(|| ScanError::new(ScanErrorKind::InvalidInput, "JWT payload is invalid"))?;
+    let signature = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|_| {
+        ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "JWT signature encoding is invalid",
+        )
+    })?;
     let mut findings = Vec::new();
     if header
         .get("alg")
@@ -1933,6 +2382,10 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
             0,
         ));
     }
+    findings.extend(jwt_time_findings(
+        &payload,
+        context.clock.now().unix_timestamp(),
+    ));
     Ok(ScanResult::completed(
         vec![Evidence {
             kind: "jwt-structure".into(),
@@ -1940,12 +2393,62 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
             observation: json!({
                 "header": redact_json(header),
                 "payload": redact_json(payload),
-                "signature_bytes": parts[2].len(),
+                "signature_bytes": signature.len(),
+                "signature_sha256": hex::encode(Sha256::digest(&signature)),
+                "signature_verified": false,
             }),
             observed_at: context.clock.now(),
         }],
         findings,
     ))
+}
+
+fn jwt_time_findings(payload: &Value, now: i64) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    match payload.get("exp").and_then(Value::as_i64) {
+        Some(expiry) if expiry <= now => findings.push(finding(
+            "jwt-expired",
+            "The JWT expiration time is in the past",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        )),
+        None => findings.push(finding(
+            "jwt-expiration-missing",
+            "The JWT does not declare an expiration time",
+            Severity::Low,
+            Confidence::Confirmed,
+            0,
+        )),
+        Some(_) => {}
+    }
+    if payload
+        .get("nbf")
+        .and_then(Value::as_i64)
+        .is_some_and(|not_before| not_before > now)
+    {
+        findings.push(finding(
+            "jwt-not-active",
+            "The JWT is not active yet",
+            Severity::Info,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    if payload
+        .get("iat")
+        .and_then(Value::as_i64)
+        .is_some_and(|issued_at| issued_at > now.saturating_add(300))
+    {
+        findings.push(finding(
+            "jwt-issued-in-future",
+            "The JWT issue time is unexpectedly in the future",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    findings
 }
 
 fn wordlist(value: &str) -> Vec<String> {
@@ -1971,6 +2474,7 @@ fn millis(value: u128) -> u64 {
 
 fn network_result(
     evidence: Vec<Evidence>,
+    findings: Vec<Finding>,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<ScanResult, ScanError> {
     if evidence.is_empty() {
@@ -1987,10 +2491,41 @@ fn network_result(
             } else {
                 ExecutionStatus::Partial
             },
-            findings: Vec::new(),
+            findings,
             evidence,
             diagnostics,
         })
+    }
+}
+
+fn push_network_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    host: &str,
+    port: u16,
+    error: &PortError,
+) {
+    diagnostics.push(Diagnostic {
+        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+        message: format!("{host}:{port}: {}", error.message),
+    });
+}
+
+fn usize_option(options: &BTreeMap<String, Value>, key: &str, fallback: usize) -> usize {
+    options
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
+fn host_limit(request: &ScanRequest) -> usize {
+    usize_option(&request.options, "max_hosts", request.budget.max_requests)
+        .min(request.budget.max_requests)
+}
+
+fn reindex_findings(findings: &mut [Finding], evidence: usize) {
+    for finding in findings {
+        finding.evidence = vec![evidence];
     }
 }
 
@@ -2176,6 +2711,7 @@ mod tests {
     impl TlsPort for FakeTls {
         async fn handshake(&self, _request: TlsRequest) -> Result<TlsObservation, PortError> {
             Ok(TlsObservation {
+                handshake_kind: TlsHandshakeKind::Full,
                 protocol: "TLSv1_3".into(),
                 cipher_suite: "TLS_AES_256_GCM_SHA384".into(),
                 alpn: Some("h2".into()),
@@ -2235,7 +2771,7 @@ mod tests {
             TargetKind::Email => Target::parse(kind, "security@example.com")?,
             TargetKind::Opaque if id == "jwt-token-analyzer" => Target::parse(
                 kind,
-                "eyJhbGciOiJub25lIn0.eyJzdWIiOiJmaXh0dXJlIn0.signature",
+                "eyJhbGciOiJub25lIn0.eyJzdWIiOiJmaXh0dXJlIn0.c2lnbmF0dXJl",
             )?,
             TargetKind::Opaque => Target::parse(kind, "example-fixture")?,
         };
@@ -2244,6 +2780,7 @@ mod tests {
 
     fn tls_observation(certificate: Option<TlsCertificate>) -> TlsObservation {
         TlsObservation {
+            handshake_kind: TlsHandshakeKind::Full,
             protocol: "TLSv1_3".into(),
             cipher_suite: "TLS_AES_256_GCM_SHA384".into(),
             alpn: Some("h2".into()),
@@ -2384,6 +2921,100 @@ mod tests {
         assert_eq!(redacted.get("matched_accounts"), Some(&json!(2)));
         assert!(!redacted.to_string().contains("alice"));
         assert!(!redacted.to_string().contains("bob"));
+    }
+
+    #[test]
+    fn axfr_query_is_framed_and_only_accepts_answer_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let query = dns_axfr_query("example.com")?;
+        assert_eq!(
+            usize::from(u16::from_be_bytes([query[0], query[1]])),
+            query.len() - 2
+        );
+        assert_eq!(&query[2..4], &[0x53, 0x55]);
+        assert_eq!(&query[query.len() - 4..query.len() - 2], &[0, 252]);
+
+        let accepted = [0, 12, 0x53, 0x55, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        let refused = [0, 12, 0x53, 0x55, 0x81, 0x85, 0, 1, 0, 0, 0, 0, 0, 0];
+        assert!(dns_transfer_accepted(&accepted));
+        assert!(!dns_transfer_accepted(&refused));
+        Ok(())
+    }
+
+    #[test]
+    fn snmp_requests_are_bounded_and_distinguish_get_from_bulk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let get = snmp_request("public", false)?;
+        let bulk = snmp_request("public", true)?;
+        assert_eq!(get.first(), Some(&0x30));
+        assert!(get.contains(&0xa0));
+        assert!(!get.contains(&0xa5));
+        assert!(bulk.contains(&0xa5));
+        assert!(snmp_request("", false).is_err());
+        assert!(snmp_request(&"x".repeat(65), false).is_err());
+
+        let mut pdu = ber_tlv(0x02, &[0x53, 0x55, 0x47, 0x52]);
+        pdu.extend(ber_tlv(0x02, &[0]));
+        pdu.extend(ber_tlv(0x02, &[0]));
+        pdu.extend(ber_tlv(0x30, &[]));
+        let mut message = ber_tlv(0x02, &[1]);
+        message.extend(ber_tlv(0x04, b"public"));
+        message.extend(ber_tlv(0xa2, &pdu));
+        let response = ber_tlv(0x30, &message);
+        assert_eq!(snmp_response_status(&response), Some(0));
+        let mut invalid = response;
+        let Some(request_id) = invalid
+            .windows(4)
+            .position(|window| window == [0x53, 0x55, 0x47, 0x52])
+        else {
+            return Err("fixture SNMP request ID is missing".into());
+        };
+        invalid[request_id] = 0;
+        assert_eq!(snmp_response_status(&invalid), None);
+        Ok(())
+    }
+
+    #[test]
+    fn jwt_time_analysis_reports_expiry_activation_and_clock_skew() {
+        let findings = jwt_time_findings(&json!({"exp": 99, "nbf": 200, "iat": 500}), 100);
+        let keys: BTreeSet<_> = findings
+            .iter()
+            .map(|finding| finding.key.as_str())
+            .collect();
+        assert!(keys.contains("jwt-expired"));
+        assert!(keys.contains("jwt-not-active"));
+        assert!(keys.contains("jwt-issued-in-future"));
+    }
+
+    #[test]
+    fn command_metadata_omits_raw_host_keys_and_whois_contacts() {
+        let ssh = CommandResponse {
+            exit_code: Some(0),
+            stdout: "example.com ssh-ed25519 AAAA-sensitive-key-material".into(),
+            stderr: String::new(),
+            duration_ms: 1,
+        };
+        let ssh_value = command_observation(CommandKind::SshKeyscan, &ssh).to_string();
+        assert!(!ssh_value.contains("AAAA-sensitive-key-material"));
+        assert!(ssh_value.contains("ssh-ed25519"));
+
+        let whois = safe_whois_fields(
+            "Domain Name: EXAMPLE.COM\nRegistrar: Fixture\nRegistrant Email: person@example.com",
+        );
+        assert_eq!(
+            whois.get("domain name").map(String::as_str),
+            Some("EXAMPLE.COM")
+        );
+        assert!(!whois.contains_key("registrant email"));
+    }
+
+    #[test]
+    fn cidr_command_targets_respect_the_host_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let cidr = Target::parse(TargetKind::Cidr, "192.0.2.0/24")?;
+        let targets = command_targets(&cidr, 3);
+        assert_eq!(targets.len(), 3);
+        assert!(targets.iter().all(|target| matches!(target, Target::Ip(_))));
+        Ok(())
     }
 
     #[tokio::test]

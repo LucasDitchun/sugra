@@ -17,8 +17,8 @@ pub use ports::{
     Clock, CommandKind, CommandPort, CommandRequest, CommandResponse, DnsPort, DnsQuery, DnsRecord,
     DnsRecordType, HttpMethod, HttpPort, HttpRequest, HttpResponse, PortError, PortErrorKind,
     ProviderPort, ProviderRequest, ProviderResponse, ServiceBundle, TcpPort, TcpRequest,
-    TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest, UdpPort, UdpRequest,
-    UdpResponse,
+    TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest, UdpPort,
+    UdpRequest, UdpResponse,
 };
 pub use report::{render_csv, render_html, render_terminal};
 pub use scanner::{ScanContext, ScanError, ScanErrorKind, Scanner};

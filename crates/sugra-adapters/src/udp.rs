@@ -57,3 +57,44 @@ impl UdpPort for TokioUdp {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use sugra_domain::{Budget, ScopeGrant};
+    use time::OffsetDateTime;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn datagram_exchange_is_scoped_and_response_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = server.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut request = [0_u8; 32];
+            let (received, peer) = server.recv_from(&mut request).await?;
+            assert_eq!(&request[..received], b"probe");
+            server.send_to(b"response", peer).await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let target = Target::Ip(address.ip());
+        let response = TokioUdp
+            .execute(UdpRequest {
+                host: address.ip().to_string(),
+                port: address.port(),
+                payload: b"probe".to_vec(),
+                budget: Budget {
+                    timeout_ms: 1_000,
+                    max_response_bytes: 4,
+                    ..Budget::default()
+                },
+                scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+            })
+            .await?;
+        assert_eq!(response.bytes, b"resp");
+        task.await??;
+        Ok(())
+    }
+}
