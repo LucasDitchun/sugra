@@ -428,8 +428,13 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        let calls = provider_calls(self.descriptor.id.as_str(), &request.target);
+        let calls = provider_calls(
+            self.descriptor.id.as_str(),
+            &request.target,
+            &request.options,
+        );
         let mut evidence = Vec::new();
+        let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
         for call in calls {
             let response = self
@@ -438,18 +443,32 @@ impl BuiltinScanner {
                 .query(ProviderRequest {
                     provider: call.provider.into(),
                     operation: call.operation.into(),
-                    query: provider_query(call.provider, &request.target),
+                    query: provider_query(
+                        self.descriptor.id.as_str(),
+                        &call,
+                        &request.target,
+                        &request.options,
+                    ),
                     secret_env: call.secret_env.map(str::to_owned),
                     budget: request.budget,
                 })
                 .await;
             match response {
-                Ok(response) => evidence.push(Evidence {
-                    kind: "provider-observation".into(),
-                    source: response.provider,
-                    observation: redact_json(response.data),
-                    observed_at: context.clock.now(),
-                }),
+                Ok(response) => {
+                    let observation = redact_provider_data(&response.provider, response.data);
+                    findings.extend(analyze_provider(
+                        self.descriptor.id.as_str(),
+                        &response.provider,
+                        &observation,
+                        evidence.len(),
+                    ));
+                    evidence.push(Evidence {
+                        kind: "provider-observation".into(),
+                        source: provider_source(&response.provider).into(),
+                        observation,
+                        observed_at: context.clock.now(),
+                    });
+                }
                 Err(error) => diagnostics.push(Diagnostic {
                     kind: format!("{:?}", error.kind).to_ascii_lowercase(),
                     message: error.message,
@@ -473,7 +492,7 @@ impl BuiltinScanner {
             } else {
                 ExecutionStatus::Partial
             },
-            findings: Vec::new(),
+            findings,
             evidence,
             diagnostics,
         })
@@ -1400,48 +1419,40 @@ struct ProviderCall {
     secret_env: Option<&'static str>,
 }
 
-fn provider_calls(id: &str, target: &Target) -> Vec<ProviderCall> {
-    let call = |provider, operation, secret_env| ProviderCall {
+fn provider_calls(
+    id: &str,
+    target: &Target,
+    options: &BTreeMap<String, Value>,
+) -> Vec<ProviderCall> {
+    if let Some(calls) = provider_registry_calls(id, target, options) {
+        return calls;
+    }
+    provider_intelligence_calls(id, target)
+        .unwrap_or_else(|| vec![provider_call("configured-provider", "query", None)])
+}
+
+const fn provider_call(
+    provider: &'static str,
+    operation: &'static str,
+    secret_env: Option<&'static str>,
+) -> ProviderCall {
+    ProviderCall {
         provider,
         operation,
         secret_env,
-    };
+    }
+}
+
+fn provider_registry_calls(
+    id: &str,
+    target: &Target,
+    options: &BTreeMap<String, Value>,
+) -> Option<Vec<ProviderCall>> {
     match id {
-        "ct-log-query" | "subdomain-enum" | "associated-hosts" | "certificate-authority-recon" => {
-            vec![call("crtsh", "query", None)]
+        "asn-lookup" if matches!(target, Target::Ip(_)) => {
+            Some(vec![provider_call("ripestat", "network-info", None)])
         }
-        "archive-history" => vec![call("wayback", "cdx", None)],
-        "shodan" | "reverse-ip-lookup" => vec![call("shodan", "host", Some("SHODAN_API_KEY"))],
-        "virustotal-scan" => vec![call(
-            "virustotal",
-            if matches!(target, Target::Ip(_)) {
-                "ip"
-            } else {
-                "domain"
-            },
-            Some("VIRUSTOTAL_API_KEY"),
-        )],
-        "breached-credentials-lookup" | "data-leak" => {
-            vec![call("hibp", "account", Some("HIBP_API_KEY"))]
-        }
-        "ssl-labs-report" => vec![call("ssllabs", "analyze", None)],
-        value if value.contains("reputation") || value == "threat-feed-correlator" => vec![
-            call("abuseipdb", "check", Some("ABUSEIPDB_API_KEY")),
-            call("otx", "domain", Some("OTX_API_KEY")),
-            call("urlhaus", "host", None),
-        ],
-        value
-            if value.contains("location")
-                || value.contains("timezone")
-                || value.contains("geo-ip") =>
-        {
-            vec![call("ipinfo", "lookup", Some("IPINFO_API_KEY"))]
-        }
-        value if value.contains("malware") || value.contains("phishing") => vec![
-            call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
-            call("urlhaus", "host", None),
-        ],
-        _ => vec![call(
+        "asn-lookup" | "rdap-lookup" => Some(vec![provider_call(
             "rdap",
             if matches!(target, Target::Ip(_)) {
                 "ip"
@@ -1449,20 +1460,312 @@ fn provider_calls(id: &str, target: &Target) -> Vec<ProviderCall> {
                 "domain"
             },
             None,
-        )],
+        )]),
+        "autonomous-neighbor-peering-map" => {
+            Some(vec![provider_call("ripestat", "asn-neighbours", None)])
+        }
+        "bgp-route-analysis" => Some(vec![provider_call("ripestat", "bgp-state", None)]),
+        "ip-allocation-history-tracker" => {
+            Some(vec![provider_call("ripestat", "historical-whois", None)])
+        }
+        "ip-info" => Some(vec![provider_call("ripestat", "network-info", None)]),
+        "ns-geo-asn-diversity-analyzer" => Some(vec![provider_call("ripestat", "dns-chain", None)]),
+        "rpki-route-validity-check" if options.contains_key("asn") => {
+            Some(vec![provider_call("ripestat", "rpki-validation", None)])
+        }
+        "rpki-route-validity-check" => Some(vec![provider_call("ripestat", "rpki-history", None)]),
+        "irr-routing-registry-analyzer" => Some(vec![provider_call("ripestat", "whois", None)]),
+        "archive-history" => Some(vec![provider_call("wayback", "cdx", None)]),
+        _ => None,
     }
 }
 
-fn provider_query(provider: &str, target: &Target) -> BTreeMap<String, Value> {
+fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<ProviderCall>> {
+    match id {
+        "associated-hosts" | "domain-shadowing-detector" => Some(vec![
+            provider_call("crtsh", "query", None),
+            provider_call("urlscan", "search", None),
+        ]),
+        "ct-log-query"
+        | "subdomain-enum"
+        | "certificate-authority-recon"
+        | "rogue-certificate-check" => Some(vec![provider_call("crtsh", "query", None)]),
+        "reverse-ip-lookup" | "passive-dns-history" => {
+            Some(vec![provider_call("urlscan", "search", None)])
+        }
+        "shodan" => Some(vec![provider_call(
+            "shodan",
+            "host",
+            Some("SHODAN_API_KEY"),
+        )]),
+        "censys" => Some(vec![provider_call(
+            "censys",
+            if matches!(target, Target::Ip(_)) {
+                "host"
+            } else {
+                "webproperty"
+            },
+            Some("CENSYS_API_TOKEN"),
+        )]),
+        "virustotal-scan" => Some(vec![provider_call(
+            "virustotal",
+            if matches!(target, Target::Ip(_)) {
+                "ip"
+            } else {
+                "domain"
+            },
+            Some("VIRUSTOTAL_API_KEY"),
+        )]),
+        "breached-credentials-lookup" | "data-leak" => Some(vec![provider_call(
+            "hibp",
+            if matches!(target, Target::Email(_)) {
+                "account"
+            } else {
+                "domain"
+            },
+            Some("HIBP_API_KEY"),
+        )]),
+        "ssl-labs-report" => Some(vec![provider_call("ssllabs", "analyze", None)]),
+        "global-ranking" => Some(vec![provider_call(
+            "cloudflare-radar",
+            "domain-ranking",
+            Some("CLOUDFLARE_API_TOKEN"),
+        )]),
+        "ip-reputation-check" | "ip-reputation-trending" => Some(vec![
+            provider_call("ripestat", "dns-blocklists", None),
+            provider_call("abuseipdb", "check", Some("ABUSEIPDB_API_KEY")),
+        ]),
+        "domain-reputation-check" => Some(vec![
+            provider_call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
+            provider_call("urlscan", "search", None),
+            provider_call("urlhaus", "host", Some("URLHAUS_AUTH_KEY")),
+        ]),
+        "threat-feed-correlator" => Some(vec![
+            provider_call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
+            provider_call("otx", "domain", Some("OTX_API_KEY")),
+            provider_call("urlhaus", "host", Some("URLHAUS_AUTH_KEY")),
+        ]),
+        "geo-ip-spoof-detection" => Some(vec![
+            provider_call("ipinfo", "lookup", Some("IPINFO_API_KEY")),
+            provider_call("ripestat", "rir-geo", None),
+        ]),
+        value
+            if value.contains("location")
+                || value.contains("timezone")
+                || value.contains("geo-ip") =>
+        {
+            Some(vec![provider_call(
+                "ipinfo",
+                "lookup",
+                Some("IPINFO_API_KEY"),
+            )])
+        }
+        value if value.contains("malware") || value.contains("phishing") => Some(vec![
+            provider_call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
+            provider_call("urlscan", "search", None),
+            provider_call("urlhaus", "host", Some("URLHAUS_AUTH_KEY")),
+        ]),
+        "pastebin-monitoring" | "dark-web-monitoring" => {
+            Some(vec![provider_call("configured-monitoring", "search", None)])
+        }
+        _ => None,
+    }
+}
+
+fn provider_query(
+    scanner_id: &str,
+    call: &ProviderCall,
+    target: &Target,
+    options: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
     let canonical = target.canonical();
-    let key = match provider {
-        "crtsh" => "q",
-        "wayback" => "url",
-        "abuseipdb" => "ipAddress",
-        "ssllabs" | "urlhaus" => "host",
-        _ => "target",
+    let host = provider_host(target);
+    match call.provider {
+        "crtsh" => {
+            let query = if matches!(
+                scanner_id,
+                "associated-hosts" | "subdomain-enum" | "domain-shadowing-detector"
+            ) {
+                format!("%.{host}")
+            } else {
+                host
+            };
+            BTreeMap::from([("q".into(), Value::String(query))])
+        }
+        "wayback" => BTreeMap::from([("url".into(), Value::String(format!("{host}/*")))]),
+        "urlscan" => {
+            let field = match target {
+                Target::Ip(_) | Target::Cidr(_) => "ip",
+                Target::Asn(_) => "asn",
+                _ => "domain",
+            };
+            BTreeMap::from([("q".into(), Value::String(format!("{field}:{host}")))])
+        }
+        "ripestat" if call.operation == "rpki-validation" => BTreeMap::from([
+            (
+                "resource".into(),
+                options
+                    .get("asn")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            ),
+            ("prefix".into(), Value::String(canonical)),
+        ]),
+        "ripestat" => BTreeMap::from([("resource".into(), Value::String(canonical))]),
+        "abuseipdb" => BTreeMap::from([("ipAddress".into(), Value::String(host))]),
+        "ssllabs" | "urlhaus" => BTreeMap::from([("host".into(), Value::String(host))]),
+        "censys" if call.operation == "webproperty" => {
+            BTreeMap::from([("target".into(), Value::String(format!("{host}:443")))])
+        }
+        _ => BTreeMap::from([("target".into(), Value::String(host))]),
+    }
+}
+
+fn provider_host(target: &Target) -> String {
+    match target {
+        Target::Url(url) => url.host_str().unwrap_or_default().to_owned(),
+        Target::HostPort { host, .. } | Target::Domain(host) => host.clone(),
+        Target::Email(value) => value.clone(),
+        _ => target.canonical(),
+    }
+}
+
+fn provider_source(provider: &str) -> &str {
+    match provider {
+        "hibp" => "Have I Been Pwned (https://haveibeenpwned.com/)",
+        "ripestat" => "RIPEstat (https://stat.ripe.net/)",
+        "urlhaus" => "URLhaus by abuse.ch (https://urlhaus.abuse.ch/)",
+        "urlscan" => "urlscan.io (https://urlscan.io/)",
+        "censys" => "Censys (https://censys.com/)",
+        "cloudflare-radar" => "Cloudflare Radar (https://radar.cloudflare.com/)",
+        other => other,
+    }
+}
+
+fn analyze_provider(
+    scanner_id: &str,
+    provider: &str,
+    observation: &Value,
+    evidence: usize,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if scanner_id == "rpki-route-validity-check"
+        && observation
+            .pointer("/data/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.starts_with("invalid"))
+    {
+        findings.push(finding(
+            "rpki-route-invalid",
+            "The route origin is invalid under the observed RPKI state",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "hibp"
+        && (observation
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+            || observation
+                .get("matched_accounts")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0))
+    {
+        findings.push(finding(
+            "breach-observation-present",
+            "The configured breach source returned matching observations",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "virustotal"
+        && observation
+            .pointer("/data/attributes/last_analysis_stats/malicious")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+    {
+        findings.push(finding(
+            "malicious-engine-observation",
+            "One or more reputation engines reported a malicious indicator",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "abuseipdb"
+        && observation
+            .pointer("/data/abuseConfidenceScore")
+            .and_then(Value::as_u64)
+            .is_some_and(|score| score >= 25)
+    {
+        findings.push(finding(
+            "address-abuse-confidence",
+            "The address has a material abuse-confidence score",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "urlhaus"
+        && observation
+            .get("urls")
+            .and_then(Value::as_array)
+            .is_some_and(|urls| !urls.is_empty())
+    {
+        findings.push(finding(
+            "malware-url-observation",
+            "The malware URL source returned matching observations",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    if provider == "ssllabs" && has_weak_tls_grade(observation) {
+        findings.push(finding(
+            "external-tls-grade-risk",
+            "The external TLS assessment reported a weak endpoint grade",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    findings
+}
+
+fn redact_provider_data(provider: &str, value: Value) -> Value {
+    if provider != "hibp" {
+        return redact_json(value);
+    }
+    let accounts = match value {
+        Value::Object(accounts) => accounts,
+        other => return redact_json(other),
     };
-    BTreeMap::from([(key.into(), Value::String(canonical))])
+    let mut breaches = BTreeSet::new();
+    for values in accounts.values() {
+        if let Some(items) = values.as_array() {
+            breaches.extend(items.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+    }
+    json!({
+        "matched_accounts": accounts.len(),
+        "breaches": breaches,
+    })
+}
+
+fn has_weak_tls_grade(observation: &Value) -> bool {
+    observation
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .is_some_and(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                endpoint
+                    .get("grade")
+                    .and_then(Value::as_str)
+                    .is_some_and(|grade| matches!(grade, "C" | "D" | "E" | "F" | "T" | "M"))
+            })
+        })
 }
 
 fn tls_endpoint(target: &Target) -> Result<(String, u16), ScanError> {
@@ -2006,6 +2309,81 @@ mod tests {
                 .iter()
                 .any(|finding| finding.key == "tls-weak-cipher")
         );
+    }
+
+    #[test]
+    fn every_provider_scanner_has_an_explicit_provider_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let builtins = build_builtins(&services())?;
+        let mut provider_scanners = 0;
+        for descriptor in builtins.catalog.iter() {
+            let profile = profile_for(descriptor.id.as_str())
+                .ok_or_else(|| format!("missing semantic profile for {}", descriptor.id))?;
+            if profile.analyzer.family() != BoundaryFamily::Provider {
+                continue;
+            }
+            provider_scanners += 1;
+            let target = target_for(descriptor.target_kinds[0], descriptor.id.as_str())?;
+            let calls = provider_calls(descriptor.id.as_str(), &target, &BTreeMap::new());
+            assert!(!calls.is_empty(), "{} has no provider plan", descriptor.id);
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| call.provider != "configured-provider"),
+                "{} fell through to the generic provider",
+                descriptor.id
+            );
+        }
+        assert_eq!(provider_scanners, 36);
+        Ok(())
+    }
+
+    #[test]
+    fn rpki_provider_query_keeps_asn_and_prefix_separate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let target = Target::parse(TargetKind::Cidr, "192.0.2.0/24")?;
+        let call = ProviderCall {
+            provider: "ripestat",
+            operation: "rpki-validation",
+            secret_env: None,
+        };
+        let query = provider_query(
+            "rpki-route-validity-check",
+            &call,
+            &target,
+            &BTreeMap::from([("asn".into(), json!("64496"))]),
+        );
+        assert_eq!(query.get("resource"), Some(&json!("64496")));
+        assert_eq!(query.get("prefix"), Some(&json!("192.0.2.0/24")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_analysis_reports_confirmed_security_signals() {
+        let rpki = analyze_provider(
+            "rpki-route-validity-check",
+            "ripestat",
+            &json!({"data": {"status": "invalid_asn"}}),
+            0,
+        );
+        assert_eq!(rpki[0].key, "rpki-route-invalid");
+        assert_eq!(rpki[0].severity, Severity::High);
+
+        let reputation = analyze_provider(
+            "virustotal-scan",
+            "virustotal",
+            &json!({"data": {"attributes": {"last_analysis_stats": {"malicious": 3}}}}),
+            0,
+        );
+        assert_eq!(reputation[0].key, "malicious-engine-observation");
+
+        let redacted = redact_provider_data(
+            "hibp",
+            json!({"alice": ["FixtureBreach"], "bob": ["OtherBreach"]}),
+        );
+        assert_eq!(redacted.get("matched_accounts"), Some(&json!(2)));
+        assert!(!redacted.to_string().contains("alice"));
+        assert!(!redacted.to_string().contains("bob"));
     }
 
     #[tokio::test]

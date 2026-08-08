@@ -267,9 +267,9 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "rpki-route-validity-check",
             "RPKI Route Validity Check",
             Operation::Registry,
-            vec![TargetKind::Domain, TargetKind::Ip],
+            vec![TargetKind::Cidr, TargetKind::Asn],
             vec![Capability::PassiveNetwork],
-            &[],
+            &["asn", "timeout"],
         )?,
         definition(
             LegacyId::Catalog(10),

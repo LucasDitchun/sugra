@@ -4,3 +4,12 @@ https://github.com/LucasDitchun/Argus
 Argus is distributed under the MIT License. Sugra does not copy Argus source code or Git history.
 
 Rust dependencies retain their respective licenses. Exact dependency and license information is available from Cargo metadata and release SBOM artifacts.
+
+Optional provider integrations return data owned and licensed by their respective operators. Users are responsible for their account terms, quotas, attribution, and lawful use:
+
+- RIPEstat Data API: https://stat.ripe.net/docs/data-api/
+- Have I Been Pwned: https://haveibeenpwned.com/API/v3 (breach data is attributed to Have I Been Pwned and is subject to its documented Creative Commons Attribution terms)
+- urlscan.io: https://urlscan.io/docs/api/
+- Censys Platform API: https://docs.censys.com/reference/get-started
+- URLhaus by abuse.ch: https://urlhaus-api.abuse.ch/
+- Cloudflare Radar API: https://developers.cloudflare.com/api/resources/radar/

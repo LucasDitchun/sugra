@@ -35,6 +35,16 @@ impl ProviderPort for ReqwestProvider {
         let mut headers = BTreeMap::new();
         if request.provider == "cloudflare-doh" {
             headers.insert("accept".into(), "application/dns-json".into());
+        } else if request.provider == "censys" {
+            let asset = if request.operation == "webproperty" {
+                "webproperty"
+            } else {
+                "host"
+            };
+            headers.insert(
+                "accept".into(),
+                format!("application/vnd.censys.api.v3.{asset}.v1+json"),
+            );
         }
         if let Some(secret_env) = &request.secret_env {
             let secret = std::env::var(secret_env).map_err(|_| {
@@ -45,6 +55,7 @@ impl ProviderPort for ReqwestProvider {
             })?;
             inject_secret(&request.provider, &mut endpoint, &mut headers, &secret)?;
         }
+        let (method, body) = provider_transport(&request, &mut headers);
         let scope_target = Target::parse(TargetKind::Url, endpoint.as_str())
             .map_err(|_| PortError::new(PortErrorKind::Internal, "provider endpoint is invalid"))?;
         let scope = ScopeGrant::exact(&scope_target, false, self.clock.now());
@@ -53,9 +64,9 @@ impl ProviderPort for ReqwestProvider {
             .http
             .execute(HttpRequest {
                 url: endpoint,
-                method: HttpMethod::Get,
+                method,
                 headers,
-                body: Vec::new(),
+                body,
                 max_redirects: 2,
                 budget: request.budget,
                 scope,
@@ -88,6 +99,9 @@ impl ProviderPort for ReqwestProvider {
 }
 
 fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
+    if request.provider == "ripestat" {
+        return ripestat_endpoint(request);
+    }
     let (base, fixed): (&str, &[(&str, &str)]) =
         match (request.provider.as_str(), request.operation.as_str()) {
             ("crtsh", "query") => ("https://crt.sh/", &[("output", "json")]),
@@ -104,11 +118,22 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
             ("virustotal", "domain") => ("https://www.virustotal.com/api/v3/domains", &[]),
             ("virustotal", "ip") => ("https://www.virustotal.com/api/v3/ip_addresses", &[]),
             ("hibp", "account") => ("https://haveibeenpwned.com/api/v3/breachedaccount", &[]),
+            ("hibp", "domain") => ("https://haveibeenpwned.com/api/v3/breacheddomain", &[]),
             ("abuseipdb", "check") => ("https://api.abuseipdb.com/api/v2/check", &[]),
             ("ipinfo", "lookup") => ("https://ipinfo.io", &[]),
             ("otx", "domain") => ("https://otx.alienvault.com/api/v1/indicators/domain", &[]),
             ("urlhaus", "host") => ("https://urlhaus-api.abuse.ch/v1/host/", &[]),
             ("ssllabs", "analyze") => ("https://api.ssllabs.com/api/v3/analyze", &[]),
+            ("urlscan", "search") => ("https://urlscan.io/api/v1/search/", &[("size", "100")]),
+            ("censys", "host") => ("https://api.platform.censys.io/v3/global/asset/host", &[]),
+            ("censys", "webproperty") => (
+                "https://api.platform.censys.io/v3/global/asset/webproperty",
+                &[],
+            ),
+            ("cloudflare-radar", "domain-ranking") => (
+                "https://api.cloudflare.com/client/v4/radar/ranking/domain",
+                &[("format", "JSON")],
+            ),
             ("cloudflare-doh", "resolve") => ("https://cloudflare-dns.com/dns-query", &[]),
             ("google-doh", "resolve") => ("https://dns.google/resolve", &[]),
             _ => {
@@ -120,14 +145,8 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
         };
     let mut url = Url::parse(base)
         .map_err(|_| PortError::new(PortErrorKind::Internal, "provider endpoint is invalid"))?;
-    if matches!(
-        (request.provider.as_str(), request.operation.as_str()),
-        ("rdap" | "virustotal", "domain" | "ip")
-            | ("shodan", "host")
-            | ("hibp", "account")
-            | ("ipinfo", "lookup")
-            | ("otx", "domain")
-    ) {
+    let target_in_path = provider_target_in_path(&request.provider, &request.operation);
+    if target_in_path {
         let target = query_string(&request.query, "target")?;
         url.path_segments_mut()
             .map_err(|()| {
@@ -142,23 +161,94 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
                 .push("general");
         }
     }
-    let target_in_path = matches!(
-        (request.provider.as_str(), request.operation.as_str()),
-        ("rdap" | "virustotal", "domain" | "ip")
-            | ("shodan", "host")
-            | ("hibp", "account")
-            | ("ipinfo", "lookup")
-            | ("otx", "domain")
-    );
     {
         let mut pairs = url.query_pairs_mut();
         for (key, value) in fixed {
             pairs.append_pair(key, value);
         }
         for (key, value) in &request.query {
+            if request.provider == "urlhaus" {
+                continue;
+            }
             if key == "target" && target_in_path {
                 continue;
             }
+            if let Some(value) = value.as_str() {
+                pairs.append_pair(key, value);
+            } else {
+                pairs.append_pair(key, &value.to_string());
+            }
+        }
+    }
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+    Ok(url)
+}
+
+fn provider_target_in_path(provider: &str, operation: &str) -> bool {
+    matches!(
+        (provider, operation),
+        ("rdap" | "virustotal", "domain" | "ip")
+            | ("shodan", "host")
+            | ("hibp", "account" | "domain")
+            | ("ipinfo", "lookup")
+            | ("otx", "domain")
+            | ("censys", "host" | "webproperty")
+            | ("cloudflare-radar", "domain-ranking")
+    )
+}
+
+fn provider_transport(
+    request: &ProviderRequest,
+    headers: &mut BTreeMap<String, String>,
+) -> (HttpMethod, Vec<u8>) {
+    if request.provider != "urlhaus" {
+        return (HttpMethod::Get, Vec::new());
+    }
+    headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in &request.query {
+        if let Some(value) = value.as_str() {
+            serializer.append_pair(key, value);
+        } else {
+            serializer.append_pair(key, &value.to_string());
+        }
+    }
+    (HttpMethod::Post, serializer.finish().into_bytes())
+}
+
+fn ripestat_endpoint(request: &ProviderRequest) -> Result<Url, PortError> {
+    let endpoint = match request.operation.as_str() {
+        "as-overview" => "as-overview",
+        "asn-neighbours" => "asn-neighbours",
+        "bgp-state" => "bgp-state",
+        "dns-blocklists" => "dns-blocklists",
+        "dns-chain" => "dns-chain",
+        "historical-whois" => "historical-whois",
+        "network-info" => "network-info",
+        "prefix-overview" => "prefix-overview",
+        "rir" => "rir",
+        "rir-geo" => "rir-geo",
+        "routing-history" => "routing-history",
+        "rpki-history" => "rpki-history",
+        "rpki-validation" => "rpki-validation",
+        "whois" => "whois",
+        _ => {
+            return Err(PortError::new(
+                PortErrorKind::Unavailable,
+                "RIPEstat operation is not configured",
+            ));
+        }
+    };
+    let mut url = Url::parse(&format!("https://stat.ripe.net/data/{endpoint}/data.json"))
+        .map_err(|_| PortError::new(PortErrorKind::Internal, "provider endpoint is invalid"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in &request.query {
             if let Some(value) = value.as_str() {
                 pairs.append_pair(key, value);
             } else {
@@ -207,7 +297,16 @@ fn inject_secret(
         "otx" => {
             headers.insert("x-otx-api-key".into(), secret.into());
         }
-        "crtsh" | "wayback" | "rdap" | "urlhaus" | "ssllabs" => {
+        "censys" | "cloudflare-radar" => {
+            headers.insert("authorization".into(), format!("Bearer {secret}"));
+        }
+        "urlscan" => {
+            headers.insert("api-key".into(), secret.into());
+        }
+        "urlhaus" => {
+            headers.insert("auth-key".into(), secret.into());
+        }
+        "crtsh" | "wayback" | "rdap" | "ripestat" | "ssllabs" | "cloudflare-doh" | "google-doh" => {
             return Err(PortError::new(
                 PortErrorKind::InvalidResponse,
                 "provider does not accept a credential for this operation",
@@ -289,6 +388,88 @@ mod tests {
             return Err("public provider accepted an unsupported credential".into());
         };
         assert_eq!(error.kind, PortErrorKind::InvalidResponse);
+        Ok(())
+    }
+
+    #[test]
+    fn ripestat_endpoint_uses_an_allowlisted_operation_and_resource()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = endpoint_for(&request(
+            "ripestat",
+            "routing-history",
+            BTreeMap::from([("resource".into(), json!("AS64496"))]),
+        ))?;
+        assert_eq!(endpoint.path(), "/data/routing-history/data.json");
+        assert_eq!(endpoint.query(), Some("resource=AS64496"));
+        assert!(endpoint_for(&request("ripestat", "arbitrary", BTreeMap::new())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn censys_endpoint_and_bearer_header_follow_platform_v3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut endpoint = endpoint_for(&request(
+            "censys",
+            "webproperty",
+            BTreeMap::from([("target".into(), json!("example.com:443"))]),
+        ))?;
+        assert_eq!(
+            endpoint.path(),
+            "/v3/global/asset/webproperty/example.com:443"
+        );
+        let mut headers = BTreeMap::new();
+        inject_secret("censys", &mut endpoint, &mut headers, "fixture-token")?;
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer fixture-token")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn urlscan_search_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = endpoint_for(&request(
+            "urlscan",
+            "search",
+            BTreeMap::from([("q".into(), json!("domain:example.com"))]),
+        ))?;
+        let pairs: BTreeMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("q").map(String::as_str),
+            Some("domain:example.com")
+        );
+        assert_eq!(pairs.get("size").map(String::as_str), Some("100"));
+        Ok(())
+    }
+
+    #[test]
+    fn urlhaus_host_query_uses_authenticated_form_post() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request(
+            "urlhaus",
+            "host",
+            BTreeMap::from([("host".into(), json!("example.com"))]),
+        );
+        let endpoint = endpoint_for(&request)?;
+        assert!(endpoint.query().is_none());
+        let mut headers = BTreeMap::new();
+        let mut credential_endpoint = endpoint.clone();
+        inject_secret(
+            "urlhaus",
+            &mut credential_endpoint,
+            &mut headers,
+            "fixture-key",
+        )?;
+        let (method, body) = provider_transport(&request, &mut headers);
+        assert_eq!(method, HttpMethod::Post);
+        assert_eq!(body, b"host=example.com");
+        assert_eq!(
+            headers.get("auth-key").map(String::as_str),
+            Some("fixture-key")
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/x-www-form-urlencoded")
+        );
         Ok(())
     }
 }
