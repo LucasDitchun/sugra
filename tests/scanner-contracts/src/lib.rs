@@ -117,6 +117,7 @@ const CONTRACT_GROUPS: &[(Boundary, &[&str])] = &[
             "rogue-subdomain-resolver",
             "spf-dkim-dmarc-validator",
             "subdomain-takeover",
+            "typosquat-domain-checker",
             "decoy-dns-beacon",
             "dns-caa-checker",
             "dual-stack-diff",
@@ -194,7 +195,6 @@ const CONTRACT_GROUPS: &[(Boundary, &[&str])] = &[
             "security-contact-gap-finder",
             "security-txt",
             "session-hijacking-passive",
-            "typosquat-domain-checker",
         ],
     ),
     (
