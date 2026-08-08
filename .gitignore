@@ -1,0 +1,7 @@
+/target
+/runs
+/.env
+.DS_Store
+*.log
+*.swp
+*.tmp

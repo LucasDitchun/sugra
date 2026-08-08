@@ -1,0 +1,6 @@
+Sugra is an independent Rust reimplementation inspired by the publicly documented capabilities of Argus:
+https://github.com/LucasDitchun/Argus
+
+Argus is distributed under the MIT License. Sugra does not copy Argus source code or Git history.
+
+Rust dependencies retain their respective licenses. Exact dependency and license information is available from Cargo metadata and release SBOM artifacts.

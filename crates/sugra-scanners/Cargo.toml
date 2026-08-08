@@ -1,0 +1,33 @@
+[package]
+name = "sugra-scanners"
+description = "Built-in security observation capabilities for Sugra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+hex.workspace = true
+regex.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sugra-core = { path = "../sugra-core" }
+sugra-domain = { path = "../sugra-domain" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+sugra-adapters = { path = "../sugra-adapters" }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

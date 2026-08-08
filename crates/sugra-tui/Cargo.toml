@@ -1,0 +1,22 @@
+[package]
+name = "sugra-tui"
+description = "Full-screen terminal interface for Sugra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
+sugra-core = { path = "../sugra-core" }
+sugra-domain = { path = "../sugra-domain" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

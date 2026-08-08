@@ -1,0 +1,31 @@
+[package]
+name = "sugra-cli"
+description = "Command-line application for Sugra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sugra"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+sugra-adapters = { path = "../sugra-adapters" }
+sugra-core = { path = "../sugra-core" }
+sugra-domain = { path = "../sugra-domain" }
+sugra-scanners = { path = "../sugra-scanners" }
+sugra-tui = { path = "../sugra-tui" }
+tokio.workspace = true
+tokio-util.workspace = true
+time.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
