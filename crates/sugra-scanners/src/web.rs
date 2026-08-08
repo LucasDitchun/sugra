@@ -118,10 +118,16 @@ fn resource_plan(
         "broken-links" | "content-discovery" | "crawler" => {
             paths_plan(base, vec!["/".into()], true, max_pages)
         }
-        "cookies" | "cookie-scope-diff" | "session-hijacking-passive" => paths_plan(
+        "cookies" | "session-hijacking-passive" => paths_plan(
             base,
             option_paths(options, "paths", &["/", "/login", "/account"]),
             false,
+            max_pages,
+        ),
+        "cookie-scope-diff" => paths_plan(
+            base,
+            option_paths(options, "paths", &["/", "/login", "/account"]),
+            true,
             max_pages,
         ),
         "crawl-rules" => paths_plan(base, vec!["/robots.txt".into()], false, max_pages),

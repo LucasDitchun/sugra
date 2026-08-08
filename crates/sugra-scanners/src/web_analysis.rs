@@ -6,7 +6,7 @@ use scraper::{Html, Selector};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sugra_core::{HttpMethod, HttpRedirectDecision, HttpResponse};
+use sugra_core::{HttpCookie, HttpMethod, HttpRedirectDecision, HttpResponse};
 use sugra_domain::{Confidence, Finding, Severity};
 use url::Url;
 
@@ -56,7 +56,7 @@ pub(crate) struct WebSample {
     pub(crate) label: String,
     pub(crate) status: u16,
     pub(crate) body_sha256: String,
-    pub(crate) cookie_names: BTreeSet<String>,
+    pub(crate) cookie_scopes: BTreeMap<String, String>,
     pub(crate) headers: BTreeSet<String>,
     pub(crate) duration_ms: u64,
     pub(crate) bytes: usize,
@@ -133,7 +133,9 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
                 "application/json",
             ],
         ),
-        dom_sink_markers: marker_count(
+        dom_sink_markers: executable_marker_count(
+            response,
+            &document,
             &lower,
             &[
                 ".innerhtml",
@@ -184,7 +186,7 @@ pub(crate) fn observation(
         "method": format!("{method:?}").to_ascii_uppercase(),
         "status": response.status,
         "headers": response.headers.keys().take(256).collect::<Vec<_>>(),
-        "cookies": response.cookies,
+        "cookies": response.cookies.iter().take(128).map(safe_cookie).collect::<Vec<_>>(),
         "redirects": response.redirects.iter().map(|redirect| json!({
             "status": redirect.status,
             "from": safe_url(&redirect.from),
@@ -204,10 +206,11 @@ pub(crate) fn sample(label: String, response: &HttpResponse) -> WebSample {
         label,
         status: response.status,
         body_sha256: hex::encode(Sha256::digest(&response.body)),
-        cookie_names: response
+        cookie_scopes: response
             .cookies
             .iter()
-            .map(|cookie| cookie.name_sha256.clone())
+            .take(128)
+            .map(|cookie| (cookie.name_sha256.clone(), cookie_scope_sha256(cookie)))
             .collect(),
         headers: response.headers.keys().cloned().collect(),
         duration_ms: response.duration_ms,
@@ -378,6 +381,69 @@ fn marker_count(text: &str, markers: &[&str]) -> usize {
         .iter()
         .map(|marker| text.matches(marker).count())
         .sum()
+}
+
+fn cookie_scope_sha256(cookie: &HttpCookie) -> String {
+    let scope = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        cookie
+            .domain
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        cookie.path.as_deref().unwrap_or_default(),
+        cookie.secure,
+        cookie.http_only,
+        cookie
+            .same_site
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        cookie.max_age_seconds.unwrap_or_default(),
+        cookie.max_age_seconds.is_some(),
+    );
+    hex::encode(Sha256::digest(scope.as_bytes()))
+}
+
+fn safe_cookie(cookie: &HttpCookie) -> Value {
+    json!({
+        "name_sha256": cookie.name_sha256,
+        "scope_sha256": cookie_scope_sha256(cookie),
+        "secure": cookie.secure,
+        "http_only": cookie.http_only,
+        "same_site": cookie.same_site,
+        "has_domain": cookie.domain.is_some(),
+        "has_path": cookie.path.is_some(),
+        "max_age_seconds": cookie.max_age_seconds,
+    })
+}
+
+fn executable_marker_count(
+    response: &HttpResponse,
+    document: &Html,
+    lower: &str,
+    markers: &[&str],
+) -> usize {
+    let is_script_response = response.headers.get("content-type").is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("javascript") || value.contains("ecmascript")
+    }) || response.final_url.path().rsplit_once('.').is_some_and(
+        |(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "js" | "mjs" | "cjs"
+            )
+        },
+    );
+    if is_script_response {
+        return marker_count(lower, markers);
+    }
+    selector("script:not([src])").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .map(|script| marker_count(&script.inner_html().to_ascii_lowercase(), markers))
+            .sum()
+    })
 }
 
 fn recognized_generator(document: &Html) -> Option<String> {
@@ -756,15 +822,13 @@ fn detection_findings(
 ) -> Vec<Finding> {
     let headers = &response.headers;
     match id {
-        "cdn-detection" if has_header(headers, &["cf-ray", "x-amz-cf-id", "x-cdn", "x-cache"]) => {
-            one(
-                "cdn-signal-observed",
-                "A public CDN or reverse-proxy signal is present",
-                Severity::Info,
-                Confidence::Inferred,
-                evidence,
-            )
-        }
+        "cdn-detection" if has_header(headers, &["cf-ray", "x-amz-cf-id", "x-cdn"]) => one(
+            "cdn-signal-observed",
+            "A public CDN or reverse-proxy signal is present",
+            Severity::Info,
+            Confidence::Inferred,
+            evidence,
+        ),
         "captcha-presence-checker" if signals.captcha_markers > 0 => one(
             "captcha-control-observed",
             "A CAPTCHA integration is present",
@@ -1311,13 +1375,20 @@ fn metadata_findings(
 ) -> Vec<Finding> {
     let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
-        "server-info" if response.headers.contains_key("server") => one(
-            "server-banner-observed",
-            "The response exposes a server banner",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        ),
+        "server-info"
+            if response
+                .headers
+                .get("server")
+                .is_some_and(|value| !value.trim().is_empty()) =>
+        {
+            one(
+                "server-banner-observed",
+                "The response exposes a server banner",
+                Severity::Info,
+                Confidence::Confirmed,
+                evidence,
+            )
+        }
         "crawl-rules" if has_valid_robots_policy(response) => one(
             "crawl-rules-observed",
             "A robots policy is published",
@@ -1568,10 +1639,18 @@ fn risk_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Finding
 }
 
 fn cookie_diff(samples: &[WebSample]) -> Vec<Finding> {
-    if samples
-        .windows(2)
-        .any(|window| window[0].cookie_names != window[1].cookie_names)
-    {
+    let mut first_scopes = BTreeMap::new();
+    let varies = samples.iter().any(|sample| {
+        sample.cookie_scopes.iter().any(|(name, scope)| {
+            if let Some(first_scope) = first_scopes.get(name) {
+                *first_scope != scope
+            } else {
+                first_scopes.insert(name, scope);
+                false
+            }
+        })
+    });
+    if varies {
         aggregate_one(
             "cookie-scope-varies",
             "Observed cookie names vary across the bounded path sample",
@@ -1891,8 +1970,8 @@ mod tests {
         );
         response.cookies.push(HttpCookie {
             name_sha256: "cookie-name-hash".into(),
-            domain: None,
-            path: Some("/".into()),
+            domain: Some("private-cookie.example.test".into()),
+            path: Some("/secret=value".into()),
             secure: true,
             http_only: true,
             same_site: Some("Lax".into()),
@@ -1925,6 +2004,7 @@ mod tests {
         assert!(!serialized.contains("label-person@example.test"));
         assert!(!serialized.contains("secret=value"));
         assert!(!serialized.contains("session=value"));
+        assert!(!serialized.contains("private-cookie.example.test"));
         assert!(!serialized.contains("#fragment"));
         assert!(serialized.contains("cookie-name-hash"));
     }
@@ -1948,6 +2028,42 @@ mod tests {
         assert!(keys.contains("missing-content-security-policy"));
         assert!(keys.contains("missing-strict-transport-security"));
         assert!(keys.contains("missing-x-content-type-options"));
+    }
+
+    #[test]
+    fn dom_sink_markers_require_executable_content() {
+        let prose = response("<p>Documentation mentions .innerHTML and eval( safely.</p>");
+        assert_eq!(signals(&prose).dom_sink_markers, 0);
+        assert!(finding_keys("dom-sink-scanner", &prose).is_empty());
+
+        let inline =
+            response(r"<script>document.querySelector('#x').innerHTML = '<b>x</b>';</script>");
+        assert_eq!(signals(&inline).dom_sink_markers, 1);
+        assert_eq!(
+            finding_keys("dom-sink-scanner", &inline),
+            BTreeSet::from(["dom-sink-marker-observed".into()])
+        );
+
+        let mut javascript = response("target.insertAdjacentHTML('beforeend', value);");
+        javascript.final_url = Url::parse("https://example.test/app.js")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        javascript
+            .headers
+            .insert("content-type".into(), "application/javascript".into());
+        assert_eq!(signals(&javascript).dom_sink_markers, 1);
+    }
+
+    #[test]
+    fn server_info_requires_a_non_empty_banner() {
+        let mut empty = response("fixture");
+        empty.headers.insert("server".into(), "  ".into());
+        assert!(finding_keys("server-info", &empty).is_empty());
+
+        empty.headers.insert("server".into(), "nginx".into());
+        assert_eq!(
+            finding_keys("server-info", &empty),
+            BTreeSet::from(["server-banner-observed".into()])
+        );
     }
 
     #[test]

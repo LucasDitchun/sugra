@@ -70,6 +70,16 @@ pub(crate) struct UdpAnalysis {
     pub(crate) findings: Vec<Finding>,
 }
 
+/// Safe metadata proving whether a bounded DNS-over-TCP response completed AXFR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct DnsTransferAnalysis {
+    pub(crate) accepted: bool,
+    pub(crate) response_code: u8,
+    pub(crate) messages: usize,
+    pub(crate) answer_records: usize,
+    pub(crate) soa_records: usize,
+}
+
 /// Typed analysis failures without raw endpoint or response material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum NetworkAnalysisError {
@@ -85,13 +95,13 @@ pub(crate) enum NetworkAnalysisError {
     ConnectedAddressDoesNotMatchTarget,
     #[error("UDP probe is not allowlisted for destination port {actual}; expected {expected}")]
     PortMismatch { expected: u16, actual: u16 },
-    #[error("UDP response budget must be between 1 and 65507 bytes")]
+    #[error("protocol response budget is invalid")]
     InvalidResponseBudget,
-    #[error("UDP response exceeds the declared byte budget")]
+    #[error("protocol response exceeds the declared byte budget")]
     ResponseTooLarge,
-    #[error("UDP response is truncated for the selected protocol")]
+    #[error("protocol response is truncated")]
     TruncatedResponse,
-    #[error("UDP response violates the selected protocol contract")]
+    #[error("response violates the selected protocol contract")]
     InvalidProtocolResponse,
 }
 
@@ -188,6 +198,187 @@ pub(crate) fn analyze_udp_response(
         classification,
         findings,
     })
+}
+
+/// Validates framed DNS messages and requires both opening and closing SOA records
+/// before treating an AXFR as accepted.
+pub(crate) fn analyze_dns_transfer_response(
+    response: &[u8],
+    max_response_bytes: usize,
+) -> Result<DnsTransferAnalysis, NetworkAnalysisError> {
+    if max_response_bytes == 0 {
+        return Err(NetworkAnalysisError::InvalidResponseBudget);
+    }
+    if response.len() > max_response_bytes {
+        return Err(NetworkAnalysisError::ResponseTooLarge);
+    }
+    let mut cursor = 0_usize;
+    let mut messages = 0_usize;
+    let mut answer_records = 0_usize;
+    let mut soa_records = 0_usize;
+    let mut response_code = 0_u8;
+    let mut opening_soa = false;
+    let mut closing_soa = false;
+    while cursor < response.len() {
+        let length_bytes = response
+            .get(cursor..cursor.saturating_add(2))
+            .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+        let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        cursor = cursor.saturating_add(2);
+        if length < 12 {
+            return Err(NetworkAnalysisError::InvalidProtocolResponse);
+        }
+        let end = cursor
+            .checked_add(length)
+            .ok_or(NetworkAnalysisError::ResponseTooLarge)?;
+        let message = response
+            .get(cursor..end)
+            .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+        let parsed = parse_axfr_message(message)?;
+        if messages > 0 && parsed.response_code != response_code {
+            return Err(NetworkAnalysisError::InvalidProtocolResponse);
+        }
+        if messages == 0 {
+            opening_soa = parsed.first_answer_soa;
+        }
+        closing_soa = parsed.last_answer_soa;
+        response_code = parsed.response_code;
+        answer_records = answer_records.saturating_add(parsed.answer_records);
+        soa_records = soa_records.saturating_add(parsed.soa_records);
+        messages = messages.saturating_add(1);
+        cursor = end;
+    }
+    if messages == 0 || (response_code == 0 && (soa_records < 2 || !opening_soa || !closing_soa)) {
+        return Err(NetworkAnalysisError::InvalidProtocolResponse);
+    }
+    if response_code != 0 && (answer_records != 0 || soa_records != 0) {
+        return Err(NetworkAnalysisError::InvalidProtocolResponse);
+    }
+    Ok(DnsTransferAnalysis {
+        accepted: response_code == 0,
+        response_code,
+        messages,
+        answer_records,
+        soa_records,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AxfrMessage {
+    response_code: u8,
+    answer_records: usize,
+    soa_records: usize,
+    first_answer_soa: bool,
+    last_answer_soa: bool,
+}
+
+fn parse_axfr_message(message: &[u8]) -> Result<AxfrMessage, NetworkAnalysisError> {
+    let transaction = message
+        .get(..2)
+        .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+    let flags = read_u16(message, 2)?;
+    if transaction != TRANSACTION_ID || flags & 0x8000 == 0 || (flags >> 11) & 0x0f != 0 {
+        return Err(NetworkAnalysisError::InvalidProtocolResponse);
+    }
+    let questions = usize::from(read_u16(message, 4)?);
+    if questions > 1 {
+        return Err(NetworkAnalysisError::InvalidProtocolResponse);
+    }
+    let answers = usize::from(read_u16(message, 6)?);
+    let authorities = usize::from(read_u16(message, 8)?);
+    let additionals = usize::from(read_u16(message, 10)?);
+    let mut cursor = 12_usize;
+    for question in 0..questions {
+        cursor = skip_dns_name(message, cursor)?;
+        let question_type = read_u16(message, cursor)?;
+        let question_class = read_u16(message, cursor.saturating_add(2))?;
+        if question == 0 && (question_type != 252 || question_class != 1) {
+            return Err(NetworkAnalysisError::InvalidProtocolResponse);
+        }
+        cursor = cursor.saturating_add(4);
+    }
+    let mut soa_records = 0_usize;
+    let mut first_answer_soa = false;
+    let mut last_answer_soa = false;
+    let total_records = answers
+        .checked_add(authorities)
+        .and_then(|value| value.checked_add(additionals))
+        .ok_or(NetworkAnalysisError::ResponseTooLarge)?;
+    for record in 0..total_records {
+        cursor = skip_dns_name(message, cursor)?;
+        let record_type = read_u16(message, cursor)?;
+        let record_class = read_u16(message, cursor.saturating_add(2))?;
+        let data_length = usize::from(read_u16(message, cursor.saturating_add(8))?);
+        cursor = cursor.saturating_add(10);
+        let data_end = cursor
+            .checked_add(data_length)
+            .ok_or(NetworkAnalysisError::ResponseTooLarge)?;
+        message
+            .get(cursor..data_end)
+            .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+        if record < answers && record_type == 6 && record_class == 1 {
+            if data_length < 22 {
+                return Err(NetworkAnalysisError::InvalidProtocolResponse);
+            }
+            soa_records = soa_records.saturating_add(1);
+        }
+        if record == 0 && answers > 0 {
+            first_answer_soa = record_type == 6 && record_class == 1;
+        }
+        if record.saturating_add(1) == answers {
+            last_answer_soa = record_type == 6 && record_class == 1;
+        }
+        cursor = data_end;
+    }
+    if cursor != message.len() {
+        return Err(NetworkAnalysisError::InvalidProtocolResponse);
+    }
+    Ok(AxfrMessage {
+        response_code: (flags & 0x0f) as u8,
+        answer_records: answers,
+        soa_records,
+        first_answer_soa,
+        last_answer_soa,
+    })
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, NetworkAnalysisError> {
+    let value = bytes
+        .get(offset..offset.saturating_add(2))
+        .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+    Ok(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn skip_dns_name(bytes: &[u8], mut cursor: usize) -> Result<usize, NetworkAnalysisError> {
+    for _ in 0..128 {
+        let length = *bytes
+            .get(cursor)
+            .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+        if length & 0xc0 == 0xc0 {
+            let pointer = bytes
+                .get(cursor..cursor.saturating_add(2))
+                .ok_or(NetworkAnalysisError::TruncatedResponse)?;
+            let offset = (usize::from(pointer[0] & 0x3f) << 8) | usize::from(pointer[1]);
+            if offset >= bytes.len() {
+                return Err(NetworkAnalysisError::InvalidProtocolResponse);
+            }
+            return Ok(cursor.saturating_add(2));
+        }
+        if length & 0xc0 != 0 || length > 63 {
+            return Err(NetworkAnalysisError::InvalidProtocolResponse);
+        }
+        cursor = cursor.saturating_add(1);
+        if length == 0 {
+            return Ok(cursor);
+        }
+        cursor = cursor
+            .checked_add(usize::from(length))
+            .ok_or(NetworkAnalysisError::ResponseTooLarge)?;
+        if cursor > bytes.len() {
+            return Err(NetworkAnalysisError::TruncatedResponse);
+        }
+    }
+    Err(NetworkAnalysisError::InvalidProtocolResponse)
 }
 
 fn classification_finding(classification: &UdpClassification, evidence: usize) -> Option<Finding> {

@@ -264,6 +264,38 @@ pub(crate) fn ttl_finding(records: &[DnsRecord], evidence: usize) -> Option<Find
         })
 }
 
+/// Summarizes whether every planned DNS SLA sample produced a response.
+///
+/// Individual sample latency remains in bounded evidence observations. The
+/// finding references every successful sample without claiming a latency
+/// threshold that the public scanner contract does not define.
+pub(crate) fn dns_sla_availability_finding(
+    successful_samples: usize,
+    attempted_samples: usize,
+) -> Finding {
+    let complete = successful_samples == attempted_samples;
+    let (key, title, severity) = if complete {
+        (
+            "dns-sla-availability-observed",
+            "Every bounded DNS SLA sample returned a response",
+            Severity::Info,
+        )
+    } else {
+        (
+            "dns-sla-availability-degraded",
+            "At least one bounded DNS SLA sample did not return a response",
+            Severity::Medium,
+        )
+    };
+    Finding {
+        key: key.into(),
+        title: title.into(),
+        severity,
+        confidence: Confidence::Confirmed,
+        evidence: (0..successful_samples).collect(),
+    }
+}
+
 /// Reports a generated typo candidate only when that exact candidate resolves.
 pub(crate) fn typosquat_resolution_finding(
     original: &str,
@@ -310,6 +342,7 @@ pub(crate) fn scanner_findings(
     };
     let records_for_owner = records.iter().filter(usable).collect::<Vec<_>>();
     match scanner_id {
+        "cdn-detection" => cdn_dns_findings(&records_for_owner, evidence),
         "dns-caa-checker" => type_presence_findings(
             &records_for_owner,
             DnsRecordType::Caa,
@@ -329,6 +362,7 @@ pub(crate) fn scanner_findings(
             evidence,
         ),
         "domain-info" => domain_info_findings(&records_for_owner, evidence),
+        "geo-dns-footprint" => geo_dns_findings(&records_for_owner, evidence),
         "reverse-dns-scan" => type_presence_findings(
             &records_for_owner,
             DnsRecordType::Ptr,
@@ -339,9 +373,7 @@ pub(crate) fn scanner_findings(
             Severity::Info,
             evidence,
         ),
-        "decoy-dns-beacon" | "rogue-subdomain-resolver"
-            if query_name.starts_with("_sugra-scope-probe.") =>
-        {
+        "rogue-subdomain-resolver" if query_name.starts_with("_sugra-scope-probe.") => {
             let resolves = records_for_owner
                 .iter()
                 .any(|record| is_usable_resolution_answer(record));
@@ -350,6 +382,23 @@ pub(crate) fn scanner_findings(
                     finding(
                         "unexpected-probe-answer",
                         "A deterministic nonexistent-label probe returned DNS data",
+                        Severity::Low,
+                        Confidence::Inferred,
+                        evidence,
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
+        "decoy-dns-beacon" if query_name.starts_with("_sugra-decoy-beacon.") => {
+            let resolves = records_for_owner
+                .iter()
+                .any(|record| is_usable_resolution_answer(record));
+            resolves
+                .then(|| {
+                    finding(
+                        "decoy-probe-answer-observed",
+                        "A deterministic decoy-label probe returned DNS resolution data",
                         Severity::Low,
                         Confidence::Inferred,
                         evidence,
@@ -372,6 +421,40 @@ pub(crate) fn scanner_findings(
         "subdomain-takeover" => takeover_findings(&records_for_owner, evidence),
         _ => Vec::new(),
     }
+}
+
+fn cdn_dns_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
+    const CDN_SUFFIXES: &[&str] = &[
+        "akamai.net",
+        "akamaiedge.net",
+        "cloudflare.net",
+        "cloudfront.net",
+        "edgesuite.net",
+        "fastly.net",
+        "fastlylb.net",
+        "azureedge.net",
+        "azurefd.net",
+    ];
+    let observed = records.iter().any(|record| {
+        matches!(record.record_type, DnsRecordType::Cname | DnsRecordType::Ns) && {
+            let value = canonical_name(&record.value);
+            CDN_SUFFIXES
+                .iter()
+                .any(|suffix| value == *suffix || value.ends_with(&format!(".{suffix}")))
+        }
+    });
+    observed
+        .then(|| {
+            finding(
+                "cdn-dns-signal-observed",
+                "A public DNS alias indicates a known delivery network",
+                Severity::Info,
+                Confidence::Inferred,
+                evidence,
+            )
+        })
+        .into_iter()
+        .collect()
 }
 
 fn any_presence_findings(
@@ -472,6 +555,28 @@ fn domain_info_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding>
     findings
 }
 
+fn geo_dns_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
+    let observed = records.iter().any(|record| is_usable_geo_endpoint(record));
+    let (key, title) = if observed {
+        (
+            "geo-dns-footprint-observed",
+            "DNS endpoints suitable for downstream geographic enrichment were observed",
+        )
+    } else {
+        (
+            "geo-dns-footprint-not-observed",
+            "No DNS endpoint suitable for downstream geographic enrichment was observed",
+        )
+    };
+    vec![finding(
+        key,
+        title,
+        Severity::Info,
+        Confidence::Confirmed,
+        evidence,
+    )]
+}
+
 fn spf_network_findings(records: &[&DnsRecord], evidence: usize) -> Vec<Finding> {
     let policies = records
         .iter()
@@ -526,6 +631,16 @@ fn is_usable_resolution_answer(record: &DnsRecord) -> bool {
         DnsRecordType::A => value.parse::<Ipv4Addr>().is_ok(),
         DnsRecordType::Aaaa => value.parse::<Ipv6Addr>().is_ok(),
         DnsRecordType::Cname => is_valid_dns_name(value),
+        _ => false,
+    }
+}
+
+fn is_usable_geo_endpoint(record: &DnsRecord) -> bool {
+    let value = record.value.trim().trim_end_matches('.');
+    match record.record_type {
+        DnsRecordType::A => value.parse::<Ipv4Addr>().is_ok(),
+        DnsRecordType::Aaaa => value.parse::<Ipv6Addr>().is_ok(),
+        DnsRecordType::Ns => is_valid_dns_name(value),
         _ => false,
     }
 }
@@ -942,6 +1057,40 @@ mod tests {
     }
 
     #[test]
+    fn cdn_detection_requires_an_exact_known_dns_suffix() {
+        let cloudfront = [record(
+            "example.com",
+            DnsRecordType::Cname,
+            "distribution.cloudfront.net.",
+            None,
+        )];
+        assert_eq!(
+            keys(&scanner_findings(
+                "cdn-detection",
+                "example.com",
+                &cloudfront,
+                4,
+            )),
+            vec!["cdn-dns-signal-observed"]
+        );
+
+        let deceptive = [record(
+            "example.com",
+            DnsRecordType::Cname,
+            "cloudfront.net.attacker.example",
+            None,
+        )];
+        assert!(scanner_findings("cdn-detection", "example.com", &deceptive, 4).is_empty());
+        let wrong_owner = [record(
+            "other.example",
+            DnsRecordType::Cname,
+            "distribution.cloudfront.net",
+            None,
+        )];
+        assert!(scanner_findings("cdn-detection", "example.com", &wrong_owner, 4).is_empty());
+    }
+
+    #[test]
     fn record_collectors_distinguish_usable_missing_and_wrong_type_answers() {
         for (id, record_type, observed_key, missing_key) in [
             (
@@ -1060,7 +1209,7 @@ mod tests {
 
     #[test]
     fn decoy_beacon_requires_exact_owner_resolution_type_and_value() {
-        let probe = "_sugra-scope-probe.example.com";
+        let probe = "_sugra-decoy-beacon.example.com";
         for answer in [
             record(probe, DnsRecordType::A, "192.0.2.20", None),
             record(probe, DnsRecordType::Aaaa, "2001:db8::20", None),
@@ -1068,7 +1217,7 @@ mod tests {
         ] {
             assert_eq!(
                 keys(&scanner_findings("decoy-dns-beacon", probe, &[answer], 7)),
-                vec!["unexpected-probe-answer"]
+                vec!["decoy-probe-answer-observed"]
             );
         }
 

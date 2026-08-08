@@ -1,6 +1,7 @@
 //! Pure, bounded projections of third-party provider responses.
 
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -119,6 +120,123 @@ pub(crate) enum ProviderSummary {
         /// Routes without a recognized validity status.
         unknown_routes: usize,
     },
+    /// Autonomous-system neighbours reduced to directional, de-duplicated counts.
+    AutonomousNeighborPeeringMap {
+        /// Valid bounded neighbour records.
+        records: usize,
+        /// Distinct neighbouring autonomous systems.
+        unique_autonomous_systems: usize,
+        /// Neighbours observed to the left of the queried ASN.
+        left_neighbors: usize,
+        /// Neighbours observed to the right of the queried ASN.
+        right_neighbors: usize,
+        /// Neighbours whose direction could not be established.
+        uncertain_neighbors: usize,
+    },
+    /// Historical registry objects reduced to bounded change counts.
+    IpAllocationHistory {
+        /// Historical object versions reported by the provider.
+        versions: usize,
+        /// Objects in the selected version.
+        objects: usize,
+        /// Objects referenced by the selected object.
+        referencing_objects: usize,
+        /// Objects that reference the selected object.
+        referenced_objects: usize,
+        /// Alternative registry objects suggested by the provider.
+        suggestions: usize,
+        /// Distinct safe object-type labels.
+        unique_object_types: usize,
+    },
+    /// Network identity without retaining the address, prefix, or ASN values.
+    IpNetworkInfo {
+        /// Whether the provider returned a containing prefix.
+        prefix_present: bool,
+        /// Distinct announcing autonomous systems.
+        autonomous_systems: usize,
+    },
+    /// IP location and network attributes without retaining raw provider values.
+    IpLocationInfo {
+        /// Whether a city was returned.
+        city_present: bool,
+        /// Whether a region was returned.
+        region_present: bool,
+        /// Whether a country was returned.
+        country_present: bool,
+        /// Whether a timezone was returned.
+        timezone_present: bool,
+        /// Whether a valid coordinate pair was returned.
+        coordinates_present: bool,
+        /// Whether an autonomous-system identity was returned.
+        autonomous_system_present: bool,
+    },
+    /// Public timezone metadata reduced to field presence.
+    NetworkTimezone {
+        /// Whether a timezone was returned.
+        timezone_present: bool,
+        /// Whether a country was returned.
+        country_present: bool,
+        /// Whether a valid coordinate pair was returned.
+        coordinates_present: bool,
+    },
+    /// DNS-chain topology counts; no unsupported geo/ASN enrichment is inferred.
+    NameserverDiversity {
+        /// Distinct forward-chain owners.
+        forward_nodes: usize,
+        /// Distinct reverse-chain owners.
+        reverse_nodes: usize,
+        /// Distinct recursive resolver addresses.
+        resolver_nameservers: usize,
+        /// Distinct authoritative nameserver addresses.
+        authoritative_nameservers: usize,
+        /// Distinct bounded targets across forward and reverse chains.
+        unique_chain_targets: usize,
+        /// Nameserver addresses with at least one successful enrichment.
+        enriched_nameservers: usize,
+        /// Distinct countries observed across location enrichments.
+        unique_countries: usize,
+        /// Distinct autonomous systems observed across network enrichments.
+        unique_autonomous_systems: usize,
+    },
+    /// Public server location metadata reduced to field presence.
+    ServerLocation {
+        /// Whether a city was returned.
+        city_present: bool,
+        /// Whether a region was returned.
+        region_present: bool,
+        /// Whether a country was returned.
+        country_present: bool,
+        /// Whether a valid coordinate pair was returned.
+        coordinates_present: bool,
+    },
+    /// Certificate-transparency authority counts for CA reconnaissance.
+    CertificateAuthorityRecon {
+        /// Valid bounded certificate records.
+        records: usize,
+        /// Distinct certificate authorities.
+        unique_authorities: usize,
+        /// Distinct certificate DNS names.
+        unique_names: usize,
+        /// Distinct wildcard DNS names.
+        wildcard_names: usize,
+    },
+    /// Internet Routing Registry data reduced to route-object counts.
+    IrrRoutingRegistry {
+        /// Non-IRR whois records returned alongside the result.
+        records: usize,
+        /// Valid bounded IRR records.
+        irr_records: usize,
+        /// Distinct registry authorities queried.
+        authorities: usize,
+        /// IPv4 route objects.
+        route_objects: usize,
+        /// IPv6 route objects.
+        route6_objects: usize,
+        /// Distinct route origins.
+        unique_origins: usize,
+        /// Distinct IRR source registries.
+        unique_sources: usize,
+    },
     /// `PageSpeed` metrics reduced to bounded numeric values.
     PageSpeed {
         /// Lighthouse performance score from 0 through 100.
@@ -170,6 +288,15 @@ pub(crate) struct ProviderFinding {
     pub(crate) confidence: Confidence,
 }
 
+/// Bounded real-provider enrichment for one authoritative nameserver address.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NameserverEnrichment {
+    /// `RIPEstat` network-info response, when available.
+    pub(crate) network_info: Option<Value>,
+    /// `IPinfo` lookup response, when available.
+    pub(crate) location: Option<Value>,
+}
+
 /// Analyzes a supported provider response without retaining raw records.
 #[must_use]
 pub(crate) fn analyze_provider_response(
@@ -184,11 +311,22 @@ pub(crate) fn analyze_provider_response(
             Some(analyze_rdap(scanner_id, response))
         }
         "shodan" if scanner_id == "associated-hosts" => Some(analyze_shodan_host(response)),
+        "crtsh" if scanner_id == "certificate-authority-recon" => {
+            Some(analyze_certificate_authorities(response))
+        }
         "crtsh" => Some(analyze_certificate_transparency(
             scanner_id, response, baseline,
         )),
         "urlscan" => Some(analyze_urlscan(scanner_id, response)),
         "ripestat" => Some(analyze_ripestat(scanner_id, response)),
+        "ipinfo"
+            if matches!(
+                scanner_id,
+                "ip-info" | "network-timezone-detection" | "server-location"
+            ) =>
+        {
+            Some(analyze_ipinfo(scanner_id, response))
+        }
         "pagespeed" => Some(analyze_pagespeed(scanner_id, response)),
         "cloudflare-doh" | "google-doh" => Some(analyze_doh(response)),
         "virustotal" | "abuseipdb" | "urlhaus" | "otx" => {
@@ -541,6 +679,16 @@ fn analyze_doh(response: &Value) -> ProviderAnalysis {
 }
 
 fn analyze_ripestat(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    match scanner_id {
+        "autonomous-neighbor-peering-map" => return analyze_autonomous_neighbors(response),
+        "ip-allocation-history-tracker" => return analyze_allocation_history(response),
+        "ip-info" => return analyze_network_info(response),
+        "ns-geo-asn-diversity-analyzer" => {
+            return analyze_nameserver_diversity(response, &[]);
+        }
+        "irr-routing-registry-analyzer" => return analyze_irr_registry(response),
+        _ => {}
+    }
     let data = response.get("data").unwrap_or(response);
     let prefixes = array_len(data, &["prefixes", "announced_space"]);
     let origins = array_len(data, &["asns", "origins"]);
@@ -595,6 +743,383 @@ fn analyze_ripestat(scanner_id: &str, response: &Value) -> ProviderAnalysis {
         },
         findings,
     }
+}
+
+fn analyze_autonomous_neighbors(response: &Value) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let mut autonomous_systems = BTreeSet::new();
+    let mut records = 0_usize;
+    let mut left_neighbors = 0_usize;
+    let mut right_neighbors = 0_usize;
+    let mut uncertain_neighbors = 0_usize;
+    for neighbor in data
+        .get("neighbours")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(asn) = neighbor.get("asn").and_then(json_scalar_key) else {
+            continue;
+        };
+        let Some(position) = neighbor
+            .get("position")
+            .or_else(|| neighbor.get("type"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        records += 1;
+        autonomous_systems.insert(asn);
+        if position.eq_ignore_ascii_case("left") {
+            left_neighbors += 1;
+        } else if position.eq_ignore_ascii_case("right") {
+            right_neighbors += 1;
+        } else {
+            uncertain_neighbors += 1;
+        }
+    }
+    let findings = (records > 0)
+        .then_some(ProviderFinding {
+            key: "autonomous-neighbors-observed",
+            title: "The routing provider returned autonomous-system neighbours",
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        })
+        .into_iter()
+        .collect();
+    ProviderAnalysis {
+        summary: ProviderSummary::AutonomousNeighborPeeringMap {
+            records,
+            unique_autonomous_systems: autonomous_systems.len(),
+            left_neighbors,
+            right_neighbors,
+            uncertain_neighbors,
+        },
+        findings,
+    }
+}
+
+fn json_scalar_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.to_ascii_uppercase()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn analyze_allocation_history(response: &Value) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let versions = data
+        .get("num_versions")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_else(|| bounded_array_len(data.get("versions")))
+        .min(MAX_PROVIDER_RECORDS);
+    let objects = bounded_array_len(data.get("objects"));
+    let referencing_objects = bounded_array_len(data.get("referencing"));
+    let referenced_objects = bounded_array_len(data.get("referenced_by"));
+    let suggestions = bounded_array_len(data.get("suggestions"));
+    let mut object_types = BTreeSet::new();
+    for key in ["objects", "referencing", "referenced_by", "suggestions"] {
+        for object in data
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(MAX_PROVIDER_RECORDS)
+        {
+            if let Some(object_type) = object
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                object_types.insert(object_type.to_ascii_lowercase());
+            }
+        }
+    }
+    let observed = versions + objects + referencing_objects + referenced_objects > 0;
+    ProviderAnalysis {
+        summary: ProviderSummary::IpAllocationHistory {
+            versions,
+            objects,
+            referencing_objects,
+            referenced_objects,
+            suggestions,
+            unique_object_types: object_types.len().min(MAX_PROVIDER_RECORDS),
+        },
+        findings: info_finding(
+            observed,
+            "allocation-history-observed",
+            "The registry provider returned historical allocation objects",
+        ),
+    }
+}
+
+fn analyze_network_info(response: &Value) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let prefix_present = data
+        .get("prefix")
+        .and_then(Value::as_str)
+        .is_some_and(|prefix| !prefix.trim().is_empty());
+    let autonomous_systems = distinct_array_values(data.get("asns"));
+    ProviderAnalysis {
+        summary: ProviderSummary::IpNetworkInfo {
+            prefix_present,
+            autonomous_systems,
+        },
+        findings: info_finding(
+            prefix_present || autonomous_systems > 0,
+            "network-information-observed",
+            "The routing provider returned public network information",
+        ),
+    }
+}
+
+pub(crate) fn analyze_nameserver_diversity(
+    response: &Value,
+    enrichments: &[NameserverEnrichment],
+) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let forward_nodes = bounded_object_len(data.get("forward_nodes"));
+    let reverse_nodes = bounded_object_len(data.get("reverse_nodes"));
+    let resolver_nameservers = distinct_array_values(data.get("nameservers"));
+    let authoritative_nameservers = distinct_array_values(data.get("authoritative_nameservers"));
+    let mut chain_targets = BTreeSet::new();
+    for key in ["forward_nodes", "reverse_nodes"] {
+        for values in data
+            .get(key)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|nodes| nodes.values())
+            .filter_map(Value::as_array)
+        {
+            for value in values.iter().take(MAX_PROVIDER_RECORDS) {
+                if let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) {
+                    chain_targets.insert(value.to_ascii_lowercase());
+                    if chain_targets.len() == MAX_PROVIDER_RECORDS {
+                        break;
+                    }
+                }
+            }
+            if chain_targets.len() == MAX_PROVIDER_RECORDS {
+                break;
+            }
+        }
+    }
+    let mut countries = BTreeSet::new();
+    let mut autonomous_systems = BTreeSet::new();
+    let mut enriched_nameservers = 0_usize;
+    for enrichment in enrichments.iter().take(MAX_PROVIDER_RECORDS) {
+        enriched_nameservers +=
+            usize::from(enrichment.network_info.is_some() || enrichment.location.is_some());
+        if let Some(network) = enrichment.network_info.as_ref() {
+            let data = network.get("data").unwrap_or(network);
+            collect_array_values(data.get("asns"), &mut autonomous_systems);
+        }
+        if let Some(location) = enrichment.location.as_ref() {
+            let geo = location.get("geo").unwrap_or(location);
+            if let Some(country) = geo
+                .get("country_code")
+                .or_else(|| geo.get("country"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                countries.insert(country.to_ascii_uppercase());
+            }
+            if let Some(asn) = location
+                .pointer("/as/asn")
+                .or_else(|| location.get("asn"))
+                .and_then(json_scalar_key)
+            {
+                autonomous_systems.insert(asn);
+            }
+        }
+    }
+    let actual_diversity = countries.len() >= 2 || autonomous_systems.len() >= 2;
+    ProviderAnalysis {
+        summary: ProviderSummary::NameserverDiversity {
+            forward_nodes,
+            reverse_nodes,
+            resolver_nameservers,
+            authoritative_nameservers,
+            unique_chain_targets: chain_targets.len(),
+            enriched_nameservers,
+            unique_countries: countries.len(),
+            unique_autonomous_systems: autonomous_systems.len(),
+        },
+        findings: info_finding(
+            authoritative_nameservers >= 2 && actual_diversity,
+            "nameserver-diversity-observed",
+            "Authoritative nameservers span multiple countries or autonomous systems",
+        ),
+    }
+}
+
+/// Extracts distinct authoritative nameserver IPs for bounded real enrichment.
+#[must_use]
+pub(crate) fn authoritative_nameserver_addresses(response: &Value) -> Vec<String> {
+    let data = response.get("data").unwrap_or(response);
+    let forward_nodes = data.get("forward_nodes").and_then(Value::as_object);
+    let mut addresses = BTreeSet::new();
+    for value in data
+        .get("authoritative_nameservers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter_map(Value::as_str)
+    {
+        if let Ok(address) = value.parse::<IpAddr>() {
+            addresses.insert(address.to_string());
+            continue;
+        }
+        let normalized = value.trim_end_matches('.');
+        let resolved = forward_nodes.into_iter().filter_map(|nodes| {
+            nodes
+                .iter()
+                .find(|(name, _)| name.trim_end_matches('.').eq_ignore_ascii_case(normalized))
+                .map(|(_, values)| values)
+        });
+        for address in resolved
+            .filter_map(Value::as_array)
+            .flat_map(|values| values.iter())
+            .take(MAX_PROVIDER_RECORDS)
+            .filter_map(Value::as_str)
+            .filter_map(|address| address.parse::<IpAddr>().ok())
+        {
+            addresses.insert(address.to_string());
+        }
+    }
+    addresses.into_iter().collect()
+}
+
+/// Extracts distinct address answers from a DNS chain for bounded domain enrichment.
+#[must_use]
+pub(crate) fn dns_chain_addresses(response: &Value) -> Vec<String> {
+    let data = response.get("data").unwrap_or(response);
+    data.get("forward_nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+        .filter_map(Value::as_array)
+        .flat_map(|values| values.iter())
+        .take(MAX_PROVIDER_RECORDS)
+        .filter_map(Value::as_str)
+        .filter_map(|value| value.parse::<IpAddr>().ok())
+        .map(|address| address.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn analyze_irr_registry(response: &Value) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let records = bounded_array_len(data.get("records"));
+    let authorities = distinct_array_values(data.get("authorities"));
+    let mut irr_records = 0_usize;
+    let mut ipv4_route_objects = 0_usize;
+    let mut ipv6_route_objects = 0_usize;
+    let mut origins = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+    for record in data
+        .get("irr_records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(entries) = record.as_array() else {
+            continue;
+        };
+        irr_records += 1;
+        let mut has_route = false;
+        let mut has_route6 = false;
+        for entry in entries.iter().take(1_000) {
+            let Some(key) = entry.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let value = entry.get("value").and_then(Value::as_str);
+            if key.eq_ignore_ascii_case("route") {
+                has_route = true;
+            } else if key.eq_ignore_ascii_case("route6") {
+                has_route6 = true;
+            } else if key.eq_ignore_ascii_case("origin") {
+                if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                    origins.insert(value.to_ascii_uppercase());
+                }
+            } else if key.eq_ignore_ascii_case("source")
+                && let Some(value) = value.filter(|value| !value.trim().is_empty())
+            {
+                sources.insert(value.to_ascii_uppercase());
+            }
+        }
+        ipv4_route_objects += usize::from(has_route);
+        ipv6_route_objects += usize::from(has_route6);
+    }
+    ProviderAnalysis {
+        summary: ProviderSummary::IrrRoutingRegistry {
+            records,
+            irr_records,
+            authorities,
+            route_objects: ipv4_route_objects,
+            route6_objects: ipv6_route_objects,
+            unique_origins: origins.len(),
+            unique_sources: sources.len(),
+        },
+        findings: info_finding(
+            ipv4_route_objects + ipv6_route_objects > 0,
+            "irr-route-objects-observed",
+            "The routing registry provider returned route objects",
+        ),
+    }
+}
+
+fn bounded_array_len(value: Option<&Value>) -> usize {
+    value
+        .and_then(Value::as_array)
+        .map_or(0, |values| values.len().min(MAX_PROVIDER_RECORDS))
+}
+
+fn bounded_object_len(value: Option<&Value>) -> usize {
+    value
+        .and_then(Value::as_object)
+        .map_or(0, |values| values.len().min(MAX_PROVIDER_RECORDS))
+}
+
+fn distinct_array_values(value: Option<&Value>) -> usize {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter_map(json_scalar_key)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn collect_array_values(value: Option<&Value>, destination: &mut BTreeSet<String>) {
+    for value in value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter_map(json_scalar_key)
+    {
+        destination.insert(value);
+    }
+}
+
+fn info_finding(observed: bool, key: &'static str, title: &'static str) -> Vec<ProviderFinding> {
+    observed
+        .then_some(ProviderFinding {
+            key,
+            title,
+            severity: Severity::Info,
+            confidence: Confidence::Confirmed,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn array_len(data: &Value, keys: &[&str]) -> usize {
@@ -876,6 +1401,157 @@ fn analyze_certificate_transparency(
         },
         findings,
     }
+}
+
+fn analyze_certificate_authorities(response: &Value) -> ProviderAnalysis {
+    let mut names = BTreeSet::new();
+    let mut authorities = BTreeSet::new();
+    let mut records = 0_usize;
+    for record in response
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(issuer) = record
+            .get("issuer_name")
+            .and_then(Value::as_str)
+            .filter(|issuer| !issuer.trim().is_empty())
+        else {
+            continue;
+        };
+        records += 1;
+        authorities.insert(issuer.to_ascii_lowercase());
+        if let Some(values) = record.get("name_value").and_then(Value::as_str) {
+            names.extend(
+                values
+                    .lines()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .take(1_000)
+                    .map(str::to_ascii_lowercase),
+            );
+        }
+    }
+    ProviderAnalysis {
+        summary: ProviderSummary::CertificateAuthorityRecon {
+            records,
+            unique_authorities: authorities.len(),
+            unique_names: names.len().min(MAX_PROVIDER_RECORDS),
+            wildcard_names: names.iter().filter(|name| name.starts_with("*.")).count(),
+        },
+        findings: info_finding(
+            !authorities.is_empty(),
+            "certificate-authority-observed",
+            "Certificate transparency returned certificate authority observations",
+        ),
+    }
+}
+
+fn analyze_ipinfo(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    let geo = response.get("geo").unwrap_or(response);
+    let present = |keys: &[&str]| {
+        keys.iter().any(|key| {
+            geo.get(key)
+                .or_else(|| response.get(key))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    };
+    let coordinates_present = valid_coordinates(geo) || valid_coordinates(response);
+    if scanner_id == "ip-info" {
+        let city_present = present(&["city"]);
+        let region_present = present(&["region", "region_code"]);
+        let country_present = present(&["country", "country_code"]);
+        let timezone_present = present(&["timezone"]);
+        let autonomous_system_present = response
+            .pointer("/as/asn")
+            .or_else(|| response.get("asn"))
+            .and_then(json_scalar_key)
+            .is_some();
+        return ProviderAnalysis {
+            summary: ProviderSummary::IpLocationInfo {
+                city_present,
+                region_present,
+                country_present,
+                timezone_present,
+                coordinates_present,
+                autonomous_system_present,
+            },
+            findings: info_finding(
+                city_present
+                    || region_present
+                    || country_present
+                    || timezone_present
+                    || coordinates_present
+                    || autonomous_system_present,
+                "ip-location-observed",
+                "The location provider returned public address metadata",
+            ),
+        };
+    }
+    if scanner_id == "network-timezone-detection" {
+        let timezone_present = present(&["timezone"]);
+        let country_present = present(&["country", "country_code"]);
+        return ProviderAnalysis {
+            summary: ProviderSummary::NetworkTimezone {
+                timezone_present,
+                country_present,
+                coordinates_present,
+            },
+            findings: info_finding(
+                timezone_present,
+                "network-timezone-observed",
+                "The location provider returned timezone metadata",
+            ),
+        };
+    }
+    let city_present = present(&["city"]);
+    let region_present = present(&["region", "region_code"]);
+    let country_present = present(&["country", "country_code"]);
+    ProviderAnalysis {
+        summary: ProviderSummary::ServerLocation {
+            city_present,
+            region_present,
+            country_present,
+            coordinates_present,
+        },
+        findings: info_finding(
+            city_present || region_present || country_present || coordinates_present,
+            "server-location-observed",
+            "The location provider returned public server location metadata",
+        ),
+    }
+}
+
+fn valid_coordinates(value: &Value) -> bool {
+    let numeric = value
+        .get("latitude")
+        .and_then(Value::as_f64)
+        .zip(value.get("longitude").and_then(Value::as_f64))
+        .is_some_and(|(latitude, longitude)| {
+            latitude.is_finite()
+                && longitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && (-180.0..=180.0).contains(&longitude)
+        });
+    numeric
+        || value
+            .get("loc")
+            .and_then(Value::as_str)
+            .and_then(|coordinates| coordinates.split_once(','))
+            .and_then(|(latitude, longitude)| {
+                latitude
+                    .parse::<f64>()
+                    .ok()
+                    .zip(longitude.parse::<f64>().ok())
+            })
+            .is_some_and(|(latitude, longitude)| {
+                latitude.is_finite()
+                    && longitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && (-180.0..=180.0).contains(&longitude)
+            })
 }
 
 fn is_concrete_hostname(name: &str) -> bool {

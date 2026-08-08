@@ -29,6 +29,8 @@ pub(crate) enum ProviderName {
     AbuseIpDb,
     /// Google `PageSpeed` Insights.
     PageSpeed,
+    /// `IPinfo` public network and geolocation metadata.
+    IpInfo,
 }
 
 impl ProviderName {
@@ -46,6 +48,7 @@ impl ProviderName {
             Self::UrlHaus => "urlhaus",
             Self::AbuseIpDb => "abuseipdb",
             Self::PageSpeed => "pagespeed",
+            Self::IpInfo => "ipinfo",
         }
     }
 }
@@ -187,13 +190,20 @@ pub(crate) fn plan_for(
     let providers = match scanner_id {
         "associated-hosts" => selected_sources(&options.sources, target_kind)?,
         "asn-lookup" => selected_registry_providers(options.provider.as_deref(), target_kind)?,
-        "archive-history" => vec![ProviderName::Wayback],
-        "ct-log-query" => vec![ProviderName::CrtSh],
-        "domain-shadowing-detector" => vec![ProviderName::CrtSh, ProviderName::UrlScan],
         "ip-reputation-trending" if target_kind == TargetKind::Ip => {
             vec![ProviderName::RipeStat, ProviderName::AbuseIpDb]
         }
-        "ip-reputation-trending" => vec![ProviderName::RipeStat],
+        "autonomous-neighbor-peering-map"
+        | "ip-allocation-history-tracker"
+        | "ns-geo-asn-diversity-analyzer"
+        | "irr-routing-registry-analyzer"
+        | "ip-reputation-trending" => vec![ProviderName::RipeStat],
+        "ip-info" if target_kind == TargetKind::Domain => vec![ProviderName::RipeStat],
+        "ip-info" => vec![ProviderName::RipeStat, ProviderName::IpInfo],
+        "archive-history" => vec![ProviderName::Wayback],
+        "ct-log-query" | "certificate-authority-recon" => vec![ProviderName::CrtSh],
+        "network-timezone-detection" | "server-location" => vec![ProviderName::IpInfo],
+        "domain-shadowing-detector" => vec![ProviderName::CrtSh, ProviderName::UrlScan],
         "domain-reputation-check" => vec![
             ProviderName::VirusTotal,
             ProviderName::UrlScan,
@@ -276,12 +286,55 @@ fn selected_registry_providers(
     }
 }
 
+#[allow(clippy::match_same_arms)]
 fn operation_for(
     scanner_id: &str,
     provider: ProviderName,
     target_kind: TargetKind,
 ) -> Result<&'static str, ProviderPlanError> {
     let operation = match (scanner_id, provider, target_kind) {
+        ("autonomous-neighbor-peering-map", ProviderName::RipeStat, TargetKind::Asn) => {
+            "asn-neighbours"
+        }
+        (
+            "ip-allocation-history-tracker",
+            ProviderName::RipeStat,
+            TargetKind::Cidr | TargetKind::Asn,
+        ) => "historical-whois",
+        ("ip-info", ProviderName::RipeStat, TargetKind::Ip) => "network-info",
+        ("ip-info", ProviderName::RipeStat, TargetKind::Domain) => "dns-chain",
+        ("ip-info", ProviderName::IpInfo, TargetKind::Ip) => "lookup",
+        ("ns-geo-asn-diversity-analyzer", ProviderName::RipeStat, TargetKind::Domain) => {
+            "dns-chain"
+        }
+        ("certificate-authority-recon", ProviderName::CrtSh, TargetKind::Domain) => "query",
+        (
+            "irr-routing-registry-analyzer",
+            ProviderName::RipeStat,
+            TargetKind::Asn | TargetKind::Ip,
+        ) => "whois",
+        (
+            "network-timezone-detection" | "server-location",
+            ProviderName::IpInfo,
+            TargetKind::Ip,
+        ) => "lookup",
+        (
+            "autonomous-neighbor-peering-map"
+            | "ip-allocation-history-tracker"
+            | "ip-info"
+            | "network-timezone-detection"
+            | "ns-geo-asn-diversity-analyzer"
+            | "server-location"
+            | "certificate-authority-recon"
+            | "irr-routing-registry-analyzer",
+            provider,
+            target_kind,
+        ) => {
+            return Err(ProviderPlanError::UnsupportedTarget {
+                provider,
+                target_kind,
+            });
+        }
         (
             "ip-reputation-trending",
             ProviderName::RipeStat,
@@ -348,6 +401,7 @@ fn validate_secrets(values: &BTreeMap<ProviderName, String>) -> Result<(), Provi
                 | ProviderName::UrlHaus
                 | ProviderName::AbuseIpDb
                 | ProviderName::PageSpeed
+                | ProviderName::IpInfo
         ) {
             return Err(ProviderPlanError::SecretNotSupported(*provider));
         }
@@ -755,6 +809,133 @@ mod tests {
             Some("PAGESPEED_API_KEY")
         );
         Ok(())
+    }
+
+    #[test]
+    fn wave_three_scanners_use_only_concrete_target_safe_operations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "autonomous-neighbor-peering-map",
+                TargetKind::Asn,
+                ProviderName::RipeStat,
+                "asn-neighbours",
+            ),
+            (
+                "ip-allocation-history-tracker",
+                TargetKind::Cidr,
+                ProviderName::RipeStat,
+                "historical-whois",
+            ),
+            (
+                "ns-geo-asn-diversity-analyzer",
+                TargetKind::Domain,
+                ProviderName::RipeStat,
+                "dns-chain",
+            ),
+            (
+                "certificate-authority-recon",
+                TargetKind::Domain,
+                ProviderName::CrtSh,
+                "query",
+            ),
+            (
+                "irr-routing-registry-analyzer",
+                TargetKind::Asn,
+                ProviderName::RipeStat,
+                "whois",
+            ),
+        ];
+        for (scanner_id, target_kind, provider, operation) in cases {
+            let plan = plan_for(scanner_id, target_kind, &ProviderPlanOptions::default())?
+                .ok_or("wave-three provider plan is missing")?;
+            assert_eq!(plan.probes.len(), 1, "{scanner_id}");
+            assert_eq!(plan.probes[0].provider, provider, "{scanner_id}");
+            assert_eq!(plan.probes[0].operation, operation, "{scanner_id}");
+        }
+
+        let ip_info = plan_for(
+            "ip-info",
+            TargetKind::Ip,
+            &ProviderPlanOptions {
+                secret_refs: BTreeMap::from([(ProviderName::IpInfo, "IPINFO_API_KEY".into())]),
+                ..ProviderPlanOptions::default()
+            },
+        )?
+        .ok_or("IP info provider plan is missing")?;
+        assert_eq!(
+            ip_info
+                .probes
+                .iter()
+                .map(|probe| (probe.provider, probe.operation, probe.secret_env.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ProviderName::RipeStat, "network-info", None),
+                (ProviderName::IpInfo, "lookup", Some("IPINFO_API_KEY")),
+            ]
+        );
+        let domain_ip_info = plan_for(
+            "ip-info",
+            TargetKind::Domain,
+            &ProviderPlanOptions::default(),
+        )?
+        .ok_or("domain IP info provider plan is missing")?;
+        assert_eq!(
+            domain_ip_info
+                .probes
+                .iter()
+                .map(|probe| (probe.provider, probe.operation))
+                .collect::<Vec<_>>(),
+            vec![(ProviderName::RipeStat, "dns-chain")]
+        );
+
+        let ipinfo_options = ProviderPlanOptions {
+            secret_refs: BTreeMap::from([(ProviderName::IpInfo, "IPINFO_API_KEY".into())]),
+            ..ProviderPlanOptions::default()
+        };
+        for scanner_id in ["network-timezone-detection", "server-location"] {
+            let plan = plan_for(scanner_id, TargetKind::Ip, &ipinfo_options)?
+                .ok_or("IPinfo provider plan is missing")?;
+            assert_eq!(plan.probes[0].provider, ProviderName::IpInfo);
+            assert_eq!(plan.probes[0].operation, "lookup");
+            assert_eq!(plan.probes[0].secret_env.as_deref(), Some("IPINFO_API_KEY"));
+        }
+
+        assert_eq!(
+            plan_for(
+                "autonomous-neighbor-peering-map",
+                TargetKind::Ip,
+                &ProviderPlanOptions::default(),
+            ),
+            Err(ProviderPlanError::UnsupportedTarget {
+                provider: ProviderName::RipeStat,
+                target_kind: TargetKind::Ip,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_operations_reject_unsupported_domain_targets() {
+        for (scanner_id, provider) in [
+            ("ip-allocation-history-tracker", ProviderName::RipeStat),
+            ("network-timezone-detection", ProviderName::IpInfo),
+            ("server-location", ProviderName::IpInfo),
+            ("irr-routing-registry-analyzer", ProviderName::RipeStat),
+        ] {
+            assert_eq!(
+                plan_for(
+                    scanner_id,
+                    TargetKind::Domain,
+                    &ProviderPlanOptions::default(),
+                ),
+                Err(ProviderPlanError::UnsupportedTarget {
+                    provider,
+                    target_kind: TargetKind::Domain,
+                }),
+                "{scanner_id}"
+            );
+        }
     }
 
     #[test]

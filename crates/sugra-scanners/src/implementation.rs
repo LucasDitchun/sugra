@@ -8,15 +8,15 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
     Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
     HttpMethod, HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, PortError,
-    PortErrorKind, ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner,
-    ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
+    PortErrorKind, ProviderRequest, ProviderResponse, ScanContext, ScanError, ScanErrorKind,
+    Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -27,15 +27,20 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::dns_analysis::{
-    dkim_selector_owners, dnssec_findings, dual_stack_finding, email_config_findings,
-    scanner_findings as dns_scanner_findings, summarize_dns_evidence, ttl_finding,
-    typosquat_resolution_finding,
+    dkim_selector_owners, dns_sla_availability_finding, dnssec_findings, dual_stack_finding,
+    email_config_findings, scanner_findings as dns_scanner_findings, summarize_dns_evidence,
+    ttl_finding, typosquat_resolution_finding,
 };
 use crate::network_analysis::{
-    NetworkAnalysisError, UdpProbe, analyze_udp_response as analyze_protocol_udp_response,
-    ipv6_reachability_finding, udp_payload as protocol_udp_payload,
+    NetworkAnalysisError, UdpProbe, analyze_dns_transfer_response,
+    analyze_udp_response as analyze_protocol_udp_response, ipv6_reachability_finding,
+    udp_payload as protocol_udp_payload,
 };
-use crate::provider_analysis::{ProviderBaseline, analyze_provider_response};
+use crate::provider_analysis::{
+    NameserverEnrichment, ProviderAnalysis, ProviderBaseline, ProviderSummary,
+    analyze_nameserver_diversity, analyze_provider_response, authoritative_nameserver_addresses,
+    dns_chain_addresses,
+};
 use crate::provider_plan::{
     self, ProviderName, ProviderPlanError, ProviderPlanOptions, ProviderWindow,
 };
@@ -139,6 +144,22 @@ impl Scanner for BuiltinScanner {
                 "request scanner ID does not match implementation",
             ));
         }
+        if !self
+            .descriptor
+            .target_kinds
+            .contains(&request.target.kind())
+        {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidInput,
+                "target kind is not supported by this scanner",
+            ));
+        }
+        request.budget.validate().map_err(|_| {
+            ScanError::new(
+                ScanErrorKind::InvalidInput,
+                "execution budget violates scanner safety bounds",
+            )
+        })?;
         if context.cancellation.is_cancelled() {
             return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
         }
@@ -151,6 +172,34 @@ fn validate_scanner_controls(
     scanner_id: &str,
     options: &BTreeMap<String, Value>,
 ) -> Result<(), ScanError> {
+    if matches!(scanner_id, "ip-range-scanner" | "open-ports")
+        && let Some(ports) = options.get("ports")
+        && ports.as_array().is_none_or(|ports| {
+            ports.is_empty()
+                || ports.iter().any(|port| {
+                    port.as_str()
+                        .and_then(|port| port.parse::<u16>().ok())
+                        .is_none_or(|port| port == 0)
+                })
+        })
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "TCP ports must be non-zero decimal values",
+        ));
+    }
+    if matches!(
+        scanner_id,
+        "ip-range-scanner" | "icmp-reachability-matrix" | "ssh-banner-key-fingerprinter"
+    ) && options
+        .get("max_hosts")
+        .is_some_and(|value| value.as_u64().is_none_or(|value| value == 0))
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "max_hosts must be a positive integer",
+        ));
+    }
     if scanner_id == "dns-over-https"
         && options
             .get("qtype")
@@ -235,7 +284,11 @@ impl BuiltinScanner {
                     combined.status = ExecutionStatus::Partial;
                     combined.diagnostics.push(Diagnostic {
                         kind: "analysis-stage-unavailable".into(),
-                        message: format!("{}: {}", analyzer.as_str(), error.message),
+                        message: format!(
+                            "{} stage unavailable ({:?})",
+                            analyzer.as_str(),
+                            error.kind
+                        ),
                     });
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -264,8 +317,8 @@ impl BuiltinScanner {
             BoundaryFamily::Provider => self.scan_providers(request, context).await,
             BoundaryFamily::Tcp => self.scan_tcp(analyzer, request, context).await,
             BoundaryFamily::Udp => self.scan_udp(analyzer, request, context).await,
-            BoundaryFamily::Command => self.scan_command(request, context).await,
-            BoundaryFamily::Local => self.scan_local(request, context),
+            BoundaryFamily::Command => self.scan_command(analyzer, request, context).await,
+            BoundaryFamily::Local => self.scan_local(analyzer, request, context),
         }
     }
 
@@ -290,6 +343,7 @@ impl BuiltinScanner {
     ) -> Result<ScanResult, ScanError> {
         let id = self.descriptor.id.as_str();
         let plan = dns_query_plan(id, &request.target, request)?;
+        let attempted_samples = plan.len().min(request.budget.max_requests);
         let mut evidence = Vec::new();
         let mut diagnostics = Vec::new();
         let mut findings = Vec::new();
@@ -352,6 +406,12 @@ impl BuiltinScanner {
                 ScanError::new(ScanErrorKind::Transport, "all DNS observations failed")
             }));
         }
+        if id == "dns-sla-latency-monitor" {
+            findings.push(dns_sla_availability_finding(
+                evidence.len(),
+                attempted_samples,
+            ));
+        }
         Ok(ScanResult {
             status: completion_status(&diagnostics),
             findings,
@@ -377,20 +437,17 @@ impl BuiltinScanner {
         let plan = plan_for(id, &base, &options, request.budget, &request.scope)
             .ok_or_else(|| ScanError::new(ScanErrorKind::Internal, "web probe plan is missing"))?;
         let limit = plan.max_pages.min(request.budget.max_requests);
-        let crawl = plan.crawl;
-        let max_depth = plan.max_depth;
-        let sample_per_million = plan.sample_per_million;
-        let delay_ms = plan.delay_ms;
-        let include_subdomains = plan.include_subdomains;
+        let (crawl, max_depth, sample_per_million) =
+            (plan.crawl, plan.max_depth, plan.sample_per_million);
+        let (delay_ms, include_subdomains) = (plan.delay_ms, plan.include_subdomains);
         let mut queue: VecDeque<(WebProbe, usize)> =
             plan.probes.into_iter().map(|probe| (probe, 0)).collect();
         let mut seen = BTreeSet::new();
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
-        let mut samples: Vec<WebSample> = Vec::new();
-        let mut attempts = 0_usize;
-
+        let mut first_error = None;
+        let (mut samples, mut attempts) = (Vec::<WebSample>::new(), 0_usize);
         while let Some((probe, depth)) = queue.pop_front() {
             if attempts >= limit || !seen.insert(probe.identity()) {
                 continue;
@@ -418,7 +475,9 @@ impl BuiltinScanner {
                 Ok(response) => {
                     let index = evidence.len();
                     let signals = web_signals(&response);
-                    findings.extend(web_response_findings(id, &response, &signals, index));
+                    if id != "content-discovery" || depth > 0 {
+                        findings.extend(web_response_findings(id, &response, &signals, index));
+                    }
                     if should_discover_links(crawl, method, depth, max_depth, &response) {
                         for url in discover_links(
                             &response.final_url,
@@ -441,20 +500,22 @@ impl BuiltinScanner {
                         observed_at: context.clock.now(),
                     });
                 }
-                Err(error) => diagnostics.push(Diagnostic {
-                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                    message: format!("{label}: {}", error.message),
-                }),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(scan_error_from_port(error.clone()));
+                    }
+                    diagnostics.push(Diagnostic {
+                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                        message: format!("HTTP probe failed: {}", error.message),
+                    });
+                }
             }
         }
         findings.extend(aggregate_web_findings(id, &samples, &options));
         if evidence.is_empty() {
-            let first = diagnostics
-                .first()
-                .map_or("HTTP observation failed", |diagnostic| {
-                    diagnostic.message.as_str()
-                });
-            return Err(ScanError::new(ScanErrorKind::Transport, first));
+            return Err(first_error.unwrap_or_else(|| {
+                ScanError::new(ScanErrorKind::Transport, "HTTP observation failed")
+            }));
         }
         Ok(ScanResult {
             status: completion_status(&diagnostics),
@@ -521,19 +582,58 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
+        let scanner_id = self.descriptor.id.as_str();
         let calls = provider_calls(
-            self.descriptor.id.as_str(),
+            scanner_id,
             &request.target,
             &request.options,
             request.budget,
         )?;
+        if scanner_id == "ip-info" && matches!(request.target, Target::Domain(_)) {
+            let Some(primary) = calls.into_iter().next() else {
+                return Err(ScanError::new(
+                    ScanErrorKind::DependencyUnavailable,
+                    "domain address discovery provider is unavailable",
+                ));
+            };
+            return self.scan_domain_ip_info(request, context, primary).await;
+        }
+        if scanner_id == "ns-geo-asn-diversity-analyzer" {
+            let Some(primary) = calls.into_iter().next() else {
+                return Err(ScanError::new(
+                    ScanErrorKind::DependencyUnavailable,
+                    "nameserver discovery provider is unavailable",
+                ));
+            };
+            return self
+                .scan_nameserver_diversity(request, context, primary)
+                .await;
+        }
+        self.scan_provider_calls(request, context, calls).await
+    }
+
+    async fn scan_provider_calls(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+        calls: Vec<ProviderCall>,
+    ) -> Result<ScanResult, ScanError> {
+        let scanner_id = self.descriptor.id.as_str();
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
-        if let Some(diagnostic) =
-            provider_temporal_gap(self.descriptor.id.as_str(), &calls, &request.options)
-        {
+        if let Some(diagnostic) = provider_temporal_gap(scanner_id, &calls, &request.options) {
             diagnostics.push(diagnostic);
+        }
+        if scanner_id == "ip-info"
+            && !(calls.iter().any(|call| call.provider == "ripestat")
+                && calls.iter().any(|call| call.provider == "ipinfo"))
+        {
+            diagnostics.push(Diagnostic {
+                kind: "provider-coverage-gap".into(),
+                message: "IP information requires both network and location provider coverage"
+                    .into(),
+            });
         }
         let expected_issuers: Vec<_> = request
             .options
@@ -544,26 +644,11 @@ impl BuiltinScanner {
             .filter_map(Value::as_str)
             .collect();
         for call in calls.into_iter().take(request.budget.max_requests) {
-            let response = self
-                .services
-                .provider
-                .query(ProviderRequest {
-                    provider: call.provider.into(),
-                    operation: call.operation.into(),
-                    query: provider_query(
-                        self.descriptor.id.as_str(),
-                        &call,
-                        &request.target,
-                        &request.options,
-                    ),
-                    secret_env: call.secret_env,
-                    budget: request.budget,
-                })
-                .await;
+            let response = self.query_provider_call(request, call).await;
             match response {
                 Ok(response) => {
                     let (observation, derived_findings) = provider_observation(
-                        self.descriptor.id.as_str(),
+                        scanner_id,
                         &response.provider,
                         response.data,
                         &expected_issuers,
@@ -606,6 +691,244 @@ impl BuiltinScanner {
         })
     }
 
+    async fn query_provider_call(
+        &self,
+        request: &ScanRequest,
+        call: ProviderCall,
+    ) -> Result<ProviderResponse, PortError> {
+        self.services
+            .provider
+            .query(ProviderRequest {
+                provider: call.provider.into(),
+                operation: call.operation.into(),
+                query: provider_query(
+                    self.descriptor.id.as_str(),
+                    &call,
+                    &request.target,
+                    &request.options,
+                ),
+                secret_env: call.secret_env,
+                budget: request.budget,
+            })
+            .await
+    }
+
+    async fn scan_nameserver_diversity(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+        primary: ProviderCall,
+    ) -> Result<ScanResult, ScanError> {
+        let response = self
+            .query_provider_call(request, primary)
+            .await
+            .map_err(|error| ScanError::new(ScanErrorKind::DependencyUnavailable, error.message))?;
+        let addresses = authoritative_nameserver_addresses(&response.data);
+        let max_nameservers = request.budget.max_requests.saturating_sub(1) / 2;
+        let (enrichments, mut diagnostics) = self
+            .enrich_nameservers(request, addresses.clone(), max_nameservers)
+            .await;
+        if addresses.len() > max_nameservers {
+            diagnostics.push(Diagnostic {
+                kind: "nameserver-enrichment-gap".into(),
+                message: "nameserver enrichment was limited by the request budget".into(),
+            });
+        }
+        let authoritative_values_present = has_authoritative_nameservers(&response.data);
+        if authoritative_values_present && addresses.is_empty() {
+            diagnostics.push(Diagnostic {
+                kind: "nameserver-enrichment-gap".into(),
+                message: "authoritative nameserver addresses could not be safely enriched".into(),
+            });
+        }
+        let analysis = analyze_nameserver_diversity(&response.data, &enrichments);
+        if authoritative_values_present && nameserver_metadata_is_empty(&analysis.summary) {
+            diagnostics.push(Diagnostic {
+                kind: "nameserver-enrichment-gap".into(),
+                message: "configured providers returned no nameserver geography or ASN metadata"
+                    .into(),
+            });
+        }
+        let (observation, findings) = provider_analysis_observation(analysis, 0)?;
+        Ok(ScanResult {
+            status: completion_status(&diagnostics),
+            findings,
+            evidence: vec![Evidence {
+                kind: "provider-observation".into(),
+                source: "RIPEstat + IPinfo".into(),
+                observation,
+                observed_at: context.clock.now(),
+            }],
+            diagnostics,
+        })
+    }
+
+    async fn enrich_nameservers(
+        &self,
+        request: &ScanRequest,
+        addresses: Vec<String>,
+        max_nameservers: usize,
+    ) -> (Vec<NameserverEnrichment>, Vec<Diagnostic>) {
+        let mut enrichments = Vec::new();
+        let mut diagnostics = Vec::new();
+        for address in addresses.into_iter().take(max_nameservers) {
+            let network_info = self
+                .services
+                .provider
+                .query(ProviderRequest {
+                    provider: "ripestat".into(),
+                    operation: "network-info".into(),
+                    query: BTreeMap::from([("resource".into(), Value::String(address.clone()))]),
+                    secret_env: None,
+                    budget: request.budget,
+                })
+                .await;
+            let location = self
+                .services
+                .provider
+                .query(ProviderRequest {
+                    provider: "ipinfo".into(),
+                    operation: "lookup".into(),
+                    query: BTreeMap::from([("target".into(), Value::String(address))]),
+                    secret_env: Some("IPINFO_API_KEY".into()),
+                    budget: request.budget,
+                })
+                .await;
+            let network_info = provider_enrichment_result(
+                network_info,
+                "RIPEstat nameserver enrichment failed",
+                &mut diagnostics,
+            );
+            let location = provider_enrichment_result(
+                location,
+                "IPinfo nameserver enrichment failed",
+                &mut diagnostics,
+            );
+            enrichments.push(NameserverEnrichment {
+                network_info,
+                location,
+            });
+        }
+        (enrichments, diagnostics)
+    }
+
+    async fn scan_domain_ip_info(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+        primary: ProviderCall,
+    ) -> Result<ScanResult, ScanError> {
+        let response = self
+            .query_provider_call(request, primary)
+            .await
+            .map_err(|error| ScanError::new(ScanErrorKind::DependencyUnavailable, error.message))?;
+        let addresses = dns_chain_addresses(&response.data);
+        if addresses.is_empty() {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "domain address discovery returned no enrichable addresses",
+            ));
+        }
+        let max_addresses = request.budget.max_requests.saturating_sub(1) / 2;
+        if max_addresses == 0 {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidInput,
+                "request budget cannot cover domain network and location enrichment",
+            ));
+        }
+        let mut diagnostics = Vec::new();
+        if addresses.len() > max_addresses {
+            diagnostics.push(Diagnostic {
+                kind: "provider-coverage-gap".into(),
+                message: "domain address enrichment was limited by the request budget".into(),
+            });
+        }
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        for address in addresses.into_iter().take(max_addresses) {
+            self.append_domain_ip_info_evidence(
+                request,
+                context,
+                address,
+                &mut evidence,
+                &mut findings,
+                &mut diagnostics,
+            )
+            .await?;
+        }
+        if evidence.is_empty() {
+            return Err(ScanError::new(
+                ScanErrorKind::DependencyUnavailable,
+                "all domain address enrichment providers are unavailable",
+            ));
+        }
+        Ok(ScanResult {
+            status: completion_status(&diagnostics),
+            findings,
+            evidence,
+            diagnostics,
+        })
+    }
+
+    async fn append_domain_ip_info_evidence(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+        address: String,
+        evidence: &mut Vec<Evidence>,
+        findings: &mut Vec<Finding>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<(), ScanError> {
+        let responses = [
+            self.services
+                .provider
+                .query(ProviderRequest {
+                    provider: "ripestat".into(),
+                    operation: "network-info".into(),
+                    query: BTreeMap::from([("resource".into(), Value::String(address.clone()))]),
+                    secret_env: None,
+                    budget: request.budget,
+                })
+                .await,
+            self.services
+                .provider
+                .query(ProviderRequest {
+                    provider: "ipinfo".into(),
+                    operation: "lookup".into(),
+                    query: BTreeMap::from([("target".into(), Value::String(address))]),
+                    secret_env: Some("IPINFO_API_KEY".into()),
+                    budget: request.budget,
+                })
+                .await,
+        ];
+        for response in responses {
+            match response {
+                Ok(response) => {
+                    let (observation, derived) = provider_observation(
+                        "ip-info",
+                        &response.provider,
+                        response.data,
+                        &[],
+                        evidence.len(),
+                    )?;
+                    findings.extend(derived);
+                    evidence.push(Evidence {
+                        kind: "provider-observation".into(),
+                        source: provider_source(&response.provider).into(),
+                        observation,
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => diagnostics.push(Diagnostic {
+                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                    message: "domain address provider enrichment failed".into(),
+                }),
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn scan_tcp(
         &self,
         analyzer: Analyzer,
@@ -624,11 +947,18 @@ impl BuiltinScanner {
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut first_error = None;
         let mut attempts = 0_usize;
         for host in targets {
             for port in &ports {
                 if attempts >= request.budget.max_requests {
                     break;
+                }
+                if context.cancellation.is_cancelled() {
+                    if evidence.is_empty() {
+                        return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+                    }
+                    return Ok(cancelled_network_result(evidence, findings, diagnostics));
                 }
                 attempts += 1;
                 let response = self
@@ -645,9 +975,30 @@ impl BuiltinScanner {
                     .await;
                 match response {
                     Ok(response) => {
+                        if response.bytes.len() > request.budget.max_response_bytes {
+                            let error = scan_error_from_network_analysis(
+                                NetworkAnalysisError::ResponseTooLarge,
+                            );
+                            diagnostics.push(Diagnostic {
+                                kind: "invalidresponse".into(),
+                                message: format!("{host}:{port}: {}", error.message),
+                            });
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                            continue;
+                        }
                         let index = evidence.len();
-                        let transfer_accepted = analyzer == Analyzer::TcpDnsTransfer
-                            && dns_transfer_accepted(&response.bytes);
+                        let transfer = (analyzer == Analyzer::TcpDnsTransfer)
+                            .then(|| {
+                                analyze_dns_transfer_response(
+                                    &response.bytes,
+                                    request.budget.max_response_bytes,
+                                )
+                                .map_err(scan_error_from_network_analysis)
+                            })
+                            .transpose()?;
+                        let transfer_accepted = transfer.is_some_and(|value| value.accepted);
                         if transfer_accepted {
                             findings.push(finding(
                                 "dns-zone-transfer-accepted",
@@ -667,42 +1018,31 @@ impl BuiltinScanner {
                         }
                         evidence.push(Evidence {
                             kind: "tcp-observation".into(),
-                            source: response.endpoint,
+                            source: format!("{host}:{port}"),
                             observation: json!({
                                 "state": "open",
                                 "bytes": response.bytes.len(),
                                 "sha256": hex::encode(Sha256::digest(&response.bytes)),
                                 "transfer_accepted": transfer_accepted,
+                                "response_code": transfer.map(|value| value.response_code),
+                                "messages": transfer.map(|value| value.messages),
+                                "answer_records": transfer.map(|value| value.answer_records),
+                                "soa_records": transfer.map(|value| value.soa_records),
                                 "duration_ms": response.duration_ms,
                             }),
                             observed_at: context.clock.now(),
                         });
                     }
-                    Err(error)
-                        if matches!(analyzer, Analyzer::TcpPorts | Analyzer::TcpRange)
-                            && matches!(
-                                error.kind,
-                                PortErrorKind::Transport | PortErrorKind::Timeout
-                            ) =>
-                    {
-                        evidence.push(Evidence {
-                            kind: "tcp-observation".into(),
-                            source: format!("{host}:{port}"),
-                            observation: json!({
-                                "state": if error.kind == PortErrorKind::Timeout {
-                                    "filtered-or-unreachable"
-                                } else {
-                                    "closed-or-unreachable"
-                                },
-                            }),
-                            observed_at: context.clock.now(),
-                        });
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(scan_error_from_port(error.clone()));
+                        }
+                        push_network_diagnostic(&mut diagnostics, &host, *port, &error);
                     }
-                    Err(error) => push_network_diagnostic(&mut diagnostics, &host, *port, &error),
                 }
             }
         }
-        network_result(evidence, findings, diagnostics)
+        network_result_with_error(evidence, findings, diagnostics, first_error)
     }
 
     async fn resolve_ipv6_candidates(
@@ -997,15 +1337,23 @@ impl BuiltinScanner {
 
     async fn scan_command(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
-        let kind = command_kind(self.descriptor.id.as_str());
+        let kind = command_kind(analyzer)?;
         let targets = command_targets(&request.target, host_limit(request));
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut first_error = None;
         for target in targets.into_iter().take(request.budget.max_requests) {
+            if context.cancellation.is_cancelled() {
+                if evidence.is_empty() {
+                    return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+                }
+                return Ok(cancelled_network_result(evidence, findings, diagnostics));
+            }
             let source = target.canonical();
             match self
                 .services
@@ -1020,31 +1368,62 @@ impl BuiltinScanner {
             {
                 Ok(response) => {
                     let index = evidence.len();
-                    findings.extend(analyze_command(kind, &response, index));
+                    let (observation, derived_findings) = match analyze_command_response(
+                        kind,
+                        &response,
+                        request.budget.max_response_bytes,
+                        index,
+                    ) {
+                        Ok(analysis) => analysis,
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error.clone());
+                            }
+                            diagnostics.push(Diagnostic {
+                                kind: "invalidresponse".into(),
+                                message: format!("{source}: {}", error.message),
+                            });
+                            continue;
+                        }
+                    };
+                    findings.extend(derived_findings);
                     evidence.push(Evidence {
                         kind: "platform-command".into(),
                         source: format!("{kind:?}:{source}"),
-                        observation: command_observation(kind, &response),
+                        observation,
                         observed_at: context.clock.now(),
                     });
                 }
-                Err(error) => diagnostics.push(Diagnostic {
-                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                    message: format!("{source}: {}", error.message),
-                }),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(scan_error_from_port(error.clone()));
+                    }
+                    diagnostics.push(Diagnostic {
+                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                        message: format!("{source}: {}", error.message),
+                    });
+                }
             }
         }
-        network_result(evidence, findings, diagnostics)
+        network_result_with_error(evidence, findings, diagnostics, first_error)
     }
 
     fn scan_local(
         &self,
+        analyzer: Analyzer,
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
         let id = self.descriptor.id.as_str();
-        if id == "jwt-token-analyzer" {
-            return scan_jwt(request, context);
+        match analyzer {
+            Analyzer::LocalJwt => return scan_jwt(request, context),
+            Analyzer::LocalWordlist => {}
+            _ => {
+                return Err(ScanError::new(
+                    ScanErrorKind::Internal,
+                    "local analyzer does not define a local analysis contract",
+                ));
+            }
         }
         let canonical = request.target.canonical();
         let host = request.target.host().unwrap_or(&canonical);
@@ -1069,6 +1448,26 @@ fn completion_status(diagnostics: &[Diagnostic]) -> ExecutionStatus {
     }
 }
 
+fn has_authoritative_nameservers(response: &Value) -> bool {
+    response
+        .get("data")
+        .unwrap_or(response)
+        .get("authoritative_nameservers")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty())
+}
+
+fn nameserver_metadata_is_empty(summary: &ProviderSummary) -> bool {
+    matches!(
+        summary,
+        ProviderSummary::NameserverDiversity {
+            unique_countries: 0,
+            unique_autonomous_systems: 0,
+            ..
+        }
+    )
+}
+
 fn provider_observation(
     scanner_id: &str,
     provider: &str,
@@ -1082,29 +1481,53 @@ fn provider_observation(
         ProviderBaseline::CertificateIssuers(expected_issuers)
     };
     if let Some(analysis) = analyze_provider_response(scanner_id, provider, &data, baseline) {
-        let findings = analysis
-            .findings
-            .into_iter()
-            .map(|finding| Finding {
-                key: finding.key.into(),
-                title: finding.title.into(),
-                severity: finding.severity,
-                confidence: finding.confidence,
-                evidence: vec![evidence],
-            })
-            .collect();
-        let observation = serde_json::to_value(analysis.summary).map_err(|_| {
-            ScanError::new(
-                ScanErrorKind::Internal,
-                "provider summary serialization failed",
-            )
-        })?;
-        return Ok((observation, findings));
+        return provider_analysis_observation(analysis, evidence);
     }
 
     let observation = redact_provider_data(provider, data);
     let findings = analyze_provider(scanner_id, provider, &observation, evidence);
     Ok((observation, findings))
+}
+
+fn provider_analysis_observation(
+    analysis: ProviderAnalysis,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let findings = analysis
+        .findings
+        .into_iter()
+        .map(|finding| Finding {
+            key: finding.key.into(),
+            title: finding.title.into(),
+            severity: finding.severity,
+            confidence: finding.confidence,
+            evidence: vec![evidence],
+        })
+        .collect();
+    let observation = serde_json::to_value(analysis.summary).map_err(|_| {
+        ScanError::new(
+            ScanErrorKind::Internal,
+            "provider summary serialization failed",
+        )
+    })?;
+    Ok((observation, findings))
+}
+
+fn provider_enrichment_result(
+    result: Result<ProviderResponse, PortError>,
+    message: &'static str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Value> {
+    match result {
+        Ok(response) => Some(response.data),
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                message: message.into(),
+            });
+            None
+        }
+    }
 }
 
 fn merge_scan_result(target: &mut ScanResult, mut source: ScanResult) {
@@ -1192,6 +1615,18 @@ fn dns_query_plan(
     target: &Target,
     request: &ScanRequest,
 ) -> Result<Vec<DnsPlannedQuery>, ScanError> {
+    if id == "dns-sla-latency-monitor"
+        && request
+            .options
+            .get("resolvers")
+            .and_then(Value::as_array)
+            .is_some_and(|resolvers| !resolvers.is_empty())
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::DependencyUnavailable,
+            "the configured DNS boundary cannot select a custom resolver",
+        ));
+    }
     if id == "reverse-dns-scan" {
         let addresses: Vec<_> = match target {
             Target::Ip(address) => vec![*address],
@@ -1264,7 +1699,7 @@ fn dns_query_plan(
             queries.extend(dkim_queries(&name, request)?);
             queries
         }
-        "rogue-subdomain-resolver" | "subdomain-takeover" | "decoy-dns-beacon" => vec![
+        "rogue-subdomain-resolver" | "subdomain-takeover" => vec![
             query(
                 name.clone(),
                 vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
@@ -1274,6 +1709,10 @@ fn dns_query_plan(
                 vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
             ),
         ],
+        "decoy-dns-beacon" => vec![query(
+            format!("_sugra-decoy-beacon.{name}"),
+            vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
+        )],
         _ => vec![query(name, dns_types(id, request))],
     };
     Ok(plan)
@@ -1399,10 +1838,12 @@ fn analyze_dns(
 ) {
     match id {
         "dnssec" => findings.extend(dnssec_findings(&query.name, records, evidence)),
-        "dns-caa-checker"
+        "cdn-detection"
+        | "dns-caa-checker"
         | "dns-records"
         | "decoy-dns-beacon"
         | "domain-info"
+        | "geo-dns-footprint"
         | "reverse-dns-scan"
         | "rogue-subdomain-resolver"
         | "spf-network-extractor"
@@ -1770,6 +2211,11 @@ fn provider_plan_options(
                     .insert(ProviderName::PageSpeed, value.into());
             }
         }
+        "ip-info" | "network-timezone-detection" | "server-location" => {
+            projected
+                .secret_refs
+                .insert(ProviderName::IpInfo, "IPINFO_API_KEY".into());
+        }
         _ => {}
     }
     Ok(projected)
@@ -1909,20 +2355,11 @@ fn provider_registry_calls(
             },
             None,
         )]),
-        "autonomous-neighbor-peering-map" => {
-            Some(vec![provider_call("ripestat", "asn-neighbours", None)])
-        }
         "bgp-route-analysis" => Some(vec![provider_call("ripestat", "bgp-state", None)]),
-        "ip-allocation-history-tracker" => {
-            Some(vec![provider_call("ripestat", "historical-whois", None)])
-        }
-        "ip-info" => Some(vec![provider_call("ripestat", "network-info", None)]),
-        "ns-geo-asn-diversity-analyzer" => Some(vec![provider_call("ripestat", "dns-chain", None)]),
         "rpki-route-validity-check" if options.contains_key("asn") => {
             Some(vec![provider_call("ripestat", "rpki-validation", None)])
         }
         "rpki-route-validity-check" => Some(vec![provider_call("ripestat", "rpki-history", None)]),
-        "irr-routing-registry-analyzer" => Some(vec![provider_call("ripestat", "whois", None)]),
         _ => None,
     }
 }
@@ -1937,7 +2374,7 @@ fn provider_intelligence_calls(
             provider_call("crtsh", "query", None),
             provider_call("urlscan", "search", None),
         ]),
-        "subdomain-enum" | "certificate-authority-recon" | "rogue-certificate-check" => {
+        "subdomain-enum" | "rogue-certificate-check" => {
             Some(vec![provider_call("crtsh", "query", None)])
         }
         "reverse-ip-lookup" | "passive-dns-history" => {
@@ -2153,6 +2590,7 @@ fn provider_source(provider: &str) -> &str {
         "censys" => "Censys (https://censys.com/)",
         "cloudflare-radar" => "Cloudflare Radar (https://radar.cloudflare.com/)",
         "pagespeed" => "PageSpeed Insights (https://pagespeed.web.dev/)",
+        "ipinfo" => "IPinfo (https://ipinfo.io/)",
         "cloudflare-doh" => "Cloudflare DNS over HTTPS (https://cloudflare-dns.com/)",
         "google-doh" => "Google Public DNS over HTTPS (https://dns.google/)",
         other => other,
@@ -2349,14 +2787,14 @@ fn network_hosts(target: &Target, limit: usize) -> Result<Vec<String>, ScanError
 
 fn tcp_ports(id: &str, request: &ScanRequest) -> Vec<u16> {
     if let Some(values) = request.options.get("ports").and_then(Value::as_array) {
-        let ports: Vec<u16> = values
+        let ports: BTreeSet<u16> = values
             .iter()
             .filter_map(Value::as_str)
             .filter_map(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .collect();
         if !ports.is_empty() {
-            return ports;
+            return ports.into_iter().collect();
         }
     }
     if id.contains("ssh") {
@@ -2409,16 +2847,6 @@ fn dns_axfr_query(name: &str) -> Result<Vec<u8>, ScanError> {
     let mut framed = length.to_be_bytes().to_vec();
     framed.extend(dns);
     Ok(framed)
-}
-
-fn dns_transfer_accepted(response: &[u8]) -> bool {
-    if response.len() < 14 {
-        return false;
-    }
-    let header = &response[2..14];
-    let flags = u16::from_be_bytes([header[2], header[3]]);
-    let answers = u16::from_be_bytes([header[6], header[7]]);
-    header[..2] == [0x53, 0x55] && flags & 0x8000 != 0 && flags.trailing_zeros() >= 4 && answers > 0
 }
 
 fn udp_ports(id: &str, request: &ScanRequest) -> Vec<u16> {
@@ -2480,15 +2908,16 @@ fn udp_probe(analyzer: Analyzer, id: &str, port: u16) -> Result<UdpProbe, ScanEr
     Ok(probe)
 }
 
-fn command_kind(id: &str) -> CommandKind {
-    if id.contains("traceroute") {
-        CommandKind::Traceroute
-    } else if id.contains("whois") {
-        CommandKind::Whois
-    } else if id.contains("ssh") {
-        CommandKind::SshKeyscan
-    } else {
-        CommandKind::Ping
+fn command_kind(analyzer: Analyzer) -> Result<CommandKind, ScanError> {
+    match analyzer {
+        Analyzer::CommandReachability => Ok(CommandKind::Ping),
+        Analyzer::CommandPath => Ok(CommandKind::Traceroute),
+        Analyzer::CommandWhois => Ok(CommandKind::Whois),
+        Analyzer::CommandSsh => Ok(CommandKind::SshKeyscan),
+        _ => Err(ScanError::new(
+            ScanErrorKind::Internal,
+            "command analyzer does not define an allowlisted command",
+        )),
     }
 }
 
@@ -2499,28 +2928,214 @@ fn command_targets(target: &Target, limit: usize) -> Vec<Target> {
     }
 }
 
-fn command_observation(kind: CommandKind, response: &CommandResponse) -> Value {
-    let details = match kind {
-        CommandKind::Ping => json!({"reachable": response.exit_code == Some(0)}),
-        CommandKind::Traceroute => json!({
-            "hop_lines": response
-                .stdout
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-                .saturating_sub(1),
-        }),
-        CommandKind::Whois => json!({"fields": safe_whois_fields(&response.stdout)}),
-        CommandKind::SshKeyscan => json!({"host_keys": ssh_key_metadata(&response.stdout)}),
+fn analyze_command_response(
+    kind: CommandKind,
+    response: &CommandResponse,
+    max_response_bytes: usize,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let total_bytes = response
+        .stdout
+        .len()
+        .checked_add(response.stderr.len())
+        .ok_or_else(|| {
+            ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "command output is too large",
+            )
+        })?;
+    if max_response_bytes == 0 || total_bytes > max_response_bytes {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "command output exceeds the declared byte budget",
+        ));
+    }
+    let exit_code = response.exit_code.ok_or_else(|| {
+        ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "command response does not contain an exit status",
+        )
+    })?;
+    let (details, findings) = match kind {
+        CommandKind::Ping => analyze_ping(response, exit_code, evidence)?,
+        CommandKind::Traceroute => analyze_traceroute(response, exit_code, evidence)?,
+        CommandKind::Whois => analyze_whois(response, exit_code, evidence)?,
+        CommandKind::SshKeyscan => analyze_ssh(response, exit_code, evidence)?,
     };
-    json!({
-        "exit_code": response.exit_code,
-        "stdout_bytes": response.stdout.len(),
-        "stdout_sha256": hex::encode(Sha256::digest(response.stdout.as_bytes())),
-        "stderr": safe_text(response.stderr.as_bytes(), 512),
-        "details": details,
-        "duration_ms": response.duration_ms,
-    })
+    Ok((
+        json!({
+            "exit_code": exit_code,
+            "stdout_bytes": response.stdout.len(),
+            "stdout_sha256": hex::encode(Sha256::digest(response.stdout.as_bytes())),
+            "stderr_bytes": response.stderr.len(),
+            "stderr_sha256": hex::encode(Sha256::digest(response.stderr.as_bytes())),
+            "details": details,
+            "duration_ms": response.duration_ms,
+        }),
+        findings,
+    ))
+}
+
+fn analyze_ping(
+    response: &CommandResponse,
+    exit_code: i32,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let output = response.stdout.to_ascii_lowercase();
+    let reply = (output.contains("bytes from ") || output.contains("reply from "))
+        && (output.contains("ttl=") || output.contains("ttl "));
+    let no_reply = output.contains("0 received")
+        || output.contains("100% packet loss")
+        || output.contains("request timed out");
+    if (exit_code == 0 && !reply) || (exit_code != 0 && !no_reply) {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "ping output does not prove reachability or absence of replies",
+        ));
+    }
+    let reachable = exit_code == 0;
+    let key = if reachable {
+        "icmp-reachable"
+    } else {
+        "icmp-unreachable"
+    };
+    Ok((
+        json!({"reachable": reachable, "reply_lines": usize::from(reply)}),
+        vec![finding(
+            key,
+            if reachable {
+                "The target answered a bounded ICMP probe"
+            } else {
+                "The target did not answer the bounded ICMP probe"
+            },
+            Severity::Info,
+            if reachable {
+                Confidence::Confirmed
+            } else {
+                Confidence::Unknown
+            },
+            evidence,
+        )],
+    ))
+}
+
+fn analyze_traceroute(
+    response: &CommandResponse,
+    exit_code: i32,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let mut hops = 0_usize;
+    let mut unanswered = 0_usize;
+    for line in response.stdout.lines() {
+        let trimmed = line.trim_start();
+        let Some((hop, remainder)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !hop.parse::<u16>().is_ok_and(|hop| hop > 0) {
+            continue;
+        }
+        let fields = remainder.split_whitespace().collect::<Vec<_>>();
+        if fields.len() == 3 && fields.iter().all(|field| *field == "*") {
+            hops = hops.saturating_add(1);
+            unanswered = unanswered.saturating_add(1);
+        } else if traceroute_answer_has_host_and_rtt(&fields) {
+            hops = hops.saturating_add(1);
+        }
+    }
+    if hops == 0 {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "traceroute output does not contain structured hops",
+        ));
+    }
+    Ok((
+        json!({
+            "hop_count": hops,
+            "unanswered_hops": unanswered,
+            "exit_success": exit_code == 0,
+        }),
+        vec![finding(
+            "network-path-observed",
+            "One or more bounded network-path hops were observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )],
+    ))
+}
+
+fn traceroute_answer_has_host_and_rtt(fields: &[&str]) -> bool {
+    let has_host = fields.iter().any(|field| {
+        let candidate = field.trim_matches(['(', ')', '[', ']', ',']);
+        candidate.parse::<IpAddr>().is_ok()
+            || (candidate.contains('.')
+                && candidate.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                        })
+                }))
+    });
+    let has_rtt = fields.windows(2).any(|pair| {
+        pair[1].eq_ignore_ascii_case("ms")
+            && pair[0]
+                .trim_start_matches('<')
+                .parse::<f64>()
+                .is_ok_and(|value| value.is_finite() && value >= 0.0)
+    }) || fields.iter().any(|field| {
+        field
+            .strip_suffix("ms")
+            .and_then(|value| value.trim_start_matches('<').parse::<f64>().ok())
+            .is_some_and(|value| value.is_finite() && value >= 0.0)
+    });
+    has_host && has_rtt
+}
+
+fn analyze_whois(
+    response: &CommandResponse,
+    exit_code: i32,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let fields = safe_whois_fields(&response.stdout);
+    let lower = response.stdout.to_ascii_lowercase();
+    let absent = ["no match", "not found", "no entries found", "no data found"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    if fields.is_empty() && !absent {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "WHOIS output contains neither allowlisted fields nor a not-found signal",
+        ));
+    }
+    if !fields.is_empty() && absent {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "WHOIS output contains conflicting registration signals",
+        ));
+    }
+    let registered = !fields.is_empty();
+    if registered && exit_code != 0 {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "WHOIS command failed despite returning registration-like fields",
+        ));
+    }
+    let findings = registered
+        .then(|| {
+            finding(
+                "registration-record-observed",
+                "Allowlisted public registration fields were observed",
+                Severity::Info,
+                Confidence::Confirmed,
+                evidence,
+            )
+        })
+        .into_iter()
+        .collect();
+    Ok((
+        json!({"registered": registered, "fields": fields}),
+        findings,
+    ))
 }
 
 fn safe_whois_fields(output: &str) -> BTreeMap<String, String> {
@@ -2547,42 +3162,116 @@ fn safe_whois_fields(output: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn ssh_key_metadata(output: &str) -> Vec<Value> {
-    output
+fn analyze_ssh(
+    response: &CommandResponse,
+    exit_code: i32,
+    evidence: usize,
+) -> Result<(Value, Vec<Finding>), ScanError> {
+    let mut keys = Vec::new();
+    for line in response
+        .stdout
         .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let _host = fields.next()?;
-            let key_type = fields.next()?;
-            let encoded = fields.next()?;
-            Some(json!({
-                "type": key_type,
-                "sha256": hex::encode(Sha256::digest(encoded.as_bytes())),
-            }))
+        .filter(|line| !line.trim().is_empty())
+    {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3
+            || !matches!(
+                fields[1],
+                "ssh-rsa"
+                    | "ssh-ed25519"
+                    | "ecdsa-sha2-nistp256"
+                    | "ecdsa-sha2-nistp384"
+                    | "ecdsa-sha2-nistp521"
+            )
+        {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "SSH keyscan output contains an invalid host-key record",
+            ));
+        }
+        let decoded = STANDARD.decode(fields[2]).map_err(|_| {
+            ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "SSH keyscan output contains invalid base64 key material",
+            )
+        })?;
+        if decoded.is_empty() {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "SSH keyscan output contains empty key material",
+            ));
+        }
+        if ssh_blob_key_type(&decoded) != Some(fields[1]) {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "SSH key material does not match its declared key type",
+            ));
+        }
+        keys.push(json!({
+            "type": fields[1],
+            "sha256": hex::encode(Sha256::digest(&decoded)),
+        }));
+        if keys.len() == 64 {
+            break;
+        }
+    }
+    let banner_hashes = response
+        .stderr
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with('#') && line.contains(" SSH-2.0-")
         })
         .take(64)
-        .collect()
-}
-
-fn analyze_command(kind: CommandKind, response: &CommandResponse, evidence: usize) -> Vec<Finding> {
-    match kind {
-        CommandKind::SshKeyscan if !ssh_key_metadata(&response.stdout).is_empty() => vec![finding(
+        .map(|line| hex::encode(Sha256::digest(line.as_bytes())))
+        .collect::<Vec<_>>();
+    if keys.is_empty() && exit_code == 0 {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "successful SSH keyscan output contains no valid host key",
+        ));
+    }
+    let mut findings = Vec::new();
+    if !keys.is_empty() {
+        findings.push(finding(
             "ssh-host-key-observed",
             "One or more SSH host keys were observed",
             Severity::Info,
             Confidence::Confirmed,
             evidence,
-        )],
-        CommandKind::Ping if response.exit_code != Some(0) => vec![finding(
-            "icmp-unreachable",
-            "The target did not answer the bounded ICMP probe",
-            Severity::Info,
-            Confidence::Unknown,
-            evidence,
-        )],
-        _ => Vec::new(),
+        ));
     }
+    if !banner_hashes.is_empty() {
+        findings.push(finding(
+            "ssh-banner-observed",
+            "One or more SSH protocol banners were observed",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ));
+    }
+    Ok((
+        json!({
+            "key_count": keys.len(),
+            "host_keys": keys,
+            "banner_count": banner_hashes.len(),
+            "banner_sha256": banner_hashes,
+        }),
+        findings,
+    ))
+}
+
+fn ssh_blob_key_type(blob: &[u8]) -> Option<&str> {
+    let length = blob
+        .get(..4)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .and_then(|length| usize::try_from(length).ok())?;
+    let end = 4_usize.checked_add(length)?;
+    let key_type = std::str::from_utf8(blob.get(4..end)?).ok()?;
+    (end < blob.len()).then_some(key_type)
 }
 
 fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, ScanError> {
@@ -2599,16 +3288,29 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
             "JWT must contain three segments",
         ));
     }
+    if token.len() > request.budget.max_response_bytes {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidResponse,
+            "JWT exceeds the declared byte budget",
+        ));
+    }
     let decode = |part: &str| {
         URL_SAFE_NO_PAD
             .decode(part)
             .ok()
+            .and_then(|bytes| (bytes.len() <= request.budget.max_response_bytes).then_some(bytes))
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
     };
     let header = decode(parts[0])
         .ok_or_else(|| ScanError::new(ScanErrorKind::InvalidInput, "JWT header is invalid"))?;
     let payload = decode(parts[1])
         .ok_or_else(|| ScanError::new(ScanErrorKind::InvalidInput, "JWT payload is invalid"))?;
+    let (Value::Object(header_fields), Value::Object(payload_fields)) = (&header, &payload) else {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "JWT header and payload must be JSON objects",
+        ));
+    };
     let signature = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|_| {
         ScanError::new(
             ScanErrorKind::InvalidInput,
@@ -2616,14 +3318,29 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
         )
     })?;
     let mut findings = Vec::new();
-    if header
-        .get("alg")
-        .and_then(Value::as_str)
-        .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("none"))
-    {
+    let algorithm = header.get("alg").and_then(Value::as_str);
+    if algorithm.is_some_and(|value| value.eq_ignore_ascii_case("none")) {
         findings.push(finding(
             "unsigned-jwt",
             "JWT declares the none algorithm",
+            Severity::High,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    if algorithm.is_none() {
+        findings.push(finding(
+            "jwt-algorithm-missing",
+            "JWT header does not declare a signing algorithm",
+            Severity::Medium,
+            Confidence::Confirmed,
+            0,
+        ));
+    }
+    if signature.is_empty() && algorithm.is_some_and(|value| !value.eq_ignore_ascii_case("none")) {
+        findings.push(finding(
+            "jwt-signature-missing",
+            "JWT declares a signed algorithm but has no signature bytes",
             Severity::High,
             Confidence::Confirmed,
             0,
@@ -2633,33 +3350,98 @@ fn scan_jwt(request: &ScanRequest, context: &ScanContext) -> Result<ScanResult, 
         &payload,
         context.clock.now().unix_timestamp(),
     ));
+    let observation = jwt_structure_observation(
+        parts.as_slice(),
+        header_fields.len(),
+        payload_fields.len(),
+        &header,
+        &payload,
+        algorithm,
+        &signature,
+    );
     Ok(ScanResult::completed(
         vec![Evidence {
             kind: "jwt-structure".into(),
             source: "local-input".into(),
-            observation: json!({
-                "header": redact_json(header),
-                "payload": redact_json(payload),
-                "signature_bytes": signature.len(),
-                "signature_sha256": hex::encode(Sha256::digest(&signature)),
-                "signature_verified": false,
-            }),
+            observation,
             observed_at: context.clock.now(),
         }],
         findings,
     ))
 }
 
+fn jwt_structure_observation(
+    parts: &[&str],
+    header_fields: usize,
+    claim_count: usize,
+    header: &Value,
+    payload: &Value,
+    algorithm: Option<&str>,
+    signature: &[u8],
+) -> Value {
+    json!({
+        "algorithm": safe_jwt_algorithm(algorithm),
+        "typ_is_jwt": header.get("typ").and_then(Value::as_str) == Some("JWT"),
+        "header_fields": header_fields,
+        "claim_count": claim_count,
+        "registered_claims": {
+            "iss": payload.get("iss").is_some(),
+            "sub": payload.get("sub").is_some(),
+            "aud": payload.get("aud").is_some(),
+            "exp": payload.get("exp").is_some(),
+            "nbf": payload.get("nbf").is_some(),
+            "iat": payload.get("iat").is_some(),
+            "jti": payload.get("jti").is_some(),
+        },
+        "header_sha256": hex::encode(Sha256::digest(parts[0].as_bytes())),
+        "payload_sha256": hex::encode(Sha256::digest(parts[1].as_bytes())),
+        "signature_bytes": signature.len(),
+        "signature_sha256": hex::encode(Sha256::digest(signature)),
+        "signature_verified": false,
+    })
+}
+
+fn safe_jwt_algorithm(algorithm: Option<&str>) -> &'static str {
+    match algorithm.map(str::to_ascii_uppercase).as_deref() {
+        Some("NONE") => "none",
+        Some("HS256") => "HS256",
+        Some("HS384") => "HS384",
+        Some("HS512") => "HS512",
+        Some("RS256") => "RS256",
+        Some("RS384") => "RS384",
+        Some("RS512") => "RS512",
+        Some("ES256") => "ES256",
+        Some("ES384") => "ES384",
+        Some("ES512") => "ES512",
+        Some("PS256") => "PS256",
+        Some("PS384") => "PS384",
+        Some("PS512") => "PS512",
+        Some("EDDSA") => "EdDSA",
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
 fn jwt_time_findings(payload: &Value, now: i64) -> Vec<Finding> {
     let mut findings = Vec::new();
-    match payload.get("exp").and_then(Value::as_i64) {
-        Some(expiry) if expiry <= now => findings.push(finding(
-            "jwt-expired",
-            "The JWT expiration time is in the past",
+    match payload.get("exp") {
+        Some(value) if value.as_i64().is_none() => findings.push(finding(
+            "jwt-expiration-invalid",
+            "The JWT expiration claim is not an integer timestamp",
             Severity::Medium,
             Confidence::Confirmed,
             0,
         )),
+        Some(value) if value.as_i64().is_some_and(|expiry| expiry <= now) => {
+            findings.push(finding(
+                "jwt-expired",
+                "The JWT expiration time is in the past",
+                Severity::Medium,
+                Confidence::Confirmed,
+                0,
+            ));
+        }
+        Some(_) => {}
         None => findings.push(finding(
             "jwt-expiration-missing",
             "The JWT does not declare an expiration time",
@@ -2667,7 +3449,6 @@ fn jwt_time_findings(payload: &Value, now: i64) -> Vec<Finding> {
             Confidence::Confirmed,
             0,
         )),
-        Some(_) => {}
     }
     if payload
         .get("nbf")
@@ -2742,6 +3523,43 @@ fn network_result(
             evidence,
             diagnostics,
         })
+    }
+}
+
+fn network_result_with_error(
+    evidence: Vec<Evidence>,
+    findings: Vec<Finding>,
+    diagnostics: Vec<Diagnostic>,
+    first_error: Option<ScanError>,
+) -> Result<ScanResult, ScanError> {
+    if evidence.is_empty() {
+        Err(first_error.unwrap_or_else(|| {
+            ScanError::new(ScanErrorKind::Transport, "no network endpoint responded")
+        }))
+    } else {
+        Ok(ScanResult {
+            status: completion_status(&diagnostics),
+            findings,
+            evidence,
+            diagnostics,
+        })
+    }
+}
+
+fn cancelled_network_result(
+    evidence: Vec<Evidence>,
+    findings: Vec<Finding>,
+    mut diagnostics: Vec<Diagnostic>,
+) -> ScanResult {
+    diagnostics.push(Diagnostic {
+        kind: "cancelled".into(),
+        message: "remaining network probes were cancelled".into(),
+    });
+    ScanResult {
+        status: ExecutionStatus::Cancelled,
+        findings,
+        evidence,
+        diagnostics,
     }
 }
 
@@ -2826,29 +3644,6 @@ fn scan_error_from_tls_analysis(error: TlsAnalysisError) -> ScanError {
 
 fn scan_error_from_tls_semantic(error: TlsSemanticError) -> ScanError {
     ScanError::new(ScanErrorKind::InvalidResponse, error.to_string())
-}
-
-fn safe_text(bytes: &[u8], limit: usize) -> String {
-    redact_text(&String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]))
-}
-
-fn redact_text(value: &str) -> String {
-    value
-        .lines()
-        .take(128)
-        .map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if ["password", "secret", "token", "authorization", "api_key"]
-                .iter()
-                .any(|marker| lower.contains(marker))
-            {
-                "<redacted>".into()
-            } else {
-                line.chars().take(512).collect::<String>()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn redact_json(value: Value) -> Value {
@@ -3000,16 +3795,55 @@ mod tests {
     #[async_trait]
     impl TcpPort for FakeTcp {
         async fn execute(&self, request: TcpRequest) -> Result<TcpResponse, PortError> {
+            let bytes = if request.port == 53 && request.read_response {
+                fake_axfr_response(&request.payload)
+            } else {
+                b"fixture-banner".to_vec()
+            };
             Ok(TcpResponse {
                 endpoint: if request.host.contains(':') {
                     format!("[{}]:{}", request.host, request.port)
                 } else {
                     format!("{}:{}", request.host, request.port)
                 },
-                bytes: b"fixture-banner".to_vec(),
+                bytes,
                 duration_ms: 1,
             })
         }
+    }
+
+    fn fake_axfr_response(query: &[u8]) -> Vec<u8> {
+        let Some(transaction) = query.get(2..4) else {
+            return Vec::new();
+        };
+        let Some(question) = query.get(14..) else {
+            return Vec::new();
+        };
+        let mut message = vec![
+            transaction[0],
+            transaction[1],
+            0x81,
+            0x80,
+            0,
+            1,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+        ];
+        message.extend_from_slice(question);
+        for _ in 0..2 {
+            message.extend_from_slice(&[0xc0, 0x0c, 0, 6, 0, 1, 0, 0, 1, 44, 0, 22]);
+            message.extend_from_slice(&[0_u8; 22]);
+        }
+        let Ok(length) = u16::try_from(message.len()) else {
+            return Vec::new();
+        };
+        let mut framed = length.to_be_bytes().to_vec();
+        framed.extend(message);
+        framed
     }
 
     struct FakeUdp;
@@ -3089,11 +3923,23 @@ mod tests {
     struct FakeCommand;
     #[async_trait]
     impl CommandPort for FakeCommand {
-        async fn execute(&self, _request: CommandRequest) -> Result<CommandResponse, PortError> {
+        async fn execute(&self, request: CommandRequest) -> Result<CommandResponse, PortError> {
+            let (stdout, stderr) = match request.kind {
+                CommandKind::Ping => ("64 bytes from 192.0.2.1: ttl=52 time=1 ms", ""),
+                CommandKind::Traceroute => (
+                    "traceroute to 192.0.2.1, 30 hops max\n 1 192.0.2.1 1 ms",
+                    "",
+                ),
+                CommandKind::Whois => ("Domain Name: EXAMPLE.COM", ""),
+                CommandKind::SshKeyscan => (
+                    "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx",
+                    "# example.com:22 SSH-2.0-OpenSSH_fixture",
+                ),
+            };
             Ok(CommandResponse {
                 exit_code: Some(0),
-                stdout: "fixture".into(),
-                stderr: String::new(),
+                stdout: stdout.into(),
+                stderr: stderr.into(),
                 duration_ms: 1,
             })
         }
@@ -3476,7 +4322,7 @@ mod tests {
     #[test]
     fn decoy_dns_runtime_rejects_unrelated_and_malformed_answers() {
         let query = DnsPlannedQuery {
-            name: "_sugra-scope-probe.example.com".into(),
+            name: "_sugra-decoy-beacon.example.com".into(),
             record_types: vec![DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Cname],
         };
         let mut findings = Vec::new();
@@ -3523,7 +4369,7 @@ mod tests {
             &mut findings,
         );
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].key, "unexpected-probe-answer");
+        assert_eq!(findings[0].key, "decoy-probe-answer-observed");
         assert_eq!(findings[0].evidence, [1]);
     }
 
@@ -4031,8 +4877,7 @@ mod tests {
     }
 
     #[test]
-    fn axfr_query_is_framed_and_only_accepts_answer_records()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn axfr_query_is_framed() -> Result<(), Box<dyn std::error::Error>> {
         let query = dns_axfr_query("example.com")?;
         assert_eq!(
             usize::from(u16::from_be_bytes([query[0], query[1]])),
@@ -4041,10 +4886,6 @@ mod tests {
         assert_eq!(&query[2..4], &[0x53, 0x55]);
         assert_eq!(&query[query.len() - 4..query.len() - 2], &[0, 252]);
 
-        let accepted = [0, 12, 0x53, 0x55, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
-        let refused = [0, 12, 0x53, 0x55, 0x81, 0x85, 0, 1, 0, 0, 0, 0, 0, 0];
-        assert!(dns_transfer_accepted(&accepted));
-        assert!(!dns_transfer_accepted(&refused));
         Ok(())
     }
 
@@ -4061,15 +4902,20 @@ mod tests {
     }
 
     #[test]
-    fn command_metadata_omits_raw_host_keys_and_whois_contacts() {
+    fn command_metadata_omits_raw_host_keys_and_whois_contacts()
+    -> Result<(), Box<dyn std::error::Error>> {
         let ssh = CommandResponse {
             exit_code: Some(0),
-            stdout: "example.com ssh-ed25519 AAAA-sensitive-key-material".into(),
+            stdout: "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx".into(),
             stderr: String::new(),
             duration_ms: 1,
         };
-        let ssh_value = command_observation(CommandKind::SshKeyscan, &ssh).to_string();
-        assert!(!ssh_value.contains("AAAA-sensitive-key-material"));
+        let (ssh_value, _) = analyze_command_response(CommandKind::SshKeyscan, &ssh, 1_024, 0)?;
+        let ssh_value = ssh_value.to_string();
+        assert!(
+            !ssh_value
+                .contains("AAAAC3NzaC1lZDI1NTE5AAAAIDAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx")
+        );
         assert!(ssh_value.contains("ssh-ed25519"));
 
         let whois = safe_whois_fields(
@@ -4080,6 +4926,7 @@ mod tests {
             Some("EXAMPLE.COM")
         );
         assert!(!whois.contains_key("registrant email"));
+        Ok(())
     }
 
     #[test]
