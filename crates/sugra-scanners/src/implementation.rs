@@ -25,6 +25,7 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
+use crate::web::{WebProbe, discovered, plan_for};
 
 const fn operation_family(operation: Operation) -> BoundaryFamily {
     match operation {
@@ -293,77 +294,71 @@ impl BuiltinScanner {
     ) -> Result<ScanResult, ScanError> {
         let base = base_url(&request.target)?;
         let id = self.descriptor.id.as_str();
-        let mut queue: VecDeque<Url> = http_paths(id)
-            .into_iter()
-            .filter_map(|path| base.join(path).ok())
-            .collect();
-        let methods = http_methods(id);
+        let plan = plan_for(id, &base, &request.options, request.budget.max_requests)
+            .ok_or_else(|| ScanError::new(ScanErrorKind::Internal, "web probe plan is missing"))?;
+        let limit = plan.max_pages.min(request.budget.max_requests);
+        let mut queue: VecDeque<(WebProbe, usize)> =
+            plan.probes.into_iter().map(|probe| (probe, 0)).collect();
         let mut seen = BTreeSet::new();
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
-        let crawl = is_crawler(id);
+        let mut attempts = 0_usize;
 
-        while let Some(url) = queue.pop_front() {
-            if evidence.len() >= request.budget.max_requests
-                || !seen.insert(url.as_str().to_owned())
-            {
+        while let Some((probe, depth)) = queue.pop_front() {
+            if attempts >= limit || !seen.insert(probe.identity()) {
                 continue;
             }
-            for method in &methods {
-                if evidence.len() >= request.budget.max_requests {
-                    break;
-                }
-                let mut headers = BTreeMap::new();
-                if id == "cors-misconfiguration-scanner" {
-                    headers.insert("origin".into(), "https://scope-check.invalid".into());
-                }
-                let response = self
-                    .services
-                    .http
-                    .execute(HttpRequest {
-                        url: url.clone(),
-                        method: *method,
-                        headers,
-                        body: Vec::new(),
-                        max_redirects: if id == "redirect-chain" { 10 } else { 3 },
-                        budget: request.budget,
-                        scope: request.scope.clone(),
-                    })
-                    .await;
-                match response {
-                    Ok(response) => {
-                        let index = evidence.len();
-                        let metrics = document_metrics(&response.body);
-                        analyze_http(id, &response, &metrics, index, &mut findings);
-                        if crawl && *method == HttpMethod::Get {
-                            enqueue_links(
-                                &response.final_url,
-                                &response.body,
-                                &request.scope,
-                                &mut queue,
-                            );
+            attempts += 1;
+            let method = probe.method;
+            let label = probe.label;
+            let response = self
+                .services
+                .http
+                .execute(HttpRequest {
+                    url: probe.url,
+                    method,
+                    headers: probe.headers,
+                    body: probe.body,
+                    max_redirects: probe.max_redirects,
+                    budget: request.budget,
+                    scope: request.scope.clone(),
+                })
+                .await;
+            match response {
+                Ok(response) => {
+                    let index = evidence.len();
+                    let metrics = document_metrics(&response.body);
+                    analyze_http(id, &response, &metrics, index, &mut findings);
+                    if plan.crawl && method == HttpMethod::Get && depth < request.budget.max_depth {
+                        for url in
+                            discover_links(&response.final_url, &response.body, &request.scope)
+                        {
+                            queue.push_back((discovered(url), depth + 1));
                         }
-                        evidence.push(Evidence {
-                            kind: "http-observation".into(),
-                            source: response.final_url.as_str().into(),
-                            observation: json!({
-                                "method": format!("{method:?}").to_ascii_uppercase(),
-                                "status": response.status,
-                                "headers": response.headers,
-                                "bytes": response.body.len(),
-                                "sha256": hex::encode(Sha256::digest(&response.body)),
-                                "document": metrics,
-                                "duration_ms": response.duration_ms,
-                            }),
-                            observed_at: context.clock.now(),
-                        });
                     }
-                    Err(error) => diagnostics.push(Diagnostic {
-                        kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                        message: error.message,
-                    }),
+                    evidence.push(Evidence {
+                        kind: "http-observation".into(),
+                        source: safe_url_label(&response.final_url),
+                        observation: json!({
+                            "probe": label,
+                            "method": format!("{method:?}").to_ascii_uppercase(),
+                            "status": response.status,
+                            "headers": response.headers,
+                            "cookies": response.cookies,
+                            "redirects": safe_redirects(&response.redirects),
+                            "bytes": response.body.len(),
+                            "sha256": hex::encode(Sha256::digest(&response.body)),
+                            "document": metrics,
+                            "duration_ms": response.duration_ms,
+                        }),
+                        observed_at: context.clock.now(),
+                    });
                 }
+                Err(error) => diagnostics.push(Diagnostic {
+                    kind: format!("{:?}", error.kind).to_ascii_lowercase(),
+                    message: format!("{label}: {}", error.message),
+                }),
             }
         }
         if evidence.is_empty() {
@@ -1333,7 +1328,7 @@ fn parse_dns_type(value: &str) -> Option<DnsRecordType> {
 }
 
 fn base_url(target: &Target) -> Result<Url, ScanError> {
-    match target {
+    let url = match target {
         Target::Url(value) => Ok(value.clone()),
         Target::Domain(value) | Target::HostPort { host: value, .. } => {
             Url::parse(&format!("https://{value}/")).map_err(|_| {
@@ -1350,51 +1345,17 @@ fn base_url(target: &Target) -> Result<Url, ScanError> {
             ScanErrorKind::InvalidInput,
             "scanner requires a web-capable target",
         )),
+    }?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "web target must use HTTP(S) without embedded credentials",
+        ));
     }
-}
-
-fn is_crawler(id: &str) -> bool {
-    matches!(
-        id,
-        "broken-links"
-            | "crawler"
-            | "content-discovery"
-            | "email-harvester"
-            | "javascript-file-analyzer"
-            | "dom-sink-scanner"
-            | "dependency-js-cdn-scanner"
-            | "third-party-script-risk-profiler"
-            | "static-asset-fingerprinter"
-    )
-}
-
-fn http_paths(id: &str) -> Vec<&'static str> {
-    match id {
-        "crawl-rules" => vec!["/robots.txt"],
-        "sitemap-parsing" => vec!["/sitemap.xml", "/sitemap_index.xml"],
-        "security-txt" | "security-contact-gap-finder" => {
-            vec!["/.well-known/security.txt", "/security.txt", "/"]
-        }
-        "exposed-env-files" => vec!["/.env", "/.env.production", "/.env.local"],
-        "git-repo-exposure-check" => vec!["/.git/HEAD", "/.git/config"],
-        "api-schema-grabber" => vec!["/openapi.json", "/swagger.json", "/api-docs", "/graphql"],
-        "exposed-api-endpoints" => vec!["/api", "/api/v1", "/swagger", "/openapi.json"],
-        "directory-finder" => vec!["/admin/", "/backup/", "/config/", "/uploads/"],
-        "graphql-introspection-probe" => vec!["/graphql"],
-        "file-upload-surface-finder" => vec!["/", "/upload", "/uploads"],
-        "cloud-bucket-exposure" | "cloud-service-enumeration" => {
-            vec!["/", "/.well-known/assetlinks.json"]
-        }
-        _ => vec!["/"],
-    }
-}
-
-fn http_methods(id: &str) -> Vec<HttpMethod> {
-    if id == "http-method-enumerator" {
-        vec![HttpMethod::Get, HttpMethod::Head, HttpMethod::Options]
-    } else {
-        vec![HttpMethod::Get]
-    }
+    Ok(url)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1436,30 +1397,53 @@ fn document_metrics(body: &[u8]) -> DocumentMetrics {
     }
 }
 
-fn enqueue_links(
-    base: &Url,
-    body: &[u8],
-    scope: &sugra_domain::ScopeGrant,
-    queue: &mut VecDeque<Url>,
-) {
+fn discover_links(base: &Url, body: &[u8], scope: &sugra_domain::ScopeGrant) -> Vec<Url> {
     let document = Html::parse_document(&String::from_utf8_lossy(body));
     let Ok(selector) = Selector::parse("a[href], script[src]") else {
-        return;
+        return Vec::new();
     };
-    for element in document.select(&selector) {
-        let candidate = element
-            .value()
-            .attr("href")
-            .or_else(|| element.value().attr("src"))
-            .and_then(|value| base.join(value).ok());
-        if let Some(candidate) = candidate
-            && Target::parse(TargetKind::Url, candidate.as_str())
-                .ok()
-                .is_some_and(|target| scope.allows(&target))
-        {
-            queue.push_back(candidate);
-        }
-    }
+    document
+        .select(&selector)
+        .filter_map(|element| {
+            element
+                .value()
+                .attr("href")
+                .or_else(|| element.value().attr("src"))
+                .and_then(|value| base.join(value).ok())
+        })
+        .filter(|candidate| {
+            matches!(candidate.scheme(), "http" | "https")
+                && candidate.username().is_empty()
+                && candidate.password().is_none()
+                && Target::parse(TargetKind::Url, candidate.as_str())
+                    .ok()
+                    .is_some_and(|target| scope.allows(&target))
+        })
+        .take(512)
+        .collect()
+}
+
+fn safe_url_label(url: &Url) -> String {
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.to_string()
+}
+
+fn safe_redirects(redirects: &[sugra_core::HttpRedirect]) -> Vec<Value> {
+    redirects
+        .iter()
+        .map(|redirect| {
+            json!({
+                "status": redirect.status,
+                "from": safe_url_label(&redirect.from),
+                "to": safe_url_label(&redirect.to),
+                "decision": format!("{:?}", redirect.decision).to_ascii_lowercase(),
+            })
+        })
+        .collect()
 }
 
 fn analyze_http(

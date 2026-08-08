@@ -8,10 +8,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION, SET_COOKIE};
 use reqwest::{Client, Method, redirect};
 use sha2::{Digest, Sha256};
 use sugra_core::{
-    HttpCookie, HttpMethod, HttpPort, HttpRedirect, HttpRequest, HttpResponse, PortError,
-    PortErrorKind,
+    HttpCookie, HttpMethod, HttpPort, HttpRedirect, HttpRedirectDecision, HttpRequest,
+    HttpResponse, PortError, PortErrorKind,
 };
-use sugra_domain::{Target, TargetKind};
+use sugra_domain::{Budget, ScopeGrant, Target, TargetKind};
 
 /// Reqwest client configured to disable automatic redirects and require Rustls.
 #[derive(Clone)]
@@ -47,6 +47,7 @@ impl HttpPort for ReqwestHttp {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, PortError> {
         let mut url = request.url;
         let mut method = request.method;
+        validate_request_headers(&request.headers, &request.scope)?;
         let headers = request_headers(&request.headers)?;
         let started = Instant::now();
         let mut redirects = Vec::new();
@@ -60,17 +61,11 @@ impl HttpPort for ReqwestHttp {
             if !request.body.is_empty() {
                 builder = builder.body(request.body.clone());
             }
-            let mut response = builder
+            let response = builder
                 .send()
                 .await
                 .map_err(|_| PortError::new(PortErrorKind::Transport, "HTTP request failed"))?;
             if is_redirect(response.status().as_u16()) {
-                if redirect_count == request.max_redirects {
-                    return Err(PortError::new(
-                        PortErrorKind::InvalidResponse,
-                        "HTTP redirect limit exceeded",
-                    ));
-                }
                 let location = response
                     .headers()
                     .get(LOCATION)
@@ -87,59 +82,133 @@ impl HttpPort for ReqwestHttp {
                         "HTTP redirect has an invalid URL",
                     )
                 })?;
+                let decision = if redirect_count == request.max_redirects {
+                    HttpRedirectDecision::LimitReached
+                } else if ensure_url_in_scope(&request.scope, &next).is_ok() {
+                    HttpRedirectDecision::Followed
+                } else {
+                    HttpRedirectDecision::OutOfScope
+                };
                 redirects.push(HttpRedirect {
                     status: response.status().as_u16(),
                     from: response.url().clone(),
                     to: next.clone(),
+                    decision,
                 });
-                url = next;
-                if response.status().as_u16() == 303
-                    || (matches!(response.status().as_u16(), 301 | 302)
-                        && method == HttpMethod::Post)
-                {
-                    method = HttpMethod::Get;
+                if decision == HttpRedirectDecision::Followed {
+                    url = next;
+                    if response.status().as_u16() == 303
+                        || (matches!(response.status().as_u16(), 301 | 302)
+                            && method == HttpMethod::Post)
+                    {
+                        method = HttpMethod::Get;
+                    }
+                    continue;
                 }
-                continue;
             }
-
-            if response
-                .content_length()
-                .is_some_and(|length| length > request.budget.max_response_bytes as u64)
-            {
-                return Err(PortError::new(
-                    PortErrorKind::TooLarge,
-                    "HTTP response exceeds byte budget",
-                ));
-            }
-            let status = response.status().as_u16();
-            let final_url = response.url().clone();
-            let response_headers = response_headers(response.headers());
-            let cookies = response_cookies(response.headers());
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| {
-                PortError::new(PortErrorKind::Transport, "HTTP response body failed")
-            })? {
-                if body.len().saturating_add(chunk.len()) > request.budget.max_response_bytes {
-                    return Err(PortError::new(
-                        PortErrorKind::TooLarge,
-                        "HTTP response exceeds byte budget",
-                    ));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            return Ok(HttpResponse {
-                final_url,
-                status,
-                headers: response_headers,
-                cookies,
-                redirects,
-                body,
-                duration_ms: millis(started.elapsed().as_millis()),
-            });
+            return finish_response(response, redirects, started, request.budget).await;
         }
         Err(PortError::new(
             PortErrorKind::Internal,
             "unreachable redirect state",
+        ))
+    }
+}
+
+async fn finish_response(
+    mut response: reqwest::Response,
+    redirects: Vec<HttpRedirect>,
+    started: Instant,
+    budget: Budget,
+) -> Result<HttpResponse, PortError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > budget.max_response_bytes as u64)
+    {
+        return Err(PortError::new(
+            PortErrorKind::TooLarge,
+            "HTTP response exceeds byte budget",
+        ));
+    }
+    let status = response.status().as_u16();
+    let final_url = response.url().clone();
+    let headers = response_headers(response.headers());
+    let cookies = response_cookies(response.headers());
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| PortError::new(PortErrorKind::Transport, "HTTP response body failed"))?
+    {
+        if body.len().saturating_add(chunk.len()) > budget.max_response_bytes {
+            return Err(PortError::new(
+                PortErrorKind::TooLarge,
+                "HTTP response exceeds byte budget",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(HttpResponse {
+        final_url,
+        status,
+        headers,
+        cookies,
+        redirects,
+        body,
+        duration_ms: millis(started.elapsed().as_millis()),
+    })
+}
+
+fn validate_request_headers(
+    values: &BTreeMap<String, String>,
+    scope: &ScopeGrant,
+) -> Result<(), PortError> {
+    for (name, value) in values {
+        match name.to_ascii_lowercase().as_str() {
+            "authorization"
+            | "cookie"
+            | "proxy-authorization"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection" => {
+                return Err(PortError::new(
+                    PortErrorKind::InvalidResponse,
+                    "request contains a boundary-controlled header",
+                ));
+            }
+            "host" => ensure_host_header_in_scope(scope, value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_host_header_in_scope(scope: &ScopeGrant, value: &str) -> Result<(), PortError> {
+    let url = url::Url::parse(&format!("http://{value}/")).map_err(|_| {
+        PortError::new(
+            PortErrorKind::InvalidResponse,
+            "Host header is not a valid authority",
+        )
+    })?;
+    let host = url.host_str().ok_or_else(|| {
+        PortError::new(PortErrorKind::InvalidResponse, "Host header omitted a host")
+    })?;
+    let target = host
+        .parse()
+        .map(Target::Ip)
+        .or_else(|_| Target::parse(TargetKind::Domain, host))
+        .map_err(|_| {
+            PortError::new(
+                PortErrorKind::InvalidResponse,
+                "Host header contains an invalid host",
+            )
+        })?;
+    if scope.allows(&target) {
+        Ok(())
+    } else {
+        Err(PortError::new(
+            PortErrorKind::OutOfScope,
+            "Host header is outside the declared scope",
         ))
     }
 }
@@ -222,12 +291,13 @@ fn parse_cookie_metadata(value: &str) -> Option<HttpCookie> {
             "domain" => cookie.domain = value.map(bounded_cookie_attribute),
             "path" => cookie.path = value.map(bounded_cookie_attribute),
             "samesite" => {
-                cookie.same_site = value.and_then(|value| match value.to_ascii_lowercase().as_str() {
-                    "strict" => Some("strict".into()),
-                    "lax" => Some("lax".into()),
-                    "none" => Some("none".into()),
-                    _ => None,
-                });
+                cookie.same_site =
+                    value.and_then(|value| match value.to_ascii_lowercase().as_str() {
+                        "strict" => Some("strict".into()),
+                        "lax" => Some("lax".into()),
+                        "none" => Some("none".into()),
+                        _ => None,
+                    });
             }
             "max-age" => cookie.max_age_seconds = value.and_then(|value| value.parse().ok()),
             _ => {}
@@ -273,8 +343,13 @@ fn millis(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
 
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+    use sugra_domain::{Budget, ScopeGrant};
+    use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -330,6 +405,65 @@ mod tests {
             return Err("newline crossed the HTTP header boundary".into());
         };
         assert_eq!(error.kind, PortErrorKind::InvalidResponse);
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_controlled_and_out_of_scope_host_headers_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let scope = ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH);
+        let sensitive = BTreeMap::from([("authorization".into(), "Bearer value".into())]);
+        assert!(validate_request_headers(&sensitive, &scope).is_err());
+
+        let host_override = BTreeMap::from([("host".into(), "outside.example".into())]);
+        let Err(error) = validate_request_headers(&host_override, &scope) else {
+            return Err("out-of-scope Host header was accepted".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::OutOfScope);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_redirect_is_recorded_without_being_followed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://192.0.2.1/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let url = url::Url::parse(&format!("http://{address}/"))?;
+        let target = Target::parse(TargetKind::Url, url.as_str())?;
+        let response = ReqwestHttp::new()?
+            .execute(HttpRequest {
+                url,
+                method: HttpMethod::Get,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+                max_redirects: 3,
+                budget: Budget {
+                    timeout_ms: 1_000,
+                    max_response_bytes: 1_024,
+                    ..Budget::default()
+                },
+                scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+            })
+            .await?;
+        assert_eq!(response.status, 302);
+        assert_eq!(response.redirects.len(), 1);
+        assert_eq!(
+            response.redirects[0].decision,
+            HttpRedirectDecision::OutOfScope
+        );
+        server.await??;
         Ok(())
     }
 

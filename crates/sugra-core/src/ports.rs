@@ -199,6 +199,20 @@ pub struct HttpRedirect {
     pub from: Url,
     /// Scoped destination resolved from `Location`.
     pub to: Url,
+    /// Whether and why the boundary followed the destination.
+    pub decision: HttpRedirectDecision,
+}
+
+/// Safety decision for one redirect destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpRedirectDecision {
+    /// Destination was in scope and followed.
+    Followed,
+    /// Destination was recorded but not contacted because it was out of scope.
+    OutOfScope,
+    /// Destination was recorded but not contacted because the hop limit was reached.
+    LimitReached,
 }
 
 /// Normalized HTTP response.
