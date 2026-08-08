@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use sugra_adapters::{
     HickoryDns, ReqwestHttp, ReqwestProvider, RustlsTls, SystemClock, SystemCommand, TokioTcp,
     TokioUdp,
@@ -43,7 +44,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Browse all scanners and compatibility identities.
-    #[command(alias = "list")]
+    #[command(visible_alias = "list")]
     Catalog {
         /// Emit the catalog as JSON.
         #[arg(long)]
@@ -86,6 +87,31 @@ enum Command {
         /// Output projection.
         #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
         format: OutputFormat,
+    },
+    /// List canonical reports from the immutable run store.
+    History {
+        /// Immutable run artifact root.
+        #[arg(long, default_value = "sugra-runs")]
+        output: PathBuf,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the effective read-only CLI configuration.
+    Config {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect local capabilities without making network requests.
+    #[command(visible_alias = "doctor")]
+    Diagnostics {
+        /// Immutable run artifact root inspected by the command.
+        #[arg(long, default_value = "sugra-runs")]
+        output: PathBuf,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Open the full-screen terminal interface.
     Tui {
@@ -186,12 +212,12 @@ impl From<TargetKindArg> for TargetKind {
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("scanner selector is unknown: {0}")]
-    UnknownScanner(String),
-    #[error("target is incompatible with scanner {scanner}: {target}")]
-    InvalidTarget { scanner: String, target: String },
-    #[error("invalid option assignment: {0}; expected key=value")]
-    InvalidAssignment(String),
+    #[error("scanner selector is unknown")]
+    UnknownScanner,
+    #[error("target is incompatible with scanner {scanner}")]
+    InvalidTarget { scanner: String },
+    #[error("invalid option assignment; expected key=value")]
+    InvalidAssignment,
     #[error("active scanner {0} requires --authorize-active")]
     AuthorizationRequired(String),
     #[error("could not initialize {component}: {message}")]
@@ -199,8 +225,12 @@ enum CliError {
         component: &'static str,
         message: String,
     },
-    #[error("no scanner in preset {preset:?} accepts target {target}")]
-    EmptyPreset { preset: Preset, target: String },
+    #[error("no scanner in preset {preset:?} accepts the supplied target")]
+    EmptyPreset { preset: Preset },
+    #[error("invalid canonical report: {0}")]
+    InvalidReport(PathBuf),
+    #[error("could not format a report timestamp")]
+    Timestamp(#[source] time::error::Format),
     #[error(transparent)]
     Engine(#[from] sugra_core::EngineError),
     #[error(transparent)]
@@ -271,6 +301,9 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             .await
         }
         Command::Report { path, format } => render_saved_report(&path, format).await,
+        Command::History { output, json } => print_history(&output, json).await,
+        Command::Diagnostics { output, json } => print_diagnostics(&output, json),
+        Command::Config { json } => print_effective_config(concurrency, json),
         Command::Tui { output } => run_tui(concurrency, output).await,
     }
 }
@@ -390,6 +423,276 @@ fn print_descriptor(descriptor: &ScannerDescriptor, json: bool) -> Result<(), Cl
     Ok(())
 }
 
+fn render_effective_config(concurrency: usize, json: bool) -> Result<String, CliError> {
+    if json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "concurrency": concurrency,
+            "run_store": "sugra-runs",
+            "scan_defaults": {
+                "timeout_ms": Budget::DEFAULT.timeout_ms,
+                "max_requests": Budget::DEFAULT.max_requests,
+                "max_response_bytes": Budget::DEFAULT.max_response_bytes,
+                "max_depth": Budget::DEFAULT.max_depth,
+                "persist": true
+            },
+            "active_authorization_required": true
+        }))?);
+    }
+
+    Ok(format!(
+        "Concurrency: {concurrency}\nRun store: sugra-runs\nScan timeout: {} ms\nMaximum requests: {}\nMaximum response bytes: {}\nMaximum depth: {}\nPersistence: enabled by default\nActive authorization: required\n",
+        Budget::DEFAULT.timeout_ms,
+        Budget::DEFAULT.max_requests,
+        Budget::DEFAULT.max_response_bytes,
+        Budget::DEFAULT.max_depth
+    ))
+}
+
+fn print_effective_config(concurrency: usize, json: bool) -> Result<(), CliError> {
+    let output = render_effective_config(concurrency, json)?;
+    print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryEntry {
+    run_id: String,
+    status: &'static str,
+    started_at: String,
+    finished_at: String,
+    scanners: usize,
+    findings: usize,
+    evidence: usize,
+    diagnostics: usize,
+    report_path: PathBuf,
+}
+
+async fn load_history(root: &Path) -> Result<Vec<HistoryEntry>, CliError> {
+    let mut directory = match tokio::fs::read_dir(root).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = Vec::new();
+    while let Some(entry) = directory.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let report_path = entry.path().join("report.json");
+        let bytes = match tokio::fs::read(&report_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let report = serde_json::from_slice::<RunReport>(&bytes)
+            .map_err(|_| CliError::InvalidReport(report_path.clone()))?;
+        let started_at = report
+            .started_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(CliError::Timestamp)?;
+        let finished_at = report
+            .finished_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(CliError::Timestamp)?;
+        let summary = HistoryEntry {
+            run_id: report.run_id.to_string(),
+            status: status_label(report.status()),
+            started_at,
+            finished_at,
+            scanners: report.executions.len(),
+            findings: report
+                .executions
+                .iter()
+                .map(|execution| execution.result.findings.len())
+                .sum(),
+            evidence: report
+                .executions
+                .iter()
+                .map(|execution| execution.result.evidence.len())
+                .sum(),
+            diagnostics: report
+                .executions
+                .iter()
+                .map(|execution| execution.result.diagnostics.len())
+                .sum(),
+            report_path,
+        };
+        entries.push((report.started_at, summary));
+    }
+    entries.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.run_id.cmp(&right.1.run_id))
+    });
+    Ok(entries.into_iter().map(|(_, summary)| summary).collect())
+}
+
+async fn print_history(root: &Path, json: bool) -> Result<(), CliError> {
+    let history = load_history(root).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&history)?);
+    } else if history.is_empty() {
+        println!("No persisted runs found in {}.", root.display());
+    } else {
+        println!(
+            "{:<36} {:<10} {:<25} {:>8} {:>8}",
+            "RUN", "STATUS", "STARTED", "SCANNERS", "FINDINGS"
+        );
+        for run in history {
+            println!(
+                "{:<36} {:<10} {:<25} {:>8} {:>8}",
+                run.run_id, run.status, run.started_at, run.scanners, run.findings
+            );
+        }
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+const fn status_label(status: sugra_domain::ExecutionStatus) -> &'static str {
+    match status {
+        sugra_domain::ExecutionStatus::Completed => "completed",
+        sugra_domain::ExecutionStatus::Partial => "partial",
+        sugra_domain::ExecutionStatus::Skipped => "skipped",
+        sugra_domain::ExecutionStatus::Failed => "failed",
+        sugra_domain::ExecutionStatus::Cancelled => "cancelled",
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsReport {
+    schema_version: u32,
+    app_version: &'static str,
+    platform: PlatformDiagnostics,
+    catalog: CatalogDiagnostics,
+    run_store: RunStoreDiagnostics,
+    optional_commands: BTreeMap<&'static str, bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlatformDiagnostics {
+    os: &'static str,
+    arch: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogDiagnostics {
+    ready: bool,
+    scanner_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RunStoreDiagnostics {
+    exists: bool,
+    directory: bool,
+}
+
+fn collect_diagnostics(output: &Path) -> DiagnosticsReport {
+    let (catalog_ready, scanner_count) = build_application()
+        .map(|(builtins, _, _)| (true, builtins.catalog.len()))
+        .unwrap_or((false, 0));
+    let metadata = std::fs::metadata(output).ok();
+    let commands = if cfg!(target_os = "windows") {
+        [
+            ("ping", "ping"),
+            ("traceroute", "tracert"),
+            ("whois", "whois"),
+            ("ssh-keyscan", "ssh-keyscan"),
+        ]
+    } else {
+        [
+            ("ping", "ping"),
+            ("traceroute", "traceroute"),
+            ("whois", "whois"),
+            ("ssh-keyscan", "ssh-keyscan"),
+        ]
+    };
+    DiagnosticsReport {
+        schema_version: 1,
+        app_version: env!("CARGO_PKG_VERSION"),
+        platform: PlatformDiagnostics {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        },
+        catalog: CatalogDiagnostics {
+            ready: catalog_ready,
+            scanner_count,
+        },
+        run_store: RunStoreDiagnostics {
+            exists: metadata.is_some(),
+            directory: metadata.is_some_and(|value| value.is_dir()),
+        },
+        optional_commands: commands
+            .into_iter()
+            .map(|(label, executable)| (label, executable_available(executable)))
+            .collect(),
+    }
+}
+
+fn executable_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+        cfg!(target_os = "windows") && directory.join(format!("{name}.exe")).is_file()
+    })
+}
+
+fn print_diagnostics(output: &Path, json: bool) -> Result<(), CliError> {
+    let diagnostics = collect_diagnostics(output);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+    } else {
+        println!("Sugra {}", diagnostics.app_version);
+        println!(
+            "Platform: {}/{}",
+            diagnostics.platform.os, diagnostics.platform.arch
+        );
+        println!(
+            "Catalog: {} ({} scanners)",
+            if diagnostics.catalog.ready {
+                "ready"
+            } else {
+                "unavailable"
+            },
+            diagnostics.catalog.scanner_count
+        );
+        println!(
+            "Run store: {}",
+            if diagnostics.run_store.directory {
+                "available"
+            } else if diagnostics.run_store.exists {
+                "not a directory"
+            } else {
+                "not created"
+            }
+        );
+        println!("Optional local commands:");
+        for (command, available) in diagnostics.optional_commands {
+            println!(
+                "  {command}: {}",
+                if available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            );
+        }
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
 async fn run_scan(concurrency: usize, arguments: ScanArgs) -> Result<(), CliError> {
     let (builtins, clock, _) = build_application()?;
     let descriptor = resolve_scanner(&builtins.catalog, &arguments.scanner)?;
@@ -462,10 +765,7 @@ async fn run_preset(
         ));
     }
     if requests.is_empty() {
-        return Err(CliError::EmptyPreset {
-            preset,
-            target: raw_target.into(),
-        });
+        return Err(CliError::EmptyPreset { preset });
     }
     let engine = engine_for(builtins.registry, clock, concurrency)?;
     let report = engine
@@ -476,8 +776,14 @@ async fn run_preset(
 }
 
 async fn render_saved_report(path: &Path, format: OutputFormat) -> Result<(), CliError> {
-    let bytes = tokio::fs::read(path).await?;
-    let report = serde_json::from_slice::<RunReport>(&bytes)?;
+    let report_path = if path.is_dir() {
+        path.join("report.json")
+    } else {
+        path.to_owned()
+    };
+    let bytes = tokio::fs::read(&report_path).await?;
+    let report = serde_json::from_slice::<RunReport>(&bytes)
+        .map_err(|_| CliError::InvalidReport(report_path))?;
     print_report(&report, format)
 }
 
@@ -510,7 +816,7 @@ fn resolve_scanner(catalog: &Catalog, selector: &str) -> Result<ScannerDescripto
     compatibility
         .and_then(|id| catalog.resolve_legacy(id))
         .cloned()
-        .ok_or_else(|| CliError::UnknownScanner(selector.into()))
+        .ok_or(CliError::UnknownScanner)
 }
 
 fn parse_target(
@@ -523,14 +829,14 @@ fn parse_target(
         if !descriptor.target_kinds.contains(&kind) {
             return Err(CliError::InvalidTarget {
                 scanner: descriptor.id.to_string(),
-                target: raw.into(),
             });
         }
-        return Ok(Target::parse(kind, raw)?);
+        return Target::parse(kind, raw).map_err(|_| CliError::InvalidTarget {
+            scanner: descriptor.id.to_string(),
+        });
     }
     infer_target(descriptor, raw).ok_or_else(|| CliError::InvalidTarget {
         scanner: descriptor.id.to_string(),
-        target: raw.into(),
     })
 }
 
@@ -547,7 +853,7 @@ fn parse_assignments(values: &[String]) -> Result<BTreeMap<String, String>, CliE
         let (key, value) = assignment
             .split_once('=')
             .filter(|(key, _)| !key.trim().is_empty())
-            .ok_or_else(|| CliError::InvalidAssignment(assignment.clone()))?;
+            .ok_or(CliError::InvalidAssignment)?;
         supplied.insert(key.trim().into(), value.into());
     }
     Ok(supplied)
@@ -631,6 +937,109 @@ mod tests {
     }
 
     #[test]
+    fn read_only_operational_commands_have_json_interfaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let history = Cli::try_parse_from(["sugra", "history", "--json"])?;
+        assert!(matches!(
+            history.command,
+            Some(Command::History { json: true, .. })
+        ));
+
+        let config = Cli::try_parse_from(["sugra", "config", "--json"])?;
+        assert!(matches!(
+            config.command,
+            Some(Command::Config { json: true })
+        ));
+
+        let diagnostics = Cli::try_parse_from(["sugra", "diagnostics", "--json"])?;
+        assert!(matches!(
+            diagnostics.command,
+            Some(Command::Diagnostics { json: true, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn config_json_exposes_stable_effective_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let output = render_effective_config(7, true)?;
+        let value: serde_json::Value = serde_json::from_str(&output)?;
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["concurrency"], 7);
+        assert_eq!(value["run_store"], "sugra-runs");
+        assert_eq!(
+            value["scan_defaults"]["timeout_ms"],
+            Budget::DEFAULT.timeout_ms
+        );
+        assert_eq!(value["active_authorization_required"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_is_newest_first_and_summarizes_reports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::str::FromStr;
+
+        use sugra_domain::{ExecutionStatus, RunId, ScanExecution, ScanResult};
+
+        let root = tempfile::tempdir()?;
+        let fixtures = [
+            (
+                "00000000-0000-4000-8000-000000000001",
+                OffsetDateTime::UNIX_EPOCH,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000002",
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            ),
+        ];
+        for (run_id, started_at) in fixtures {
+            let directory = root.path().join(run_id);
+            tokio::fs::create_dir(&directory).await?;
+            let report = RunReport {
+                schema_version: 1,
+                run_id: RunId::from_str(run_id)?,
+                app_version: "test".into(),
+                started_at,
+                finished_at: started_at,
+                executions: vec![ScanExecution {
+                    scanner_id: ScannerId::new("dns-records")?,
+                    result: ScanResult {
+                        status: ExecutionStatus::Completed,
+                        findings: Vec::new(),
+                        evidence: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    duration_ms: 1,
+                }],
+            };
+            tokio::fs::write(directory.join("report.json"), serde_json::to_vec(&report)?).await?;
+        }
+
+        let history = load_history(root.path()).await?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].run_id, fixtures[1].0);
+        assert_eq!(history[0].scanners, 1);
+        assert_eq!(history[0].status, "completed");
+        assert!(history[0].report_path.ends_with("report.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_json_is_structured_and_redacts_environment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let diagnostics = collect_diagnostics(root.path());
+        let output = serde_json::to_string(&diagnostics)?;
+        let value: serde_json::Value = serde_json::from_str(&output)?;
+        assert_eq!(value["schema_version"], 1);
+        assert!(value["catalog"]["scanner_count"].as_u64().is_some());
+        assert!(value["run_store"]["exists"].as_bool().is_some());
+        assert!(value["optional_commands"].is_object());
+        assert!(!output.contains("PATH"));
+        Ok(())
+    }
+
+    #[test]
     fn compatibility_selector_resolves_to_canonical_descriptor()
     -> Result<(), Box<dyn std::error::Error>> {
         let catalog = fixture_catalog()?;
@@ -660,6 +1069,25 @@ mod tests {
         let values = vec!["timeout=10".into(), "timeout=20".into()];
         let parsed = parse_assignments(&values)?;
         assert_eq!(parsed.get("timeout").map(String::as_str), Some("20"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_errors_do_not_echo_target_or_option_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let assignment_secret = "private-api-token";
+        let Err(assignment_error) = parse_assignments(&[assignment_secret.into()]) else {
+            return Err(io::Error::other("invalid assignment was accepted").into());
+        };
+        assert!(!assignment_error.to_string().contains(assignment_secret));
+
+        let catalog = fixture_catalog()?;
+        let descriptor = resolve_scanner(&catalog, "dns-records")?;
+        let target_secret = "private target value";
+        let Err(error) = parse_target(&descriptor, target_secret, None) else {
+            return Err(io::Error::other("invalid target was accepted").into());
+        };
+        assert!(!error.to_string().contains(target_secret));
         Ok(())
     }
 }
