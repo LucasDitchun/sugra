@@ -1,6 +1,8 @@
 //! Capability-oriented implementations shared by the 147 compiled descriptors.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +16,7 @@ use sugra_core::{
     Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
     HttpMethod, HttpRequest, LocalInputPort, LocalInputRequest, PortError, PortErrorKind,
     ProviderRequest, ScanContext, ScanError, ScanErrorKind, Scanner, ScannerRegistry,
-    ServiceBundle, TcpRequest, TlsHandshakeKind, TlsObservation, TlsRequest, UdpRequest,
+    ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -25,11 +27,22 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::dns_analysis::{
-    dnssec_findings, dual_stack_finding, email_config_findings, ttl_finding,
+    dkim_selector_owners, dnssec_findings, dual_stack_finding, email_config_findings, ttl_finding,
     typosquat_resolution_finding,
 };
+use crate::network_analysis::{
+    NetworkAnalysisError, UdpProbe, analyze_udp_response as analyze_protocol_udp_response,
+    ipv6_reachability_finding, udp_payload as protocol_udp_payload,
+};
 use crate::provider_analysis::{ProviderBaseline, analyze_provider_response};
+use crate::provider_plan::{
+    self, ProviderName, ProviderPlanError, ProviderPlanOptions, ProviderWindow,
+};
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
+use crate::tls_analysis::{
+    CipherSummary, NegotiatedProtocol, ResumptionSummary, TlsAnalysisError, analyze_pinning,
+    negotiated_cipher, negotiated_protocol, summarize_resumption,
+};
 use crate::web::{WebProbe, discovered, plan_for, should_sample};
 use crate::web_analysis::{
     WebSample, aggregate_findings as aggregate_web_findings, observation as web_observation,
@@ -462,7 +475,19 @@ impl BuiltinScanner {
             })
             .await
             .map_err(scan_error_from_port)?;
-        let findings = analyze_tls(analyzer, &observation, context.clock.now().unix_timestamp());
+        let findings = if analyzer == Analyzer::TlsPinning {
+            analyze_pinning(
+                &observation,
+                request
+                    .options
+                    .get("baseline_sha256")
+                    .and_then(Value::as_str),
+                0,
+            )
+            .map_err(scan_error_from_tls_analysis)?
+        } else {
+            analyze_tls(analyzer, &observation, context.clock.now().unix_timestamp())
+        };
         Ok(ScanResult::completed(
             vec![Evidence {
                 kind: "tls-handshake".into(),
@@ -488,10 +513,16 @@ impl BuiltinScanner {
             self.descriptor.id.as_str(),
             &request.target,
             &request.options,
-        );
+            request.budget,
+        )?;
         let mut evidence = Vec::new();
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
+        if let Some(diagnostic) =
+            provider_temporal_gap(self.descriptor.id.as_str(), &calls, &request.options)
+        {
+            diagnostics.push(diagnostic);
+        }
         let expected_issuers: Vec<_> = request
             .options
             .get("expected_issuers")
@@ -569,6 +600,10 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
+        if analyzer == Analyzer::TcpRange && self.descriptor.id.as_str() == "ipv6-reachability-test"
+        {
+            return self.scan_ipv6_reachability(request, context).await;
+        }
         if matches!(analyzer, Analyzer::TcpCertificate | Analyzer::TcpTlsState) {
             return self.scan_network_tls(analyzer, request, context).await;
         }
@@ -658,6 +693,132 @@ impl BuiltinScanner {
         network_result(evidence, findings, diagnostics)
     }
 
+    async fn resolve_ipv6_candidates(
+        &self,
+        request: &ScanRequest,
+    ) -> Result<Vec<IpAddr>, ScanError> {
+        let resolved = match &request.target {
+            Target::Domain(domain) => self
+                .services
+                .dns
+                .query(DnsQuery {
+                    name: domain.clone(),
+                    record_types: vec![DnsRecordType::Aaaa],
+                    budget: request.budget,
+                })
+                .await
+                .map_err(scan_error_from_port)?
+                .into_iter()
+                .filter(|record| record.record_type == DnsRecordType::Aaaa)
+                .filter_map(|record| record.value.parse::<Ipv6Addr>().ok())
+                .map(IpAddr::V6)
+                .collect::<Vec<_>>(),
+            Target::Ip(address) => vec![*address],
+            _ => {
+                return Err(scan_error_from_network_analysis(
+                    NetworkAnalysisError::UnsupportedTarget,
+                ));
+            }
+        };
+        if matches!(request.target, Target::Ip(IpAddr::V4(_))) {
+            return Err(scan_error_from_network_analysis(
+                NetworkAnalysisError::Ipv4Target,
+            ));
+        }
+        Ok(resolved)
+    }
+
+    async fn scan_ipv6_reachability(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        let resolved = self.resolve_ipv6_candidates(request).await?;
+        let candidates = resolved
+            .iter()
+            .filter_map(|address| match address {
+                IpAddr::V6(address) => Some(*address),
+                IpAddr::V4(_) => None,
+            })
+            .take(host_limit(request).min(request.budget.max_requests))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(ScanResult::completed(
+                vec![Evidence {
+                    kind: "ipv6-resolution".into(),
+                    source: request.target.canonical(),
+                    observation: json!({"ipv6_addresses": 0}),
+                    observed_at: context.clock.now(),
+                }],
+                Vec::new(),
+            ));
+        }
+
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        let mut diagnostics = Vec::new();
+        for address in candidates {
+            let port = 443;
+            let response = self
+                .services
+                .tcp
+                .execute(TcpRequest {
+                    host: address.to_string(),
+                    port,
+                    payload: Vec::new(),
+                    read_response: false,
+                    budget: request.budget,
+                    scope: sugra_domain::ScopeGrant::exact(
+                        &Target::Ip(IpAddr::V6(address)),
+                        request.scope.active_authorized,
+                        context.clock.now(),
+                    ),
+                })
+                .await;
+            let index = evidence.len();
+            match response {
+                Ok(response) => {
+                    if let Some(finding) = ipv6_reachability_finding(
+                        &request.target,
+                        &resolved,
+                        Some(SocketAddr::new(IpAddr::V6(address), port)),
+                        index,
+                    )
+                    .map_err(scan_error_from_network_analysis)?
+                    {
+                        findings.push(finding);
+                    }
+                    evidence.push(Evidence {
+                        kind: "ipv6-reachability".into(),
+                        source: response.endpoint,
+                        observation: json!({
+                            "state": "reachable",
+                            "duration_ms": response.duration_ms,
+                        }),
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        PortErrorKind::Transport | PortErrorKind::Timeout
+                    ) =>
+                {
+                    evidence.push(Evidence {
+                        kind: "ipv6-reachability".into(),
+                        source: format!("[{address}]:{port}"),
+                        observation: json!({"state": "unreachable"}),
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => {
+                    push_network_diagnostic(&mut diagnostics, &address.to_string(), port, &error);
+                }
+            }
+        }
+        network_result(evidence, findings, diagnostics)
+    }
+
     async fn scan_network_tls(
         &self,
         analyzer: Analyzer,
@@ -680,7 +841,7 @@ impl BuiltinScanner {
         let mut findings = Vec::new();
         let mut diagnostics = Vec::new();
         let mut attempts = 0_usize;
-        let mut resumed = false;
+        let mut tls_samples = Vec::new();
         for host in targets {
             for port in &ports {
                 for _ in 0..samples {
@@ -702,7 +863,6 @@ impl BuiltinScanner {
                     {
                         Ok(observation) => {
                             let index = evidence.len();
-                            resumed |= observation.handshake_kind == TlsHandshakeKind::Resumed;
                             if analyzer == Analyzer::TcpCertificate {
                                 let now = context.clock.now().unix_timestamp();
                                 let mut observed = analyze_tls_chain(&observation);
@@ -713,7 +873,7 @@ impl BuiltinScanner {
                             evidence.push(Evidence {
                                 kind: "network-tls-observation".into(),
                                 source: format!("{host}:{port}"),
-                                observation: serde_json::to_value(observation).map_err(|_| {
+                                observation: serde_json::to_value(&observation).map_err(|_| {
                                     ScanError::new(
                                         ScanErrorKind::Internal,
                                         "TLS observation serialization failed",
@@ -721,6 +881,7 @@ impl BuiltinScanner {
                                 })?,
                                 observed_at: context.clock.now(),
                             });
+                            tls_samples.push(observation);
                         }
                         Err(error) => {
                             push_network_diagnostic(&mut diagnostics, &host, *port, &error);
@@ -729,7 +890,9 @@ impl BuiltinScanner {
                 }
             }
         }
-        if analyzer == Analyzer::TcpTlsState && !evidence.is_empty() && !resumed {
+        if analyzer == Analyzer::TcpTlsState
+            && summarize_resumption(&tls_samples) == ResumptionSummary::FullOnlyObserved
+        {
             findings.push(Finding {
                 key: "tls-session-not-resumed".into(),
                 title: "No TLS session resumption was observed in the bounded sample".into(),
@@ -759,13 +922,15 @@ impl BuiltinScanner {
                     break;
                 }
                 attempts += 1;
+                let probe = udp_probe(analyzer, self.descriptor.id.as_str(), *port)?;
                 let response = self
                     .services
                     .udp
                     .execute(UdpRequest {
                         host: host.clone(),
                         port: *port,
-                        payload: udp_payload(analyzer, self.descriptor.id.as_str(), *port)?,
+                        payload: protocol_udp_payload(probe, *port)
+                            .map_err(scan_error_from_network_analysis)?,
                         budget: request.budget,
                         scope: request.scope.clone(),
                     })
@@ -773,15 +938,21 @@ impl BuiltinScanner {
                 match response {
                     Ok(response) => {
                         let index = evidence.len();
-                        findings.extend(analyze_udp_response(analyzer, &response.bytes, index));
+                        let analysis = analyze_protocol_udp_response(
+                            probe,
+                            &response.bytes,
+                            request.budget.max_response_bytes.min(65_507),
+                            index,
+                        )
+                        .map_err(scan_error_from_network_analysis)?;
+                        findings.extend(analysis.findings);
                         evidence.push(Evidence {
                             kind: "udp-observation".into(),
                             source: response.endpoint,
                             observation: json!({
                                 "responded": true,
                                 "bytes": response.bytes.len(),
-                                "sha256": hex::encode(Sha256::digest(&response.bytes)),
-                                "protocol": udp_observation(analyzer, &response.bytes),
+                                "protocol": analysis.classification,
                                 "duration_ms": response.duration_ms,
                             }),
                             observed_at: context.clock.now(),
@@ -928,7 +1099,6 @@ fn analyze_tls(analyzer: Analyzer, observation: &TlsObservation, now: i64) -> Ve
         Analyzer::TlsExpiry => analyze_tls_expiry(observation, now),
         Analyzer::TlsCipher => analyze_tls_cipher(observation),
         Analyzer::TlsProtocol => analyze_tls_protocol(observation),
-        Analyzer::TlsPinning => analyze_tls_pinning(observation),
         _ => Vec::new(),
     }
 }
@@ -1032,30 +1202,25 @@ fn analyze_tls_expiry(observation: &TlsObservation, now: i64) -> Vec<Finding> {
 }
 
 fn analyze_tls_cipher(observation: &TlsObservation) -> Vec<Finding> {
-    let protocol = observation.protocol.to_ascii_lowercase();
-    let cipher = observation.cipher_suite.to_ascii_lowercase();
     let mut findings = Vec::new();
-    if protocol.contains("tlsv1_0") || protocol.contains("tlsv1_1") {
-        findings.push(finding(
+    match negotiated_protocol(observation) {
+        NegotiatedProtocol::Legacy => findings.push(finding(
             "tls-obsolete-protocol",
             "An obsolete TLS protocol version was negotiated",
             Severity::High,
             Confidence::Confirmed,
             0,
-        ));
-    } else if protocol.contains("tlsv1_2") {
-        findings.push(finding(
+        )),
+        NegotiatedProtocol::Tls12 => findings.push(finding(
             "tls-modernization",
             "TLS 1.2 was negotiated; verify TLS 1.3 availability",
             Severity::Info,
             Confidence::Confirmed,
             0,
-        ));
+        )),
+        NegotiatedProtocol::Tls13 | NegotiatedProtocol::Unknown => {}
     }
-    if ["rc4", "3des", "des_cbc", "null", "export"]
-        .iter()
-        .any(|marker| cipher.contains(marker))
-    {
+    if negotiated_cipher(observation) == CipherSummary::KnownWeak {
         findings.push(finding(
             "tls-weak-cipher",
             "A weak TLS cipher suite was negotiated",
@@ -1078,20 +1243,6 @@ fn analyze_tls_protocol(observation: &TlsObservation) -> Vec<Finding> {
             Confidence::Confirmed,
             0,
         )]
-    }
-}
-
-fn analyze_tls_pinning(observation: &TlsObservation) -> Vec<Finding> {
-    if observation.certificate_sha256.is_empty() {
-        vec![finding(
-            "tls-pinning-material-unavailable",
-            "No certificate fingerprint is available for pinning review",
-            Severity::Medium,
-            Confidence::Confirmed,
-            0,
-        )]
-    } else {
-        Vec::new()
     }
 }
 
@@ -1199,21 +1350,25 @@ fn dns_query_plan(
                 .map(|_| query(name.clone(), vec![DnsRecordType::A, DnsRecordType::Aaaa]))
                 .collect()
         }
-        "spf-dkim-dmarc-validator" => vec![
-            query(name.clone(), vec![DnsRecordType::Txt]),
-            query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
-            query(
-                format!("default._domainkey.{name}"),
-                vec![DnsRecordType::Txt],
-            ),
-        ],
-        "email-config" => vec![
-            query(
-                name.clone(),
-                vec![DnsRecordType::Mx, DnsRecordType::Txt, DnsRecordType::Caa],
-            ),
-            query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
-        ],
+        "spf-dkim-dmarc-validator" => {
+            let mut queries = vec![
+                query(name.clone(), vec![DnsRecordType::Txt]),
+                query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
+            ];
+            queries.extend(dkim_queries(&name, request)?);
+            queries
+        }
+        "email-config" => {
+            let mut queries = vec![
+                query(
+                    name.clone(),
+                    vec![DnsRecordType::Mx, DnsRecordType::Txt, DnsRecordType::Caa],
+                ),
+                query(format!("_dmarc.{name}"), vec![DnsRecordType::Txt]),
+            ];
+            queries.extend(dkim_queries(&name, request)?);
+            queries
+        }
         "rogue-subdomain-resolver" | "subdomain-takeover" | "decoy-dns-beacon" => vec![
             query(
                 name.clone(),
@@ -1227,6 +1382,25 @@ fn dns_query_plan(
         _ => vec![query(name, dns_types(id, request))],
     };
     Ok(plan)
+}
+
+fn dkim_queries(domain: &str, request: &ScanRequest) -> Result<Vec<DnsPlannedQuery>, ScanError> {
+    let mut selectors = string_values(&request.options, "selectors");
+    if selectors.is_empty() {
+        selectors.push("default".into());
+    }
+    let selector_refs = selectors.iter().map(String::as_str).collect::<Vec<_>>();
+    dkim_selector_owners(domain, &selector_refs)
+        .map_err(|error| ScanError::new(ScanErrorKind::InvalidInput, error.to_string()))
+        .map(|owners| {
+            owners
+                .into_iter()
+                .map(|name| DnsPlannedQuery {
+                    name,
+                    record_types: vec![DnsRecordType::Txt],
+                })
+                .collect()
+        })
 }
 
 fn typo_candidates(name: &str, limit: usize) -> Vec<String> {
@@ -1578,18 +1752,111 @@ struct ProviderCall {
     operation: &'static str,
     secret_env: Option<String>,
     strategy: Option<&'static str>,
+    controls: ProviderControls,
+}
+
+#[derive(Clone, Default)]
+struct ProviderControls {
+    limit: usize,
+    status_filter: Vec<u16>,
+    collapse_digest: bool,
+    include_wildcard: bool,
+    window: Option<ProviderWindow>,
 }
 
 fn provider_calls(
     id: &str,
     target: &Target,
     options: &BTreeMap<String, Value>,
-) -> Vec<ProviderCall> {
-    if let Some(calls) = provider_registry_calls(id, target, options) {
-        return calls;
+    budget: sugra_domain::Budget,
+) -> Result<Vec<ProviderCall>, ScanError> {
+    if matches!(id, "dark-web-monitoring" | "pastebin-monitoring") {
+        validate_secret_reference_option(options, "hibp_key")?;
     }
-    provider_intelligence_calls(id, target)
-        .unwrap_or_else(|| vec![provider_call("configured-provider", "query", None)])
+    let plan_options = provider_plan_options(id, options)?;
+    if let Some(plan) = provider_plan::plan_for(id, target.kind(), &plan_options)
+        .map_err(|error| provider_plan_error(&error))?
+    {
+        let controls = ProviderControls {
+            limit: plan.limit.min(budget.max_requests),
+            status_filter: plan.status_filter,
+            collapse_digest: plan.collapse_digest,
+            include_wildcard: plan.include_wildcard,
+            window: plan.window,
+        };
+        if id == "performance-monitoring" {
+            let Some(probe) = plan.probes.into_iter().next() else {
+                return Ok(Vec::new());
+            };
+            let mut strategies = string_values(options, "strategies")
+                .into_iter()
+                .filter_map(|strategy| match strategy.as_str() {
+                    "mobile" => Some("mobile"),
+                    "desktop" => Some("desktop"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if strategies.is_empty() {
+                strategies.extend(["mobile", "desktop"]);
+            }
+            return Ok(strategies
+                .into_iter()
+                .take(budget.max_requests)
+                .map(|strategy| ProviderCall {
+                    provider: probe.provider.as_str(),
+                    operation: probe.operation,
+                    secret_env: probe.secret_env.clone(),
+                    strategy: Some(strategy),
+                    controls: controls.clone(),
+                })
+                .collect());
+        }
+        return Ok(plan
+            .probes
+            .into_iter()
+            .take(budget.max_requests)
+            .map(|probe| ProviderCall {
+                provider: probe.provider.as_str(),
+                operation: probe.operation,
+                secret_env: probe.secret_env,
+                strategy: None,
+                controls: controls.clone(),
+            })
+            .collect());
+    }
+    if let Some(calls) = provider_registry_calls(id, target, options) {
+        return Ok(calls);
+    }
+    provider_intelligence_calls(id, target, options).ok_or_else(|| {
+        ScanError::new(
+            ScanErrorKind::DependencyUnavailable,
+            "provider integration is not configured",
+        )
+    })
+}
+
+fn validate_secret_reference_option(
+    options: &BTreeMap<String, Value>,
+    key: &str,
+) -> Result<(), ScanError> {
+    let Some(value) = options.get(key) else {
+        return Ok(());
+    };
+    let valid = value.as_str().is_some_and(|reference| {
+        !reference.is_empty()
+            && reference.len() <= 128
+            && reference
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ScanError::new(
+            ScanErrorKind::InvalidInput,
+            "provider credential reference is invalid",
+        ))
+    }
 }
 
 fn provider_call(
@@ -1602,7 +1869,162 @@ fn provider_call(
         operation,
         secret_env: secret_env.map(str::to_owned),
         strategy: None,
+        controls: ProviderControls::default(),
     }
+}
+
+fn provider_plan_options(
+    scanner_id: &str,
+    options: &BTreeMap<String, Value>,
+) -> Result<ProviderPlanOptions, ScanError> {
+    let mut projected = ProviderPlanOptions {
+        sources: string_values(options, "sources"),
+        provider: options
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        limit: optional_usize(options, "limit"),
+        status_filter: status_values(options, "status_filter")?,
+        collapse_digest: boolean_value(options, "collapse_digest"),
+        include_wildcard: boolean_value(options, "include_wildcard"),
+        short_window: optional_u16(options, "short_window"),
+        long_window: optional_u16(options, "long_window"),
+        days: optional_u16(options, "days"),
+        ..ProviderPlanOptions::default()
+    };
+    match scanner_id {
+        "associated-hosts" => {
+            projected
+                .secret_refs
+                .insert(ProviderName::Shodan, "SHODAN_API_KEY".into());
+        }
+        "domain-reputation-check" => {
+            let virus_total = options
+                .get("vt_key")
+                .and_then(Value::as_str)
+                .unwrap_or("VIRUSTOTAL_API_KEY");
+            projected
+                .secret_refs
+                .insert(ProviderName::VirusTotal, virus_total.into());
+            projected
+                .secret_refs
+                .insert(ProviderName::UrlHaus, "URLHAUS_AUTH_KEY".into());
+        }
+        "ip-reputation-trending" => {
+            projected
+                .secret_refs
+                .insert(ProviderName::AbuseIpDb, "ABUSEIPDB_API_KEY".into());
+        }
+        "performance-monitoring" => {
+            if let Some(value) = options.get("key").and_then(Value::as_str) {
+                projected
+                    .secret_refs
+                    .insert(ProviderName::PageSpeed, value.into());
+            }
+        }
+        _ => {}
+    }
+    Ok(projected)
+}
+
+fn string_values(options: &BTreeMap<String, Value>, key: &str) -> Vec<String> {
+    options
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn optional_usize(options: &BTreeMap<String, Value>, key: &str) -> Option<usize> {
+    options
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn optional_u16(options: &BTreeMap<String, Value>, key: &str) -> Option<u16> {
+    options
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+}
+
+fn boolean_value(options: &BTreeMap<String, Value>, key: &str) -> bool {
+    options.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn status_values(options: &BTreeMap<String, Value>, key: &str) -> Result<Vec<u16>, ScanError> {
+    options
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|status| u16::try_from(status).ok())
+                .or_else(|| Value::as_str(value).and_then(|status| status.parse().ok()))
+                .ok_or_else(|| {
+                    ScanError::new(
+                        ScanErrorKind::InvalidInput,
+                        "status filter must contain HTTP status codes",
+                    )
+                })
+        })
+        .collect()
+}
+
+fn provider_plan_error(error: &ProviderPlanError) -> ScanError {
+    let message = match error {
+        ProviderPlanError::UnsupportedSource(_) => "provider source is not supported",
+        ProviderPlanError::UnsupportedProvider(_) => "provider selection is not supported",
+        ProviderPlanError::UnsupportedTarget { .. } => {
+            "provider selection does not support this target"
+        }
+        ProviderPlanError::InvalidStatus(_) => "status filter contains an invalid HTTP status",
+        ProviderPlanError::InvalidSecretReference(_) => "provider credential reference is invalid",
+        ProviderPlanError::SecretNotSupported(_) => {
+            "provider operation does not accept a credential"
+        }
+    };
+    ScanError::new(ScanErrorKind::InvalidInput, message)
+}
+
+fn provider_temporal_gap(
+    scanner_id: &str,
+    calls: &[ProviderCall],
+    options: &BTreeMap<String, Value>,
+) -> Option<Diagnostic> {
+    let explicitly_requested = match scanner_id {
+        "domain-shadowing-detector" => options.contains_key("days"),
+        "ip-reputation-trending" => {
+            options.contains_key("short_window") || options.contains_key("long_window")
+        }
+        _ => false,
+    };
+    if !explicitly_requested {
+        return None;
+    }
+    let has_window = calls.iter().any(|call| call.controls.window.is_some());
+    if !has_window {
+        return None;
+    }
+    let message = match scanner_id {
+        "domain-shadowing-detector" => {
+            "certificate transparency results do not support the requested lookback filter"
+        }
+        "ip-reputation-trending" => {
+            "configured providers do not expose two comparable historical windows"
+        }
+        _ => return None,
+    };
+    Some(Diagnostic {
+        kind: "temporal-coverage-gap".into(),
+        message: message.into(),
+    })
 }
 
 fn provider_registry_calls(
@@ -1630,42 +2052,7 @@ fn provider_registry_calls(
                     .collect(),
             )
         }
-        "performance-monitoring" => {
-            let secret_env = options
-                .get("key")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let mut strategies: Vec<_> = options
-                .get("strategies")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .filter_map(|strategy| match strategy {
-                    "mobile" => Some("mobile"),
-                    "desktop" => Some("desktop"),
-                    _ => None,
-                })
-                .collect();
-            if strategies.is_empty() {
-                strategies.extend(["mobile", "desktop"]);
-            }
-            Some(
-                strategies
-                    .into_iter()
-                    .map(|strategy| ProviderCall {
-                        provider: "pagespeed",
-                        operation: "analyze",
-                        secret_env: secret_env.clone(),
-                        strategy: Some(strategy),
-                    })
-                    .collect(),
-            )
-        }
-        "asn-lookup" if matches!(target, Target::Ip(_)) => {
-            Some(vec![provider_call("ripestat", "network-info", None)])
-        }
-        "asn-lookup" | "rdap-lookup" | "security-contact-gap-finder" => Some(vec![provider_call(
+        "rdap-lookup" | "security-contact-gap-finder" => Some(vec![provider_call(
             "rdap",
             if matches!(target, Target::Ip(_)) {
                 "ip"
@@ -1688,21 +2075,23 @@ fn provider_registry_calls(
         }
         "rpki-route-validity-check" => Some(vec![provider_call("ripestat", "rpki-history", None)]),
         "irr-routing-registry-analyzer" => Some(vec![provider_call("ripestat", "whois", None)]),
-        "archive-history" => Some(vec![provider_call("wayback", "cdx", None)]),
         _ => None,
     }
 }
 
-fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<ProviderCall>> {
+fn provider_intelligence_calls(
+    id: &str,
+    target: &Target,
+    options: &BTreeMap<String, Value>,
+) -> Option<Vec<ProviderCall>> {
     match id {
-        "associated-hosts" | "domain-shadowing-detector" | "attack-surface-delta" => Some(vec![
+        "attack-surface-delta" => Some(vec![
             provider_call("crtsh", "query", None),
             provider_call("urlscan", "search", None),
         ]),
-        "ct-log-query"
-        | "subdomain-enum"
-        | "certificate-authority-recon"
-        | "rogue-certificate-check" => Some(vec![provider_call("crtsh", "query", None)]),
+        "subdomain-enum" | "certificate-authority-recon" | "rogue-certificate-check" => {
+            Some(vec![provider_call("crtsh", "query", None)])
+        }
         "reverse-ip-lookup" | "passive-dns-history" => {
             Some(vec![provider_call("urlscan", "search", None)])
         }
@@ -1738,20 +2127,17 @@ fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<Provider
             },
             Some("HIBP_API_KEY"),
         )]),
+        "dark-web-monitoring" => Some(vec![hibp_provider_call("stealer-logs-domain", options)]),
+        "pastebin-monitoring" => Some(vec![hibp_provider_call("paste-account", options)]),
         "ssl-labs-report" => Some(vec![provider_call("ssllabs", "analyze", None)]),
         "global-ranking" => Some(vec![provider_call(
             "cloudflare-radar",
             "domain-ranking",
             Some("CLOUDFLARE_API_TOKEN"),
         )]),
-        "ip-reputation-check" | "ip-reputation-trending" => Some(vec![
+        "ip-reputation-check" => Some(vec![
             provider_call("ripestat", "dns-blocklists", None),
             provider_call("abuseipdb", "check", Some("ABUSEIPDB_API_KEY")),
-        ]),
-        "domain-reputation-check" => Some(vec![
-            provider_call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
-            provider_call("urlscan", "search", None),
-            provider_call("urlhaus", "host", Some("URLHAUS_AUTH_KEY")),
         ]),
         "threat-feed-correlator" => Some(vec![
             provider_call("virustotal", "domain", Some("VIRUSTOTAL_API_KEY")),
@@ -1778,10 +2164,23 @@ fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<Provider
             provider_call("urlscan", "search", None),
             provider_call("urlhaus", "host", Some("URLHAUS_AUTH_KEY")),
         ]),
-        "pastebin-monitoring" | "dark-web-monitoring" => {
-            Some(vec![provider_call("configured-monitoring", "search", None)])
-        }
         _ => None,
+    }
+}
+
+fn hibp_provider_call(operation: &'static str, options: &BTreeMap<String, Value>) -> ProviderCall {
+    ProviderCall {
+        provider: "hibp",
+        operation,
+        secret_env: Some(
+            options
+                .get("hibp_key")
+                .and_then(Value::as_str)
+                .unwrap_or("HIBP_API_KEY")
+                .to_owned(),
+        ),
+        strategy: None,
+        controls: ProviderControls::default(),
     }
 }
 
@@ -1795,24 +2194,55 @@ fn provider_query(
     let host = provider_host(target);
     match call.provider {
         "crtsh" => {
-            let query = if matches!(
-                scanner_id,
-                "associated-hosts" | "subdomain-enum" | "domain-shadowing-detector"
-            ) {
+            let query = if call.controls.include_wildcard
+                || matches!(
+                    scanner_id,
+                    "associated-hosts" | "subdomain-enum" | "domain-shadowing-detector"
+                ) {
                 format!("%.{host}")
             } else {
                 host
             };
             BTreeMap::from([("q".into(), Value::String(query))])
         }
-        "wayback" => BTreeMap::from([("url".into(), Value::String(format!("{host}/*")))]),
+        "wayback" => {
+            let mut query = BTreeMap::from([
+                ("url".into(), Value::String(format!("{host}/*"))),
+                ("limit".into(), json!(call.controls.limit)),
+            ]);
+            if !call.controls.status_filter.is_empty() {
+                let statuses = call
+                    .controls
+                    .status_filter
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join("|");
+                query.insert(
+                    "filter".into(),
+                    Value::String(format!("statuscode:({statuses})")),
+                );
+            }
+            if call.controls.collapse_digest {
+                query.insert("collapse".into(), Value::String("digest".into()));
+            }
+            query
+        }
         "urlscan" => {
             let field = match target {
                 Target::Ip(_) | Target::Cidr(_) => "ip",
                 Target::Asn(_) => "asn",
                 _ => "domain",
             };
-            BTreeMap::from([("q".into(), Value::String(format!("{field}:{host}")))])
+            let mut search = format!("{field}:{host}");
+            if let Some(ProviderWindow::LookbackDays(days)) = call.controls.window {
+                let _ = write!(search, " AND date:>now-{days}d");
+            }
+            let mut query = BTreeMap::from([("q".into(), Value::String(search))]);
+            if call.controls.limit > 0 {
+                query.insert("size".into(), json!(call.controls.limit));
+            }
+            query
         }
         "ripestat" if call.operation == "rpki-validation" => BTreeMap::from([
             (
@@ -2166,161 +2596,40 @@ fn udp_ports(id: &str, request: &ScanRequest) -> Vec<u16> {
     }
 }
 
-fn udp_payload(analyzer: Analyzer, id: &str, port: u16) -> Result<Vec<u8>, ScanError> {
-    match port {
-        123 => {
-            let mut packet = vec![0_u8; 48];
-            packet[0] = 0x1b;
-            Ok(packet)
+fn udp_probe(analyzer: Analyzer, id: &str, port: u16) -> Result<UdpProbe, ScanError> {
+    let probe = match analyzer {
+        Analyzer::UdpNtp => UdpProbe::NtpClient,
+        Analyzer::UdpSnmp if id == "snmp-bulk-walk" => UdpProbe::SnmpPublicBulk,
+        Analyzer::UdpSnmp => UdpProbe::SnmpPublicGet,
+        Analyzer::UdpNetbios => UdpProbe::NetbiosNodeStatus,
+        Analyzer::UdpSampler => match port {
+            53 => UdpProbe::DnsRootNameserver,
+            123 => UdpProbe::NtpClient,
+            137 => UdpProbe::NetbiosNodeStatus,
+            161 => UdpProbe::SnmpPublicGet,
+            _ => {
+                return Err(ScanError::new(
+                    ScanErrorKind::InvalidInput,
+                    "UDP sampler port does not have an allowlisted protocol probe",
+                ));
+            }
+        },
+        _ => {
+            return Err(ScanError::new(
+                ScanErrorKind::Internal,
+                "UDP analyzer does not define a protocol probe",
+            ));
         }
-        161 => snmp_request(
-            "public",
-            analyzer == Analyzer::UdpSnmp && id == "snmp-bulk-walk",
-        ),
-        137 => Ok(vec![
-            0x13, 0x37, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, b'C',
-            b'K', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
-            b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
-            b'A', b'A', b'A', 0x00, 0x00, 0x21, 0x00, 0x01,
-        ]),
-        _ => Ok(vec![0_u8; 12]),
-    }
-}
-
-fn snmp_request(community: &str, bulk: bool) -> Result<Vec<u8>, ScanError> {
-    if community.is_empty()
-        || community.len() > 64
-        || !community.bytes().all(|byte| byte.is_ascii_graphic())
-    {
-        return Err(ScanError::new(
-            ScanErrorKind::InvalidInput,
-            "SNMP community must contain 1 to 64 printable ASCII characters",
+    };
+    if probe.port() != port {
+        return Err(scan_error_from_network_analysis(
+            NetworkAnalysisError::PortMismatch {
+                expected: probe.port(),
+                actual: port,
+            },
         ));
     }
-    let oid = ber_tlv(0x06, &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00]);
-    let mut variable = oid;
-    variable.extend(ber_tlv(0x05, &[]));
-    let binding = ber_tlv(0x30, &variable);
-    let bindings = ber_tlv(0x30, &binding);
-    let mut pdu = ber_tlv(0x02, &[0x53, 0x55, 0x47, 0x52]);
-    pdu.extend(ber_tlv(0x02, &[0]));
-    pdu.extend(ber_tlv(0x02, &[if bulk { 10 } else { 0 }]));
-    pdu.extend(bindings);
-    let pdu = ber_tlv(if bulk { 0xa5 } else { 0xa0 }, &pdu);
-    let mut message = ber_tlv(0x02, &[1]);
-    message.extend(ber_tlv(0x04, community.as_bytes()));
-    message.extend(pdu);
-    Ok(ber_tlv(0x30, &message))
-}
-
-fn ber_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut encoded = vec![tag];
-    if body.len() < 128 {
-        encoded.push(u8::try_from(body.len()).unwrap_or(127));
-    } else {
-        encoded.extend_from_slice(&[
-            0x82,
-            u8::try_from((body.len() >> 8) & 0xff).unwrap_or(0xff),
-            u8::try_from(body.len() & 0xff).unwrap_or(0xff),
-        ]);
-    }
-    encoded.extend_from_slice(body);
-    encoded
-}
-
-fn udp_observation(analyzer: Analyzer, response: &[u8]) -> Value {
-    match analyzer {
-        Analyzer::UdpNtp if response.len() >= 48 => json!({
-            "mode": response[0] & 0x07,
-            "version": (response[0] >> 3) & 0x07,
-            "stratum": response[1],
-            "leap_indicator": response[0] >> 6,
-        }),
-        Analyzer::UdpSnmp => json!({
-            "response_valid": snmp_response_status(response).is_some(),
-            "error_status": snmp_response_status(response),
-        }),
-        Analyzer::UdpNetbios => json!({
-            "transaction_matches": response.starts_with(&[0x13, 0x37]),
-            "answer_count": response
-                .get(6..8)
-                .map_or(0, |value| u16::from_be_bytes([value[0], value[1]])),
-        }),
-        _ => json!({"classified": "bounded-datagram"}),
-    }
-}
-
-fn analyze_udp_response(analyzer: Analyzer, response: &[u8], evidence: usize) -> Vec<Finding> {
-    match analyzer {
-        Analyzer::UdpSnmp if snmp_response_status(response) == Some(0) => {
-            vec![finding(
-                "snmp-public-community-accepted",
-                "The SNMP service responded to the public community",
-                Severity::Medium,
-                Confidence::Confirmed,
-                evidence,
-            )]
-        }
-        Analyzer::UdpNtp if response.len() >= 48 => vec![finding(
-            "ntp-service-observed",
-            "An NTP service returned protocol metadata",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        )],
-        _ => Vec::new(),
-    }
-}
-
-fn snmp_response_status(response: &[u8]) -> Option<u8> {
-    let mut outer_offset = 0;
-    let (outer_tag, message) = ber_element(response, &mut outer_offset)?;
-    if outer_tag != 0x30 || outer_offset != response.len() {
-        return None;
-    }
-    let mut message_offset = 0;
-    let (version_tag, _) = ber_element(message, &mut message_offset)?;
-    let (community_tag, community) = ber_element(message, &mut message_offset)?;
-    let (pdu_tag, pdu) = ber_element(message, &mut message_offset)?;
-    if version_tag != 0x02 || community_tag != 0x04 || community != b"public" || pdu_tag != 0xa2 {
-        return None;
-    }
-    let mut pdu_offset = 0;
-    let (request_tag, request_id) = ber_element(pdu, &mut pdu_offset)?;
-    let (status_tag, status) = ber_element(pdu, &mut pdu_offset)?;
-    if request_tag != 0x02
-        || request_id != [0x53, 0x55, 0x47, 0x52]
-        || status_tag != 0x02
-        || status.len() != 1
-    {
-        return None;
-    }
-    status.first().copied()
-}
-
-fn ber_element<'a>(input: &'a [u8], offset: &mut usize) -> Option<(u8, &'a [u8])> {
-    let tag = *input.get(*offset)?;
-    *offset += 1;
-    let first_length = *input.get(*offset)?;
-    *offset += 1;
-    let length = if first_length & 0x80 == 0 {
-        usize::from(first_length)
-    } else {
-        let length_bytes = usize::from(first_length & 0x7f);
-        if length_bytes == 0 || length_bytes > 2 {
-            return None;
-        }
-        let mut length = 0_usize;
-        for byte in input.get(*offset..(*offset).checked_add(length_bytes)?)? {
-            length = length.checked_mul(256)?.checked_add(usize::from(*byte))?;
-        }
-        *offset += length_bytes;
-        length
-    };
-    let end = (*offset).checked_add(length)?;
-    let body = input.get(*offset..end)?;
-    *offset = end;
-    Some((tag, body))
+    Ok(probe)
 }
 
 fn command_kind(id: &str) -> CommandKind {
@@ -2647,6 +2956,32 @@ fn scan_error_from_port(error: PortError) -> ScanError {
     ScanError::new(kind, error.message)
 }
 
+fn scan_error_from_network_analysis(error: NetworkAnalysisError) -> ScanError {
+    let kind = match error {
+        NetworkAnalysisError::Ipv4Target
+        | NetworkAnalysisError::UnsupportedTarget
+        | NetworkAnalysisError::Ipv4Connection
+        | NetworkAnalysisError::ConnectedAddressNotResolved
+        | NetworkAnalysisError::ConnectedAddressDoesNotMatchTarget
+        | NetworkAnalysisError::PortMismatch { .. }
+        | NetworkAnalysisError::InvalidResponseBudget => ScanErrorKind::InvalidInput,
+        NetworkAnalysisError::ResponseTooLarge
+        | NetworkAnalysisError::TruncatedResponse
+        | NetworkAnalysisError::InvalidProtocolResponse => ScanErrorKind::InvalidResponse,
+    };
+    ScanError::new(kind, error.to_string())
+}
+
+fn scan_error_from_tls_analysis(error: TlsAnalysisError) -> ScanError {
+    let kind = match error {
+        TlsAnalysisError::MissingBaseline | TlsAnalysisError::InvalidBaselineSha256 => {
+            ScanErrorKind::InvalidInput
+        }
+        TlsAnalysisError::InvalidObservedSha256 => ScanErrorKind::InvalidResponse,
+    };
+    ScanError::new(kind, error.to_string())
+}
+
 fn safe_text(bytes: &[u8], limit: usize) -> String {
     redact_text(&String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]))
 }
@@ -2713,8 +3048,8 @@ mod tests {
         Clock, CommandPort, CommandResponse, DnsPort, DnsQuery, DnsRecord, DnsRecordType, HttpPort,
         HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse,
         PortError, ProviderPort, ProviderRequest, ProviderResponse, TcpPort, TcpRequest,
-        TcpResponse, TlsCertificate, TlsObservation, TlsPort, TlsRequest, UdpPort, UdpRequest,
-        UdpResponse,
+        TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest,
+        UdpPort, UdpRequest, UdpResponse,
     };
     use sugra_domain::{Budget, ScanRequest, ScopeGrant, ScopeRule, Target, TargetKind};
     use time::OffsetDateTime;
@@ -2735,14 +3070,19 @@ mod tests {
     #[async_trait]
     impl DnsPort for FakeDns {
         async fn query(&self, query: DnsQuery) -> Result<Vec<DnsRecord>, PortError> {
+            let record_type = query
+                .record_types
+                .first()
+                .copied()
+                .unwrap_or(DnsRecordType::A);
             Ok(vec![DnsRecord {
                 name: query.name,
-                record_type: query
-                    .record_types
-                    .first()
-                    .copied()
-                    .unwrap_or(DnsRecordType::A),
-                value: "192.0.2.1".into(),
+                record_type,
+                value: if record_type == DnsRecordType::Aaaa {
+                    "2001:db8::1".into()
+                } else {
+                    "192.0.2.1".into()
+                },
                 ttl: Some(300),
             }])
         }
@@ -2815,7 +3155,11 @@ mod tests {
     impl TcpPort for FakeTcp {
         async fn execute(&self, request: TcpRequest) -> Result<TcpResponse, PortError> {
             Ok(TcpResponse {
-                endpoint: format!("{}:{}", request.host, request.port),
+                endpoint: if request.host.contains(':') {
+                    format!("[{}]:{}", request.host, request.port)
+                } else {
+                    format!("{}:{}", request.host, request.port)
+                },
                 bytes: b"fixture-banner".to_vec(),
                 duration_ms: 1,
             })
@@ -2826,9 +3170,43 @@ mod tests {
     #[async_trait]
     impl UdpPort for FakeUdp {
         async fn execute(&self, request: UdpRequest) -> Result<UdpResponse, PortError> {
+            let bytes = match request.port {
+                53 => {
+                    let mut response = vec![0_u8; 12];
+                    response[..2].copy_from_slice(&request.payload[..2]);
+                    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                    response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                    response
+                }
+                123 => {
+                    let mut response = vec![0_u8; 48];
+                    response[0] = 0x24;
+                    response[1] = 2;
+                    response[24..32].copy_from_slice(&request.payload[40..48]);
+                    response
+                }
+                137 => {
+                    let mut response = vec![0_u8; 12];
+                    response[..2].copy_from_slice(&request.payload[..2]);
+                    response[2..4].copy_from_slice(&0x8000_u16.to_be_bytes());
+                    response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                    response
+                }
+                161 => {
+                    let mut response = request.payload.clone();
+                    if let Some(index) = response
+                        .iter()
+                        .rposition(|byte| matches!(byte, 0xa0 | 0xa5))
+                    {
+                        response[index] = 0xa2;
+                    }
+                    response
+                }
+                _ => Vec::new(),
+            };
             Ok(UdpResponse {
                 endpoint: format!("{}:{}", request.host, request.port),
-                bytes: vec![1, 2, 3],
+                bytes,
                 duration_ms: 1,
             })
         }
@@ -3150,6 +3528,146 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tls_pinning_runtime_requires_and_compares_an_explicit_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let builtins = build_builtins(&services())?;
+        let descriptor = builtins
+            .catalog
+            .iter()
+            .find(|descriptor| descriptor.id.as_str() == "ssl-pinning-check")
+            .ok_or("missing TLS pinning descriptor")?;
+        assert!(descriptor.options[0].required);
+        let scanner = builtins
+            .registry
+            .get(&descriptor.id)
+            .ok_or("missing TLS pinning scanner")?;
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let context = ScanContext {
+            run_id: sugra_domain::RunId::new(),
+            cancellation: CancellationToken::new(),
+            clock: Arc::new(FixedClock),
+        };
+
+        let request = |baseline: Option<Value>| ScanRequest {
+            scanner_id: descriptor.id.clone(),
+            scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+            target: target.clone(),
+            options: baseline
+                .map(|baseline| BTreeMap::from([("baseline_sha256".into(), baseline)]))
+                .unwrap_or_default(),
+            budget: Budget::DEFAULT,
+        };
+        let matching = scanner
+            .scan(&request(Some(json!("00".repeat(32)))), &context)
+            .await?;
+        assert!(matching.findings.is_empty());
+
+        let mismatch = scanner
+            .scan(&request(Some(json!("ff".repeat(32)))), &context)
+            .await?;
+        assert_eq!(mismatch.findings[0].key, "tls-pinning-baseline-mismatch");
+
+        let Err(missing) = scanner.scan(&request(None), &context).await else {
+            return Err("missing baseline must fail".into());
+        };
+        assert_eq!(missing.kind, ScanErrorKind::InvalidInput);
+        let Err(malformed) = scanner
+            .scan(&request(Some(json!("not-a-fingerprint"))), &context)
+            .await
+        else {
+            return Err("malformed baseline must fail".into());
+        };
+        assert_eq!(malformed.kind, ScanErrorKind::InvalidInput);
+        assert!(!malformed.message.contains("not-a-fingerprint"));
+        Ok(())
+    }
+
+    #[test]
+    fn mail_policy_plans_query_each_validated_dkim_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let request = ScanRequest {
+            scanner_id: sugra_domain::ScannerId::new("email-config")?,
+            scope: ScopeGrant::exact(&target, false, OffsetDateTime::UNIX_EPOCH),
+            target: target.clone(),
+            options: BTreeMap::from([("selectors".into(), json!(["google", "default"]))]),
+            budget: Budget::DEFAULT,
+        };
+        let plan = dns_query_plan("email-config", &target, &request)?;
+        let names = plan
+            .iter()
+            .map(|query| query.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("google._domainkey.example.com"));
+        assert!(names.contains("default._domainkey.example.com"));
+
+        let mut invalid = request;
+        invalid
+            .options
+            .insert("selectors".into(), json!(["Sensitive.Value"]));
+        let Err(error) = dns_query_plan("email-config", &target, &invalid) else {
+            return Err("invalid selector must fail".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::InvalidInput);
+        assert!(!error.message.contains("Sensitive.Value"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv6_and_udp_runtime_use_protocol_specific_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let builtins = build_builtins(&services())?;
+        let context = ScanContext {
+            run_id: sugra_domain::RunId::new(),
+            cancellation: CancellationToken::new(),
+            clock: Arc::new(FixedClock),
+        };
+        for id in [
+            "ipv6-reachability-test",
+            "ntp-info-leak-checker",
+            "snmp-public-community-checker",
+            "udp-service-sampler",
+            "netbios-name-query",
+            "snmp-bulk-walk",
+        ] {
+            let descriptor = builtins
+                .catalog
+                .iter()
+                .find(|descriptor| descriptor.id.as_str() == id)
+                .ok_or_else(|| format!("missing descriptor {id}"))?;
+            let scanner = builtins
+                .registry
+                .get(&descriptor.id)
+                .ok_or_else(|| format!("missing scanner {id}"))?;
+            let target = Target::parse(TargetKind::Domain, "example.com")?;
+            let result = scanner
+                .scan(
+                    &ScanRequest {
+                        scanner_id: descriptor.id.clone(),
+                        scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
+                        target,
+                        options: BTreeMap::new(),
+                        budget: Budget::DEFAULT,
+                    },
+                    &context,
+                )
+                .await?;
+            assert!(!result.evidence.is_empty(), "{id} returned no evidence");
+            assert!(
+                !result.findings.is_empty(),
+                "{id} returned no protocol signal"
+            );
+            assert!(
+                result.evidence.iter().all(|evidence| {
+                    evidence.kind.contains("ipv6") || evidence.kind.contains("udp")
+                }),
+                "{id} returned a generic boundary observation"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn every_provider_scanner_has_an_explicit_provider_plan()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3163,17 +3681,51 @@ mod tests {
             }
             provider_scanners += 1;
             let target = target_for(descriptor.target_kinds[0], descriptor.id.as_str())?;
-            let calls = provider_calls(descriptor.id.as_str(), &target, &BTreeMap::new());
+            let calls = provider_calls(
+                descriptor.id.as_str(),
+                &target,
+                &BTreeMap::new(),
+                Budget::DEFAULT,
+            )?;
             assert!(!calls.is_empty(), "{} has no provider plan", descriptor.id);
             assert!(
                 calls
                     .iter()
-                    .all(|call| call.provider != "configured-provider"),
-                "{} fell through to the generic provider",
+                    .all(|call| !call.provider.starts_with("configured-")),
+                "{} fell through to a fictitious provider",
                 descriptor.id
             );
         }
         assert_eq!(provider_scanners, 37);
+        Ok(())
+    }
+
+    #[test]
+    fn lawful_monitoring_scanners_use_explicit_hibp_operations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let dark = provider_calls(
+            "dark-web-monitoring",
+            &domain,
+            &BTreeMap::from([("hibp_key".into(), json!("CUSTOM_HIBP_KEY"))]),
+            Budget::DEFAULT,
+        )?;
+        assert_eq!(dark.len(), 1);
+        assert_eq!(dark[0].provider, "hibp");
+        assert_eq!(dark[0].operation, "stealer-logs-domain");
+        assert_eq!(dark[0].secret_env.as_deref(), Some("CUSTOM_HIBP_KEY"));
+
+        let email = Target::parse(TargetKind::Email, "security@example.com")?;
+        let pastes = provider_calls(
+            "pastebin-monitoring",
+            &email,
+            &BTreeMap::new(),
+            Budget::DEFAULT,
+        )?;
+        assert_eq!(pastes.len(), 1);
+        assert_eq!(pastes[0].provider, "hibp");
+        assert_eq!(pastes[0].operation, "paste-account");
+        assert_eq!(pastes[0].secret_env.as_deref(), Some("HIBP_API_KEY"));
         Ok(())
     }
 
@@ -3186,6 +3738,7 @@ mod tests {
             operation: "rpki-validation",
             secret_env: None,
             strategy: None,
+            controls: ProviderControls::default(),
         };
         let query = provider_query(
             "rpki-route-validity-check",
@@ -3195,6 +3748,223 @@ mod tests {
         );
         assert_eq!(query.get("resource"), Some(&json!("64496")));
         assert_eq!(query.get("prefix"), Some(&json!("192.0.2.0/24")));
+        Ok(())
+    }
+
+    #[test]
+    fn archive_provider_query_applies_limit_status_and_digest_controls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Url, "https://example.com/path")?;
+        let options = BTreeMap::from([
+            ("limit".into(), json!(25)),
+            ("status_filter".into(), json!([200, 301])),
+            ("collapse_digest".into(), json!(true)),
+        ]);
+        let calls = provider_calls("archive-history", &target, &options, Budget::DEFAULT)?;
+        let call = calls.first().ok_or("archive provider call is missing")?;
+        let query = provider_query("archive-history", call, &target, &options);
+
+        assert_eq!(query.get("limit"), Some(&json!(25)));
+        assert_eq!(query.get("filter"), Some(&json!("statuscode:(200|301)")));
+        assert_eq!(query.get("collapse"), Some(&json!("digest")));
+        assert_eq!(query.get("url"), Some(&json!("example.com/*")));
+        Ok(())
+    }
+
+    #[test]
+    fn ct_wildcard_and_urlscan_window_are_projected_without_fake_ripe_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let ct_options = BTreeMap::from([("include_wildcard".into(), json!(true))]);
+        let ct_calls = provider_calls("ct-log-query", &domain, &ct_options, Budget::DEFAULT)?;
+        let ct_query = provider_query("ct-log-query", &ct_calls[0], &domain, &ct_options);
+        assert_eq!(
+            ct_query,
+            BTreeMap::from([("q".into(), json!("%.example.com"))])
+        );
+
+        let shadow_options = BTreeMap::from([("days".into(), json!(14))]);
+        let budget = Budget {
+            max_requests: 7,
+            ..Budget::DEFAULT
+        };
+        let shadow_calls = provider_calls(
+            "domain-shadowing-detector",
+            &domain,
+            &shadow_options,
+            budget,
+        )?;
+        let default_shadow_calls = provider_calls(
+            "domain-shadowing-detector",
+            &domain,
+            &BTreeMap::new(),
+            Budget::DEFAULT,
+        )?;
+        assert!(
+            provider_temporal_gap(
+                "domain-shadowing-detector",
+                &default_shadow_calls,
+                &BTreeMap::new(),
+            )
+            .is_none()
+        );
+        let urlscan = shadow_calls
+            .iter()
+            .find(|call| call.provider == "urlscan")
+            .ok_or("urlscan call is missing")?;
+        let urlscan_query = provider_query(
+            "domain-shadowing-detector",
+            urlscan,
+            &domain,
+            &shadow_options,
+        );
+        assert_eq!(
+            urlscan_query.get("q"),
+            Some(&json!("domain:example.com AND date:>now-14d"))
+        );
+        assert_eq!(urlscan_query.get("size"), Some(&json!(7)));
+
+        let ip = Target::parse(TargetKind::Ip, "192.0.2.10")?;
+        let trend_options = BTreeMap::from([
+            ("short_window".into(), json!(7)),
+            ("long_window".into(), json!(30)),
+        ]);
+        let trend_calls = provider_calls(
+            "ip-reputation-trending",
+            &ip,
+            &trend_options,
+            Budget::DEFAULT,
+        )?;
+        let default_trend_calls = provider_calls(
+            "ip-reputation-trending",
+            &ip,
+            &BTreeMap::new(),
+            Budget::DEFAULT,
+        )?;
+        assert!(
+            provider_temporal_gap(
+                "ip-reputation-trending",
+                &default_trend_calls,
+                &BTreeMap::new(),
+            )
+            .is_none()
+        );
+        let ripe = trend_calls
+            .iter()
+            .find(|call| call.provider == "ripestat")
+            .ok_or("RIPEstat call is missing")?;
+        assert_eq!(
+            provider_query("ip-reputation-trending", ripe, &ip, &trend_options),
+            BTreeMap::from([("resource".into(), json!("192.0.2.10"))])
+        );
+        let gap = provider_temporal_gap("ip-reputation-trending", &trend_calls, &trend_options)
+            .ok_or("temporal coverage gap is missing")?;
+        assert_eq!(gap.kind, "temporal-coverage-gap");
+        assert!(!gap.message.contains("192.0.2.10"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_selection_operations_secrets_and_budget_are_enforced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ip = Target::parse(TargetKind::Ip, "192.0.2.10")?;
+        let associated = provider_calls(
+            "associated-hosts",
+            &ip,
+            &BTreeMap::from([("sources".into(), json!(["shodan", "passive_dns"]))]),
+            Budget {
+                max_requests: 1,
+                ..Budget::DEFAULT
+            },
+        )?;
+        assert_eq!(associated.len(), 1);
+        assert_eq!(associated[0].provider, "shodan");
+        assert_eq!(associated[0].operation, "host");
+        assert_eq!(associated[0].secret_env.as_deref(), Some("SHODAN_API_KEY"));
+
+        let registry = provider_calls(
+            "asn-lookup",
+            &ip,
+            &BTreeMap::from([("provider".into(), json!("both"))]),
+            Budget {
+                max_requests: 2,
+                ..Budget::DEFAULT
+            },
+        )?;
+        assert_eq!(
+            registry
+                .iter()
+                .map(|call| (call.provider, call.operation, call.secret_env.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("rdap", "ip", None), ("ripestat", "network-info", None)]
+        );
+
+        let archive = Target::parse(TargetKind::Domain, "example.com")?;
+        let archive_calls = provider_calls(
+            "archive-history",
+            &archive,
+            &BTreeMap::from([("limit".into(), json!(1_000))]),
+            Budget {
+                max_requests: 3,
+                ..Budget::DEFAULT
+            },
+        )?;
+        let query = provider_query(
+            "archive-history",
+            &archive_calls[0],
+            &archive,
+            &BTreeMap::new(),
+        );
+        assert_eq!(query.get("limit"), Some(&json!(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_provider_options_fail_without_echoing_raw_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let raw_source = "private-provider-token";
+        let source_result = provider_calls(
+            "associated-hosts",
+            &domain,
+            &BTreeMap::from([("sources".into(), json!([raw_source]))]),
+            Budget::DEFAULT,
+        );
+        let Err(source_error) = source_result else {
+            return Err("unsupported provider source must fail".into());
+        };
+        assert_eq!(source_error.kind, ScanErrorKind::InvalidInput);
+        assert!(!source_error.message.contains(raw_source));
+
+        let raw_secret = "not-a-secret-reference";
+        let secret_result = provider_calls(
+            "domain-reputation-check",
+            &domain,
+            &BTreeMap::from([("vt_key".into(), json!(raw_secret))]),
+            Budget::DEFAULT,
+        );
+        let Err(secret_error) = secret_result else {
+            return Err("invalid provider secret reference must fail".into());
+        };
+        assert_eq!(secret_error.kind, ScanErrorKind::InvalidInput);
+        assert!(!secret_error.message.contains(raw_secret));
+
+        for raw_hibp in [json!("invalid-secret-reference"), json!(42)] {
+            let hibp_result = provider_calls(
+                "dark-web-monitoring",
+                &domain,
+                &BTreeMap::from([("hibp_key".into(), raw_hibp)]),
+                Budget::DEFAULT,
+            );
+            let Err(hibp_error) = hibp_result else {
+                return Err("invalid HIBP secret reference must fail".into());
+            };
+            assert_eq!(hibp_error.kind, ScanErrorKind::InvalidInput);
+            assert_eq!(
+                hibp_error.message,
+                "provider credential reference is invalid"
+            );
+        }
         Ok(())
     }
 
@@ -3209,7 +3979,7 @@ mod tests {
             ),
             ("qtype".into(), json!("AAAA")),
         ]);
-        let calls = provider_calls("dns-over-https", &target, &options);
+        let calls = provider_calls("dns-over-https", &target, &options, Budget::DEFAULT)?;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].provider, "google-doh");
         assert_eq!(calls[1].provider, "cloudflare-doh");
@@ -3264,7 +4034,7 @@ mod tests {
             ("key".into(), json!("GOOGLE_API_KEY")),
             ("strategies".into(), json!(["desktop"])),
         ]);
-        let calls = provider_calls("performance-monitoring", &target, &options);
+        let calls = provider_calls("performance-monitoring", &target, &options, Budget::DEFAULT)?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].provider, "pagespeed");
         assert_eq!(calls[0].secret_env.as_deref(), Some("GOOGLE_API_KEY"));
@@ -3272,7 +4042,12 @@ mod tests {
         assert_eq!(query.get("url"), Some(&json!("https://example.com/path")));
         assert_eq!(query.get("strategy"), Some(&json!("desktop")));
 
-        let defaults = provider_calls("performance-monitoring", &target, &BTreeMap::new());
+        let defaults = provider_calls(
+            "performance-monitoring",
+            &target,
+            &BTreeMap::new(),
+            Budget::DEFAULT,
+        )?;
         assert_eq!(
             defaults
                 .iter()
@@ -3361,39 +4136,6 @@ mod tests {
     }
 
     #[test]
-    fn snmp_requests_are_bounded_and_distinguish_get_from_bulk()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let get = snmp_request("public", false)?;
-        let bulk = snmp_request("public", true)?;
-        assert_eq!(get.first(), Some(&0x30));
-        assert!(get.contains(&0xa0));
-        assert!(!get.contains(&0xa5));
-        assert!(bulk.contains(&0xa5));
-        assert!(snmp_request("", false).is_err());
-        assert!(snmp_request(&"x".repeat(65), false).is_err());
-
-        let mut pdu = ber_tlv(0x02, &[0x53, 0x55, 0x47, 0x52]);
-        pdu.extend(ber_tlv(0x02, &[0]));
-        pdu.extend(ber_tlv(0x02, &[0]));
-        pdu.extend(ber_tlv(0x30, &[]));
-        let mut message = ber_tlv(0x02, &[1]);
-        message.extend(ber_tlv(0x04, b"public"));
-        message.extend(ber_tlv(0xa2, &pdu));
-        let response = ber_tlv(0x30, &message);
-        assert_eq!(snmp_response_status(&response), Some(0));
-        let mut invalid = response;
-        let Some(request_id) = invalid
-            .windows(4)
-            .position(|window| window == [0x53, 0x55, 0x47, 0x52])
-        else {
-            return Err("fixture SNMP request ID is missing".into());
-        };
-        invalid[request_id] = 0;
-        assert_eq!(snmp_response_status(&invalid), None);
-        Ok(())
-    }
-
-    #[test]
     fn jwt_time_analysis_reports_expiry_activation_and_clock_skew() {
         let findings = jwt_time_findings(&json!({"exp": 99, "nbf": 200, "iat": 500}), 100);
         let keys: BTreeSet<_> = findings
@@ -3466,11 +4208,16 @@ mod tests {
                 .get(&descriptor.id)
                 .ok_or_else(|| format!("missing implementation for {}", descriptor.id))?;
             let target = target_for(descriptor.target_kinds[0], descriptor.id.as_str())?;
+            let options = if descriptor.id.as_str() == "ssl-pinning-check" {
+                BTreeMap::from([("baseline_sha256".into(), json!("00".repeat(32)))])
+            } else {
+                BTreeMap::new()
+            };
             let request = ScanRequest {
                 scanner_id: descriptor.id.clone(),
                 scope: ScopeGrant::exact(&target, true, OffsetDateTime::UNIX_EPOCH),
                 target,
-                options: BTreeMap::new(),
+                options,
                 budget: Budget {
                     max_requests: 4,
                     ..Budget::default()

@@ -35,6 +35,11 @@ impl ProviderPort for ReqwestProvider {
         let mut headers = BTreeMap::new();
         if request.provider == "cloudflare-doh" {
             headers.insert("accept".into(), "application/dns-json".into());
+        } else if request.provider == "hibp" {
+            headers.insert(
+                "user-agent".into(),
+                format!("Sugra/{} HIBP integration", env!("CARGO_PKG_VERSION")),
+            );
         } else if request.provider == "censys" {
             let asset = if request.operation == "webproperty" {
                 "webproperty"
@@ -120,12 +125,17 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
             ("virustotal", "ip") => ("https://www.virustotal.com/api/v3/ip_addresses", &[]),
             ("hibp", "account") => ("https://haveibeenpwned.com/api/v3/breachedaccount", &[]),
             ("hibp", "domain") => ("https://haveibeenpwned.com/api/v3/breacheddomain", &[]),
+            ("hibp", "stealer-logs-domain") => (
+                "https://haveibeenpwned.com/api/v3/stealerLogsByWebsiteDomain",
+                &[],
+            ),
+            ("hibp", "paste-account") => ("https://haveibeenpwned.com/api/v3/pasteAccount", &[]),
             ("abuseipdb", "check") => ("https://api.abuseipdb.com/api/v2/check", &[]),
             ("ipinfo", "lookup") => ("https://ipinfo.io", &[]),
             ("otx", "domain") => ("https://otx.alienvault.com/api/v1/indicators/domain", &[]),
             ("urlhaus", "host") => ("https://urlhaus-api.abuse.ch/v1/host/", &[]),
             ("ssllabs", "analyze") => ("https://api.ssllabs.com/api/v3/analyze", &[]),
-            ("urlscan", "search") => ("https://urlscan.io/api/v1/search/", &[("size", "100")]),
+            ("urlscan", "search") => ("https://urlscan.io/api/v1/search/", &[]),
             ("censys", "host") => ("https://api.platform.censys.io/v3/global/asset/host", &[]),
             ("censys", "webproperty") => (
                 "https://api.platform.censys.io/v3/global/asset/webproperty",
@@ -171,6 +181,9 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
         for (key, value) in fixed {
             pairs.append_pair(key, value);
         }
+        if request.provider == "urlscan" && !request.query.contains_key("size") {
+            pairs.append_pair("size", "100");
+        }
         for (key, value) in &request.query {
             if request.provider == "urlhaus" {
                 continue;
@@ -196,7 +209,10 @@ fn provider_target_in_path(provider: &str, operation: &str) -> bool {
         (provider, operation),
         ("rdap" | "virustotal", "domain" | "ip")
             | ("shodan", "host")
-            | ("hibp", "account" | "domain")
+            | (
+                "hibp",
+                "account" | "domain" | "stealer-logs-domain" | "paste-account"
+            )
             | ("ipinfo", "lookup")
             | ("otx", "domain")
             | ("censys", "host" | "webproperty")
@@ -447,6 +463,43 @@ mod tests {
     }
 
     #[test]
+    fn hibp_monitoring_operations_use_allowlisted_path_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "stealer-logs-domain",
+                "example.com",
+                "/api/v3/stealerLogsByWebsiteDomain/example.com",
+            ),
+            (
+                "paste-account",
+                "alice@example.com",
+                "/api/v3/pasteAccount/alice@example.com",
+            ),
+        ];
+
+        for (operation, target, expected_path) in cases {
+            let endpoint = endpoint_for(&request(
+                "hibp",
+                operation,
+                BTreeMap::from([("target".into(), json!(target))]),
+            ))?;
+            assert_eq!(endpoint.host_str(), Some("haveibeenpwned.com"));
+            assert_eq!(endpoint.path(), expected_path);
+            assert!(endpoint.query().is_none());
+        }
+        assert!(
+            endpoint_for(&request(
+                "hibp",
+                "stealer-logs-email",
+                BTreeMap::from([("target".into(), json!("alice@example.com"))]),
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn doh_endpoint_preserves_bounded_query_parameters() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = endpoint_for(&request(
             "cloudflare-doh",
@@ -582,17 +635,32 @@ mod tests {
 
     #[test]
     fn urlscan_search_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = endpoint_for(&request(
+        let default_endpoint = endpoint_for(&request(
             "urlscan",
             "search",
             BTreeMap::from([("q".into(), json!("domain:example.com"))]),
         ))?;
-        let pairs: BTreeMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        let pairs: BTreeMap<_, _> = default_endpoint.query_pairs().into_owned().collect();
         assert_eq!(
             pairs.get("q").map(String::as_str),
             Some("domain:example.com")
         );
         assert_eq!(pairs.get("size").map(String::as_str), Some("100"));
+
+        let planned_endpoint = endpoint_for(&request(
+            "urlscan",
+            "search",
+            BTreeMap::from([
+                ("q".into(), json!("domain:example.com")),
+                ("size".into(), json!(7)),
+            ]),
+        ))?;
+        let sizes: Vec<_> = planned_endpoint
+            .query_pairs()
+            .filter(|(key, _)| key == "size")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(sizes, vec!["7"]);
         Ok(())
     }
 
@@ -659,6 +727,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hibp_query_sends_an_identifiable_user_agent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (provider, requests) = provider(Ok(response(200, b"[]")));
+        provider
+            .query(request(
+                "hibp",
+                "paste-account",
+                BTreeMap::from([("target".into(), json!("alice@example.com"))]),
+            ))
+            .await?;
+
+        let requests = requests.lock().map_err(|_| "test request lock failed")?;
+        let sent = requests.first().ok_or("provider did not issue a request")?;
+        let user_agent = sent
+            .headers
+            .get("user-agent")
+            .ok_or("HIBP request omitted user-agent")?;
+        assert!(user_agent.starts_with("Sugra/"));
+        assert!(user_agent.contains("HIBP"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_classifies_status_body_and_transport_failures() {
         let cases = [
             (
@@ -716,6 +807,31 @@ mod tests {
 
         let Err(error) = provider.query(request).await else {
             return Err("missing credential unexpectedly succeeded".into());
+        };
+        assert_eq!(error.kind, PortErrorKind::Unavailable);
+        assert_eq!(error.message, "provider credential is not configured");
+        assert!(
+            requests
+                .lock()
+                .map_err(|_| "test request lock failed")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_hibp_credentials_fail_before_the_http_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (provider, requests) = provider(Ok(response(200, b"[]")));
+        let mut request = request(
+            "hibp",
+            "stealer-logs-domain",
+            BTreeMap::from([("target".into(), json!("example.com"))]),
+        );
+        request.secret_env = Some("SUGRA_TEST_HIBP_CREDENTIAL_THAT_MUST_NOT_EXIST_4CF1".into());
+
+        let Err(error) = provider.query(request).await else {
+            return Err("missing HIBP credential unexpectedly succeeded".into());
         };
         assert_eq!(error.kind, PortErrorKind::Unavailable);
         assert_eq!(error.message, "provider credential is not configured");

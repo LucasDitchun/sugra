@@ -6,6 +6,7 @@ use sugra_domain::{
 };
 
 use crate::definition::{Operation, ScannerDefinition};
+use crate::dns_analysis::MAX_DKIM_SELECTORS;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
@@ -1071,9 +1072,9 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             "pastebin-monitoring",
             "Pastebin Monitoring",
             Operation::Intelligence,
-            vec![TargetKind::Domain],
+            vec![TargetKind::Email],
             vec![Capability::ThirdPartyApi, Capability::SensitiveOutput],
-            &[],
+            &["hibp_key"],
         )?,
         definition(
             LegacyId::Catalog(103),
@@ -1163,7 +1164,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Dns,
             vec![TargetKind::Domain, TargetKind::Email],
             vec![Capability::PassiveNetwork],
-            &[],
+            &["selectors"],
         )?,
         definition(
             LegacyId::Catalog(106),
@@ -1181,7 +1182,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Tls,
             vec![TargetKind::Domain, TargetKind::Url],
             vec![Capability::ActiveHttpSafe],
-            &[],
+            &["baseline_sha256"],
         )?,
         definition(
             LegacyId::Catalog(108),
@@ -1235,7 +1236,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Intelligence,
             vec![TargetKind::Domain, TargetKind::Url],
             vec![Capability::ThirdPartyApi, Capability::SensitiveOutput],
-            &[],
+            &["hibp_key"],
         )?,
         definition(
             LegacyId::Additional(2),
@@ -1271,7 +1272,7 @@ pub(crate) fn definitions() -> Result<Vec<ScannerDefinition>, DomainError> {
             Operation::Dns,
             vec![TargetKind::Domain],
             vec![Capability::PassiveNetwork],
-            &[],
+            &["selectors"],
         )?,
         definition(
             LegacyId::Additional(6),
@@ -1405,6 +1406,26 @@ fn track(operation: Operation) -> &'static str {
 
 fn option(name: &str) -> OptionDefinition {
     let lower = name.to_ascii_lowercase();
+    if lower == "baseline_sha256" {
+        return OptionDefinition {
+            key: name.into(),
+            description: "Required lowercase SHA-256 certificate pinning baseline.".into(),
+            default: None,
+            required: true,
+            kind: OptionKind::Text { max_len: 64 },
+        };
+    }
+    if lower == "selectors" {
+        return OptionDefinition {
+            key: name.into(),
+            description: "Canonical DKIM selector labels queried for public keys.".into(),
+            default: Some("default".into()),
+            required: false,
+            kind: OptionKind::List {
+                max_items: MAX_DKIM_SELECTORS,
+            },
+        };
+    }
     let kind = if lower.contains("key") || lower.contains("secret") || lower.contains("token") {
         OptionKind::SecretRef
     } else if lower.starts_with("include")
@@ -1471,6 +1492,7 @@ fn option(name: &str) -> OptionDefinition {
 fn secret_default(name: &str) -> Option<String> {
     match name.to_ascii_lowercase().as_str() {
         "vt_key" | "virustotal_key" => Some("VIRUSTOTAL_API_KEY".into()),
+        "hibp_key" => Some("HIBP_API_KEY".into()),
         "shodan_key" => Some("SHODAN_API_KEY".into()),
         "censys_key" => Some("CENSYS_API_SECRET".into()),
         _ => None,
@@ -1501,6 +1523,70 @@ mod tests {
     }
 
     #[test]
+    fn hibp_monitoring_descriptors_publish_legal_targets_and_secret_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = definitions()?;
+        for (id, target_kinds) in [
+            (
+                "dark-web-monitoring",
+                vec![TargetKind::Domain, TargetKind::Url],
+            ),
+            ("pastebin-monitoring", vec![TargetKind::Email]),
+        ] {
+            let descriptor = definitions
+                .iter()
+                .find(|definition| definition.descriptor.id.as_str() == id)
+                .map(|definition| &definition.descriptor)
+                .ok_or_else(|| format!("missing descriptor {id}"))?;
+            assert_eq!(descriptor.target_kinds, target_kinds);
+            assert_eq!(descriptor.options.len(), 1);
+            assert_eq!(descriptor.options[0].key, "hibp_key");
+            assert_eq!(descriptor.options[0].kind, OptionKind::SecretRef);
+            assert_eq!(
+                descriptor.options[0].default.as_deref(),
+                Some("HIBP_API_KEY")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sha256_baselines_preserve_scanner_specific_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = definitions()?;
+        for id in ["attack-surface-delta", "security-changelog-diff"] {
+            let baseline = definitions
+                .iter()
+                .find(|definition| definition.descriptor.id.as_str() == id)
+                .and_then(|definition| {
+                    definition
+                        .descriptor
+                        .options
+                        .iter()
+                        .find(|option| option.key == "baseline_sha256")
+                })
+                .ok_or_else(|| format!("missing SHA-256 baseline for {id}"))?;
+            assert!(!baseline.required);
+            assert!(baseline.description.starts_with("Optional"));
+        }
+
+        let pinning = definitions
+            .iter()
+            .find(|definition| definition.descriptor.id.as_str() == "ssl-pinning-check")
+            .and_then(|definition| {
+                definition
+                    .descriptor
+                    .options
+                    .iter()
+                    .find(|option| option.key == "baseline_sha256")
+            })
+            .ok_or("missing TLS pinning baseline")?;
+        assert!(pinning.required);
+        assert!(pinning.description.contains("certificate pinning"));
+        Ok(())
+    }
+
+    #[test]
     fn address_reputation_rejects_non_address_targets() -> Result<(), Box<dyn std::error::Error>> {
         let definitions = definitions()?;
         let descriptor = definitions
@@ -1509,6 +1595,27 @@ mod tests {
             .map(|definition| &definition.descriptor)
             .ok_or("missing address reputation descriptor")?;
         assert_eq!(descriptor.target_kinds, vec![TargetKind::Ip]);
+        Ok(())
+    }
+
+    #[test]
+    fn mail_policy_scanners_publish_bounded_dkim_selectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definitions = definitions()?;
+        for id in ["email-config", "spf-dkim-dmarc-validator"] {
+            let descriptor = definitions
+                .iter()
+                .find(|definition| definition.descriptor.id.as_str() == id)
+                .map(|definition| &definition.descriptor)
+                .ok_or_else(|| format!("missing descriptor {id}"))?;
+            assert_eq!(descriptor.options.len(), 1);
+            let selectors = &descriptor.options[0];
+            assert_eq!(selectors.key, "selectors");
+            assert_eq!(selectors.kind, OptionKind::List { max_items: 16 });
+            assert_eq!(selectors.default.as_deref(), Some("default"));
+            assert!(!selectors.required);
+            selectors.validate()?;
+        }
         Ok(())
     }
 }

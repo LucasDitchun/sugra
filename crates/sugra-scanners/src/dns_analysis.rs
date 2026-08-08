@@ -2,6 +2,64 @@
 
 use sugra_core::{DnsRecord, DnsRecordType};
 use sugra_domain::{Confidence, Finding, Severity};
+use thiserror::Error;
+
+/// Maximum number of DKIM selectors accepted by one bounded DNS scan.
+pub(crate) const MAX_DKIM_SELECTORS: usize = 16;
+
+/// Typed failures raised while constructing bounded DKIM query owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum DkimSelectorError {
+    /// No owner could be constructed because the selector list was empty.
+    #[error("the DKIM selector list must contain at least one item")]
+    EmptySelectors,
+    /// The raw input exceeded the declared query budget.
+    #[error("the DKIM selector list exceeds the supported item limit")]
+    TooManySelectors,
+    /// A selector was not a canonical lowercase DNS label.
+    #[error("a DKIM selector is not a canonical single DNS label")]
+    InvalidSelector,
+}
+
+/// Builds the DNS owners queried for the requested DKIM selectors.
+///
+/// # Errors
+///
+/// Returns a typed, value-free error when the selector list is empty or too
+/// large, or when any selector is not a canonical lowercase DNS label.
+pub(crate) fn dkim_selector_owners(
+    domain: &str,
+    selectors: &[&str],
+) -> Result<Vec<String>, DkimSelectorError> {
+    if selectors.is_empty() {
+        return Err(DkimSelectorError::EmptySelectors);
+    }
+    if selectors.len() > MAX_DKIM_SELECTORS {
+        return Err(DkimSelectorError::TooManySelectors);
+    }
+    if selectors.iter().any(|selector| {
+        selector.is_empty()
+            || selector.len() > 63
+            || selector.starts_with('-')
+            || selector.ends_with('-')
+            || !selector
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }) {
+        return Err(DkimSelectorError::InvalidSelector);
+    }
+    let domain = canonical_name(domain);
+    let mut unique = Vec::new();
+    for selector in selectors {
+        if !unique.contains(selector) {
+            unique.push(*selector);
+        }
+    }
+    Ok(unique
+        .into_iter()
+        .map(|selector| format!("{selector}._domainkey.{domain}"))
+        .collect())
+}
 
 /// Evaluates whether both sides of the DNSSEC delegation chain were observed.
 pub(crate) fn dnssec_findings(
@@ -272,6 +330,81 @@ mod tests {
             .iter()
             .map(|finding| finding.key.as_str())
             .collect()
+    }
+
+    #[test]
+    fn dkim_selector_owners_build_canonical_dns_names() {
+        assert_eq!(
+            dkim_selector_owners("EXAMPLE.COM.", &["default"]),
+            Ok(vec!["default._domainkey.example.com".into()])
+        );
+    }
+
+    #[test]
+    fn dkim_selector_owners_deduplicate_without_reordering() {
+        assert_eq!(
+            dkim_selector_owners("example.com", &["google", "default", "google"]),
+            Ok(vec![
+                "google._domainkey.example.com".into(),
+                "default._domainkey.example.com".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn dkim_selector_owners_enforce_the_small_list_boundary() {
+        let values = (0..=MAX_DKIM_SELECTORS)
+            .map(|index| format!("s{index}"))
+            .collect::<Vec<_>>();
+        let at_limit = values[..MAX_DKIM_SELECTORS]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dkim_selector_owners("example.com", &at_limit).map(|owners| owners.len()),
+            Ok(MAX_DKIM_SELECTORS)
+        );
+
+        let above_limit = values.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            dkim_selector_owners("example.com", &above_limit),
+            Err(DkimSelectorError::TooManySelectors)
+        );
+    }
+
+    #[test]
+    fn dkim_selector_owners_require_at_least_one_selector() {
+        assert_eq!(
+            dkim_selector_owners("example.com", &[]),
+            Err(DkimSelectorError::EmptySelectors)
+        );
+    }
+
+    #[test]
+    fn dkim_selector_owners_reject_noncanonical_labels_without_echoing_them() {
+        let oversized = "a".repeat(64);
+        let invalid = [
+            "",
+            "Default",
+            "two.labels",
+            "under_score",
+            "-leading",
+            "trailing-",
+            "não-ascii",
+            oversized.as_str(),
+            "sensitive-token.example",
+        ];
+
+        for selector in invalid {
+            let Err(error) = dkim_selector_owners("example.com", &[selector]) else {
+                unreachable!("a noncanonical selector must be rejected");
+            };
+            assert_eq!(error, DkimSelectorError::InvalidSelector);
+            assert_eq!(
+                error.to_string(),
+                "a DKIM selector is not a canonical single DNS label"
+            );
+        }
     }
 
     #[test]

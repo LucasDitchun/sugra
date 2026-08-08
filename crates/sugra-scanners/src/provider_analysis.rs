@@ -6,6 +6,8 @@ use serde::Serialize;
 use serde_json::Value;
 use sugra_domain::{Confidence, Severity};
 
+const MAX_PROVIDER_RECORDS: usize = 10_000;
+
 /// Optional operator-owned reference data used by a provider analyzer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProviderBaseline<'a> {
@@ -98,6 +100,18 @@ pub(crate) enum ProviderSummary {
         /// Abuse confidence score from 0 through 100.
         abuse_confidence: Option<u8>,
     },
+    /// HIBP stealer-log account exposure reduced to a count.
+    HibpStealerLogs {
+        /// Email accounts present in the bounded provider response.
+        exposed_accounts: usize,
+    },
+    /// HIBP paste observations reduced to aggregate counts.
+    HibpPastes {
+        /// Paste records present in the bounded provider response.
+        pastes: usize,
+        /// Total email mentions reported across the bounded paste records.
+        email_mentions: u64,
+    },
 }
 
 /// Finding independent of result evidence indexing.
@@ -132,7 +146,75 @@ pub(crate) fn analyze_provider_response(
         "virustotal" | "abuseipdb" | "urlhaus" | "otx" => {
             Some(analyze_reputation(scanner_id, response))
         }
+        "hibp" if scanner_id == "dark-web-monitoring" => Some(analyze_hibp_stealer_logs(response)),
+        "hibp" if scanner_id == "pastebin-monitoring" => Some(analyze_hibp_pastes(response)),
         _ => None,
+    }
+}
+
+fn analyze_hibp_stealer_logs(response: &Value) -> ProviderAnalysis {
+    let exposed_accounts = response
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter(|account| account.as_str().is_some())
+        .count();
+    let findings = if exposed_accounts > 0 {
+        vec![ProviderFinding {
+            key: "stealer-log-accounts-present",
+            title: "HIBP returned stealer-log accounts for the monitored website domain",
+            severity: Severity::High,
+            confidence: Confidence::Confirmed,
+        }]
+    } else {
+        Vec::new()
+    };
+    ProviderAnalysis {
+        summary: ProviderSummary::HibpStealerLogs { exposed_accounts },
+        findings,
+    }
+}
+
+fn analyze_hibp_pastes(response: &Value) -> ProviderAnalysis {
+    let mut pastes = 0_usize;
+    let mut email_mentions = 0_u64;
+    for paste in response
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+    {
+        let Some(paste) = paste.as_object() else {
+            continue;
+        };
+        let structurally_valid = paste.get("Source").and_then(Value::as_str).is_some()
+            && paste.get("Id").and_then(Value::as_str).is_some();
+        let Some(email_count) = paste.get("EmailCount").and_then(Value::as_u64) else {
+            continue;
+        };
+        if !structurally_valid {
+            continue;
+        }
+        pastes += 1;
+        email_mentions = email_mentions.saturating_add(email_count);
+    }
+    let findings = if pastes > 0 {
+        vec![ProviderFinding {
+            key: "paste-observations-present",
+            title: "HIBP returned paste observations for the monitored email account",
+            severity: Severity::High,
+            confidence: Confidence::Confirmed,
+        }]
+    } else {
+        Vec::new()
+    };
+    ProviderAnalysis {
+        summary: ProviderSummary::HibpPastes {
+            pastes,
+            email_mentions,
+        },
+        findings,
     }
 }
 
@@ -790,6 +872,138 @@ mod tests {
             analysis.summary,
             ProviderSummary::Reputation { harmless: 52, .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn dark_web_monitoring_counts_stealer_log_accounts_without_retaining_emails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let analysis = analyze_provider_response(
+            "dark-web-monitoring",
+            "hibp",
+            &json!(["alice@example.com", "bob@example.net"]),
+            ProviderBaseline::None,
+        )
+        .ok_or("HIBP response must be supported")?;
+
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::HibpStealerLogs {
+                exposed_accounts: 2,
+            }
+        );
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].key, "stealer-log-accounts-present");
+        let serialized = serde_json::to_string(&analysis)?;
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("bob@example.net"));
+        Ok(())
+    }
+
+    #[test]
+    fn pastebin_monitoring_counts_pastes_without_retaining_ids_or_titles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let analysis = analyze_provider_response(
+            "pastebin-monitoring",
+            "hibp",
+            &json!([
+                {
+                    "Source": "Pastebin",
+                    "Id": "private-paste-id",
+                    "Title": "private paste title",
+                    "EmailCount": 139
+                },
+                {"Source": "Pastie", "Id": "other-private-id", "EmailCount": 30}
+            ]),
+            ProviderBaseline::None,
+        )
+        .ok_or("HIBP response must be supported")?;
+
+        assert_eq!(
+            analysis.summary,
+            ProviderSummary::HibpPastes {
+                pastes: 2,
+                email_mentions: 169,
+            }
+        );
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].key, "paste-observations-present");
+        let serialized = serde_json::to_string(&analysis)?;
+        assert!(!serialized.contains("private-paste-id"));
+        assert!(!serialized.contains("private paste title"));
+        assert!(!serialized.contains("other-private-id"));
+        Ok(())
+    }
+
+    #[test]
+    fn hibp_empty_results_are_negative_controls() -> Result<(), Box<dyn std::error::Error>> {
+        let cases = ["dark-web-monitoring", "pastebin-monitoring"];
+        for scanner_id in cases {
+            let analysis =
+                analyze_provider_response(scanner_id, "hibp", &json!([]), ProviderBaseline::None)
+                    .ok_or("HIBP response must be supported")?;
+            assert!(analysis.findings.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hibp_malformed_records_are_ignored_and_counts_saturate_without_leaks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stealer_logs = analyze_provider_response(
+            "dark-web-monitoring",
+            "hibp",
+            &json!([null, 7, {"Email": "hidden@example.com"}, "valid@example.com"]),
+            ProviderBaseline::None,
+        )
+        .ok_or("HIBP response must be supported")?;
+        assert_eq!(
+            stealer_logs.summary,
+            ProviderSummary::HibpStealerLogs {
+                exposed_accounts: 1,
+            }
+        );
+
+        let pastes = analyze_provider_response(
+            "pastebin-monitoring",
+            "hibp",
+            &json!([
+                null,
+                "invalid",
+                {"Id": "malformed-secret-id", "Title": "secret-title", "EmailCount": 7},
+                {"Source": "Pastebin", "Id": "secret-id", "EmailCount": u64::MAX},
+                {"Source": "Pastie", "Id": "other-secret-id", "EmailCount": 1}
+            ]),
+            ProviderBaseline::None,
+        )
+        .ok_or("HIBP response must be supported")?;
+        assert_eq!(
+            pastes.summary,
+            ProviderSummary::HibpPastes {
+                pastes: 2,
+                email_mentions: u64::MAX,
+            }
+        );
+
+        let serialized = serde_json::to_string(&(stealer_logs, pastes))?;
+        assert!(!serialized.contains("hidden@example.com"));
+        assert!(!serialized.contains("valid@example.com"));
+        assert!(!serialized.contains("secret-id"));
+        assert!(!serialized.contains("secret-title"));
+
+        let bounded = analyze_provider_response(
+            "dark-web-monitoring",
+            "hibp",
+            &Value::Array(vec![json!("hidden@example.com"); MAX_PROVIDER_RECORDS + 1]),
+            ProviderBaseline::None,
+        )
+        .ok_or("HIBP response must be supported")?;
+        assert_eq!(
+            bounded.summary,
+            ProviderSummary::HibpStealerLogs {
+                exposed_accounts: MAX_PROVIDER_RECORDS,
+            }
+        );
         Ok(())
     }
 
