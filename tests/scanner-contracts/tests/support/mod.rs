@@ -322,16 +322,55 @@ struct FakeTcp(Harness);
 impl TcpPort for FakeTcp {
     async fn execute(&self, request: TcpRequest) -> Result<TcpResponse, PortError> {
         self.0.record(Boundary::Tcp)?;
+        let bytes = if request.port == 53 && request.read_response {
+            fake_axfr_response(&request.payload)
+        } else {
+            format!("fixture-banner {SECRET_MARKER}").into_bytes()
+        };
         Ok(TcpResponse {
             endpoint: if request.host.contains(':') {
                 format!("[{}]:{}", request.host, request.port)
             } else {
                 format!("{}:{}", request.host, request.port)
             },
-            bytes: format!("fixture-banner {SECRET_MARKER}").into_bytes(),
+            bytes,
             duration_ms: 1,
         })
     }
+}
+
+fn fake_axfr_response(query: &[u8]) -> Vec<u8> {
+    let Some(transaction) = query.get(2..4) else {
+        return Vec::new();
+    };
+    let Some(question) = query.get(14..) else {
+        return Vec::new();
+    };
+    let mut message = vec![
+        transaction[0],
+        transaction[1],
+        0x81,
+        0x80,
+        0,
+        1,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+    ];
+    message.extend_from_slice(question);
+    for _ in 0..2 {
+        message.extend_from_slice(&[0xc0, 0x0c, 0, 6, 0, 1, 0, 0, 1, 44, 0, 22]);
+        message.extend_from_slice(&[0_u8; 22]);
+    }
+    let Ok(length) = u16::try_from(message.len()) else {
+        return Vec::new();
+    };
+    let mut framed = length.to_be_bytes().to_vec();
+    framed.extend(message);
+    framed
 }
 
 struct FakeUdp(Harness);
@@ -415,12 +454,33 @@ struct FakeCommand(Harness);
 
 #[async_trait]
 impl CommandPort for FakeCommand {
-    async fn execute(&self, _request: CommandRequest) -> Result<CommandResponse, PortError> {
+    async fn execute(&self, request: CommandRequest) -> Result<CommandResponse, PortError> {
         self.0.record(Boundary::Command)?;
+        let (stdout, stderr) = match request.kind {
+            sugra_core::CommandKind::Ping => (
+                "64 bytes from 192.0.2.10: icmp_seq=1 ttl=52 time=1 ms".into(),
+                String::new(),
+            ),
+            sugra_core::CommandKind::Traceroute => (
+                "traceroute to 192.0.2.10, 30 hops max\n 1 192.0.2.1 1 ms\n 2 192.0.2.10 2 ms"
+                    .into(),
+                String::new(),
+            ),
+            sugra_core::CommandKind::Whois => (
+                format!(
+                    "Domain Name: EXAMPLE.COM\nRegistrar: Fixture Registrar\nRegistrant Email: {SECRET_MARKER}"
+                ),
+                String::new(),
+            ),
+            sugra_core::CommandKind::SshKeyscan => (
+                "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx".into(),
+                format!("# example.com:22 SSH-2.0-OpenSSH_fixture {SECRET_MARKER}"),
+            ),
+        };
         Ok(CommandResponse {
             exit_code: Some(0),
-            stdout: "fixture command output".into(),
-            stderr: format!("token={SECRET_MARKER}"),
+            stdout,
+            stderr,
             duration_ms: 1,
         })
     }

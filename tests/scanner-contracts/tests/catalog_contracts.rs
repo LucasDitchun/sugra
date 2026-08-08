@@ -43,8 +43,8 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
 
     assert!(gap_ids.is_subset(&contract_ids));
     assert_eq!(contracts().len(), 147);
-    assert_eq!(gaps.len(), 88);
-    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 264);
+    assert_eq!(gaps.len(), 60);
+    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 180);
 
     for covered in [
         "dnssec",
@@ -106,6 +106,34 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
         "crawl-rules",
         "crawler",
         "csp-deep-analyzer",
+        "decoy-dns-beacon",
+        "dns-sla-latency-monitor",
+        "geo-dns-footprint",
+        "autonomous-neighbor-peering-map",
+        "ip-allocation-history-tracker",
+        "ip-info",
+        "network-timezone-detection",
+        "ns-geo-asn-diversity-analyzer",
+        "server-location",
+        "certificate-authority-recon",
+        "irr-routing-registry-analyzer",
+        "open-ports",
+        "ip-range-scanner",
+        "zonetransfer",
+        "icmp-reachability-matrix",
+        "ssh-banner-key-fingerprinter",
+        "traceroute",
+        "whois-lookup",
+        "custom-wordlist-generator",
+        "jwt-token-analyzer",
+        "cdn-detection",
+        "server-info",
+        "autocomplete-vulnerability-checker",
+        "content-discovery",
+        "cookie-scope-diff",
+        "dependency-js-cdn-scanner",
+        "dom-sink-scanner",
+        "embedded-object-hunter",
     ] {
         assert!(!gap_ids.contains(covered), "{covered} still has a gap");
     }
@@ -125,7 +153,7 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
 
     let untouched = gaps
         .iter()
-        .find(|gap| gap.id == "dns-sla-latency-monitor")
+        .find(|gap| gap.id == "recursive-nameserver-leak-test")
         .unwrap_or_else(|| unreachable!("untested scanner gap must remain"));
     assert_eq!(
         untouched.missing,
