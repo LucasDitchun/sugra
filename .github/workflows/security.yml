@@ -1,6 +1,14 @@
 name: Security
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
   pull_request:
   schedule:
     - cron: "17 4 * * 1"
@@ -9,14 +17,36 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@v4
+
+  supply-chain:
+    name: Advisories, licenses, and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-audit
-      - run: cargo deny check
-      - run: cargo audit
+          tool: cargo-audit,cargo-deny
+      - uses: Swatinem/rust-cache@v2
+      - name: Audit RustSec advisories
+        run: cargo audit
+      - name: Check dependency policy
+        run: cargo deny check
