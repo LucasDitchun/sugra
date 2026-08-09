@@ -10,8 +10,13 @@ All notable changes are documented here. The format follows Keep a Changelog and
 
 ## [0.1.1] - 2026-08-09
 
+### Fixes
+
+- dispatch releases from main pushes (`00e849e`)
+
 ### Maintenance
 
+- clarify default branch policy (`2568a80`)
 - add ZeroVer release train (#8) (`c8c61b7`)
 - bump sha2 from 0.10.9 to 0.11.0 (#6) (`95a761b`)
 - bump base64 from 0.22.1 to 0.23.1 (#5) (`9f1a06b`)
