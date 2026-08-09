@@ -79,6 +79,8 @@ lto = "thin"
 [workspace.metadata.dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
+# Releases are promoted explicitly from the draft release PR instead of every tag push.
+dispatch-releases = true
 # CI backends to support
 ci = "github"
 # The installers to generate for each app

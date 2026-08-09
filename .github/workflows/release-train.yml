@@ -1,0 +1,170 @@
+name: Release train
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment (auto follows the documented ZeroVer policy)
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-train
+  cancel-in-progress: false
+
+jobs:
+  sync-pr:
+    name: Keep the release PR open
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Open the draft release PR when needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head develop \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            echo "Release PR #$existing already tracks develop."
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head develop \
+            --draft \
+            --title "chore: prepare next release" \
+            --body "This draft release train accumulates the changes accepted into \`develop\`. Run the **Prepare release** workflow when the batch is ready, review the generated version and changelog, then mark this PR ready for review. Merging it is the only supported way to change \`main\` and automatically dispatches the cargo-dist release."
+
+  prepare:
+    name: Prepare the selected release batch
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: develop
+          fetch-depth: 0
+      - name: Fetch release references
+        run: git fetch --force origin main develop --tags
+      - name: Test the version policy
+        run: python3 .github/scripts/test_release_train.py
+      - name: Calculate and write the release version
+        id: release
+        env:
+          RELEASE_BUMP: ${{ inputs.bump }}
+        run: |
+          python3 .github/scripts/release_train.py prepare \
+            --base-ref origin/main \
+            --head-ref HEAD \
+            --bump "$RELEASE_BUMP" \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: prepare-release
+      - name: Refresh and validate the lockfile
+        run: |
+          cargo check --workspace --all-features
+          cargo metadata --locked --format-version 1 > /dev/null
+      - name: Review generated files
+        run: |
+          git diff --check
+          git diff -- Cargo.toml Cargo.lock CHANGELOG.md
+      - name: Commit the prepared release to develop
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Release v${RELEASE_VERSION} is already prepared."
+          else
+            git commit -m "chore: prepare v${RELEASE_VERSION}"
+            git push origin HEAD:develop
+          fi
+      - name: Update the draft release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          PREVIOUS_VERSION: ${{ steps.release.outputs.previous_version }}
+          RELEASE_BUMP: ${{ steps.release.outputs.bump }}
+        run: |
+          number="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head develop \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+          if [[ -z "$number" ]]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head develop \
+              --draft \
+              --title "chore: release ${RELEASE_TAG}" \
+              --body "Automated release promotion."
+            number="$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head develop \
+              --state open \
+              --json number \
+              --jq '.[0].number')"
+          fi
+          gh pr edit "$number" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "chore: release ${RELEASE_TAG}" \
+            --body "## Release ${RELEASE_TAG}
+
+          This release promotes the current \`develop\` batch to \`main\`.
+
+          - Previous version: \`${PREVIOUS_VERSION}\`
+          - Proposed version: \`${RELEASE_VERSION}\`
+          - Increment: \`${RELEASE_BUMP}\`
+          - Policy: compatible pre-1.0 batches use patch; breaking pre-1.0 batches use minor.
+
+          Keep this PR as a draft while reviewing the generated changelog and checks. Mark it ready and merge only when the release should be published. The merge automatically dispatches cargo-dist for \`${RELEASE_TAG}\`."
+      - name: Dispatch checks for the generated commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref develop
+          gh workflow run security.yml --repo "$GITHUB_REPOSITORY" --ref develop
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref develop --field tag=dry-run
+
+  wrong-branch:
+    name: Require develop for release preparation
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Prepare releases by selecting the develop branch in the workflow form."
+          exit 1
