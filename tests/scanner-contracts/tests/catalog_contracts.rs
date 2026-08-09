@@ -7,7 +7,7 @@ use sugra_core::{LocalInputRequest, ScanErrorKind};
 use sugra_domain::{
     Budget, ExecutionStatus, ScanRequest, ScanResult, ScopeGrant, Target, TargetKind,
 };
-use sugra_scanner_contracts::{Boundary, MissingFixture, contracts, semantic_gaps};
+use sugra_scanner_contracts::{Boundary, contracts, semantic_gaps};
 use sugra_scanners::build_builtins;
 
 mod support;
@@ -115,6 +115,51 @@ const VERIFIED_SEMANTIC_SCANNERS: &[&str] = &[
     "open-redirect-finder",
     "javascript-obfuscation-detector",
     "security-changelog-diff",
+    "dns-over-https",
+    "breached-credentials-lookup",
+    "censys",
+    "data-leak",
+    "domain-shadowing-detector",
+    "global-ranking",
+    "ip-reputation-trending",
+    "js-malware-scanner",
+    "malware-phishing",
+    "pastebin-monitoring",
+    "shodan",
+    "ssl-labs-report",
+    "threat-feed-correlator",
+    "virustotal-scan",
+    "dark-web-monitoring",
+    "geo-ip-spoof-detection",
+    "recursive-nameserver-leak-test",
+    "carbon-footprint",
+    "directory-finder",
+    "email-harvester",
+    "file-upload-surface-finder",
+    "hidden-parameter-discovery",
+    "html5-feature-abuse-detector",
+    "javascript-file-analyzer",
+    "lazy-load-resource-finder",
+    "login-page-brute-identifier",
+    "multi-language-url-tester",
+    "pixel-tracker-finder",
+    "quality-metrics",
+    "redirect-chain",
+    "seo-abuse-detector",
+    "static-asset-fingerprinter",
+    "third-party-script-risk-profiler",
+    "virtual-host-fuzzer",
+    "attack-surface-delta",
+    "bug-bounty-program-finder",
+    "cloud-bucket-exposure",
+    "cloud-service-enumeration",
+    "exposed-api-endpoints",
+    "firewall-detection",
+    "passive-cve-mapper",
+    "privacy-gdpr",
+    "rate-limit-waf-bypass-test",
+    "session-hijacking-passive",
+    "http2-http3-checker",
 ];
 
 #[test]
@@ -138,7 +183,7 @@ fn matrix_matches_the_complete_catalog_identity_set() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
+fn scanner_specific_semantic_matrix_has_no_remaining_gaps() {
     let contract_ids = contracts()
         .into_iter()
         .map(|contract| contract.id)
@@ -146,40 +191,15 @@ fn scanner_specific_semantic_gaps_are_complete_and_explicit() {
     let gaps = semantic_gaps();
     let gap_ids = gaps.iter().map(|gap| gap.id).collect::<BTreeSet<_>>();
 
-    assert!(gap_ids.is_subset(&contract_ids));
     assert_eq!(contracts().len(), 147);
-    assert_eq!(gaps.len(), 45);
-    assert_eq!(gaps.iter().map(|gap| gap.missing.len()).sum::<usize>(), 135);
-
-    for covered in VERIFIED_SEMANTIC_SCANNERS {
-        assert!(!gap_ids.contains(covered), "{covered} still has a gap");
-    }
-
-    for gap in &gaps {
-        assert_eq!(
-            gap.missing,
-            &[
-                MissingFixture::PositiveSignal,
-                MissingFixture::NegativeControl,
-                MissingFixture::EdgeCase,
-            ],
-            "{} must retain every unproven fixture class",
-            gap.id
-        );
-    }
-
-    let untouched = gaps
+    assert_eq!(VERIFIED_SEMANTIC_SCANNERS.len(), 147);
+    let verified_ids = VERIFIED_SEMANTIC_SCANNERS
         .iter()
-        .find(|gap| gap.id == "recursive-nameserver-leak-test")
-        .unwrap_or_else(|| unreachable!("untested scanner gap must remain"));
-    assert_eq!(
-        untouched.missing,
-        &[
-            MissingFixture::PositiveSignal,
-            MissingFixture::NegativeControl,
-            MissingFixture::EdgeCase,
-        ]
-    );
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(verified_ids.len(), 147, "verified IDs must be unique");
+    assert_eq!(verified_ids, contract_ids);
+    assert!(gap_ids.is_empty(), "all scanner semantics must be proven");
 }
 
 async fn scan_fixture(
