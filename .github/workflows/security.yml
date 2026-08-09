@@ -7,6 +7,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**/Cargo.toml"
+      - "tests/**/Cargo.toml"
       - "deny.toml"
       - ".github/workflows/security.yml"
   pull_request:
