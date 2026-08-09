@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use serde::Serialize;
-use sugra_core::{TlsHandshakeKind, TlsObservation};
+use sugra_core::{QuicObservation, TlsHandshakeKind, TlsObservation};
 use sugra_domain::{Confidence, Finding, Severity};
 
 /// Validation failures at the TLS analysis boundary.
@@ -160,6 +160,17 @@ pub(crate) struct TlsEvidenceSummary {
     pub(crate) certificate_count: usize,
     /// Number of parsed certificate metadata entries.
     pub(crate) parsed_certificate_count: usize,
+    /// Bounded handshake duration.
+    pub(crate) duration_ms: u64,
+}
+
+/// Redacted evidence from one validated QUIC handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct QuicEvidenceSummary {
+    /// HTTP/3, another ALPN value, or unavailable metadata.
+    pub(crate) application_protocol: ApplicationProtocolSummary,
+    /// Whether the boundary exposed a non-empty negotiated QUIC version.
+    pub(crate) version_available: bool,
     /// Bounded handshake duration.
     pub(crate) duration_ms: u64,
 }
@@ -478,6 +489,17 @@ pub(crate) fn negotiated_application_protocol(
 ) -> ApplicationProtocolSummary {
     match observation.alpn.as_deref().map(str::trim) {
         Some("h2") => ApplicationProtocolSummary::Http2,
+        Some(value) if !is_unknown_text(value) => ApplicationProtocolSummary::Other,
+        _ => ApplicationProtocolSummary::Unknown,
+    }
+}
+
+/// Classifies HTTP/3 only from a validated QUIC transport observation.
+#[must_use]
+pub(crate) fn negotiated_quic_application_protocol(
+    observation: &QuicObservation,
+) -> ApplicationProtocolSummary {
+    match observation.alpn.as_deref().map(str::trim) {
         Some(value) if value == "h3" || value.starts_with("h3-") => {
             ApplicationProtocolSummary::Http3
         }
@@ -486,7 +508,7 @@ pub(crate) fn negotiated_application_protocol(
     }
 }
 
-/// Reports whether HTTP/2 or HTTP/3 was negotiated in this bounded observation.
+/// Reports whether HTTP/2 was negotiated in this bounded TLS/TCP observation.
 pub(crate) fn analyze_http2_http3_checker(
     observation: &TlsObservation,
     evidence: usize,
@@ -494,28 +516,46 @@ pub(crate) fn analyze_http2_http3_checker(
     validate_semantic_fingerprints(observation)?;
     Ok(match negotiated_application_protocol(observation) {
         ApplicationProtocolSummary::Http2 => Vec::new(),
-        ApplicationProtocolSummary::Http3 => vec![finding(
-            "http3-transport-unverified",
-            "HTTP/3 ALPN metadata was observed without a QUIC transport verification",
-            Severity::Info,
-            Confidence::Unknown,
-            evidence,
-        )],
-        ApplicationProtocolSummary::Other => vec![finding(
-            "http2-http3-not-negotiated",
-            "Neither HTTP/2 nor HTTP/3 was negotiated in this observation",
+        ApplicationProtocolSummary::Http3 | ApplicationProtocolSummary::Other => vec![finding(
+            "http2-not-negotiated",
+            "HTTP/2 was not negotiated in the TLS/TCP observation",
             Severity::Info,
             Confidence::Confirmed,
             evidence,
         )],
         ApplicationProtocolSummary::Unknown => vec![finding(
-            "http-alpn-metadata-unavailable",
-            "Application protocol negotiation metadata is unavailable",
+            "http2-alpn-metadata-unavailable",
+            "TLS/TCP application protocol negotiation metadata is unavailable",
             Severity::Info,
             Confidence::Unknown,
             evidence,
         )],
     })
+}
+
+/// Reports whether HTTP/3 was negotiated by a validated QUIC handshake.
+#[must_use]
+pub(crate) fn analyze_http3_checker(
+    observation: &QuicObservation,
+    evidence: usize,
+) -> Vec<Finding> {
+    match negotiated_quic_application_protocol(observation) {
+        ApplicationProtocolSummary::Http3 => Vec::new(),
+        ApplicationProtocolSummary::Http2 | ApplicationProtocolSummary::Other => vec![finding(
+            "http3-not-negotiated",
+            "HTTP/3 was not negotiated in the QUIC observation",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        )],
+        ApplicationProtocolSummary::Unknown => vec![finding(
+            "http3-negotiation-metadata-unavailable",
+            "QUIC application protocol metadata is unavailable",
+            Severity::Info,
+            Confidence::Unknown,
+            evidence,
+        )],
+    }
 }
 
 /// Summarizes a bounded set of full/resumed handshakes with aligned evidence.
@@ -616,6 +656,19 @@ pub(crate) fn summarize_tls_evidence(
         parsed_certificate_count: observation.certificates.len(),
         duration_ms: observation.duration_ms,
     })
+}
+
+/// Produces a serialization-safe view of one validated QUIC observation.
+#[must_use]
+pub(crate) fn summarize_quic_evidence(observation: &QuicObservation) -> QuicEvidenceSummary {
+    QuicEvidenceSummary {
+        application_protocol: negotiated_quic_application_protocol(observation),
+        version_available: observation
+            .version
+            .as_deref()
+            .is_some_and(|version| !is_unknown_text(version)),
+        duration_ms: observation.duration_ms,
+    }
 }
 
 fn validate_semantic_fingerprints(observation: &TlsObservation) -> Result<(), TlsSemanticError> {
@@ -994,26 +1047,38 @@ mod tests {
     }
 
     #[test]
-    fn http2_http3_checker_distinguishes_h3_other_and_missing_alpn() -> Result<(), Box<dyn Error>> {
+    fn http_protocol_analysis_requires_quic_before_classifying_http3() -> Result<(), Box<dyn Error>>
+    {
         let mut observed = observation(&"ab".repeat(32));
         observed.alpn = Some("h3-29".into());
-        let http3 = analyze_http2_http3_checker(&observed, 17)?;
-        assert_eq!(http3[0].key, "http3-transport-unverified");
-        assert_eq!(http3[0].confidence, Confidence::Unknown);
+        let tcp_h3 = analyze_http2_http3_checker(&observed, 17)?;
+        assert_eq!(tcp_h3[0].key, "http2-not-negotiated");
+        assert_eq!(tcp_h3[0].confidence, Confidence::Confirmed);
         assert_eq!(
             negotiated_application_protocol(&observed),
-            ApplicationProtocolSummary::Http3
+            ApplicationProtocolSummary::Other
         );
 
         observed.alpn = Some("http/1.1".into());
         let other = analyze_http2_http3_checker(&observed, 17)?;
-        assert_eq!(other[0].key, "http2-http3-not-negotiated");
+        assert_eq!(other[0].key, "http2-not-negotiated");
         assert_eq!(other[0].confidence, Confidence::Confirmed);
 
         observed.alpn = None;
         let missing = analyze_http2_http3_checker(&observed, 17)?;
-        assert_eq!(missing[0].key, "http-alpn-metadata-unavailable");
+        assert_eq!(missing[0].key, "http2-alpn-metadata-unavailable");
         assert_eq!(missing[0].confidence, Confidence::Unknown);
+
+        let quic = QuicObservation {
+            alpn: Some("h3-29".into()),
+            version: None,
+            duration_ms: 3,
+        };
+        assert!(analyze_http3_checker(&quic, 18).is_empty());
+        assert_eq!(
+            negotiated_quic_application_protocol(&quic),
+            ApplicationProtocolSummary::Http3
+        );
         Ok(())
     }
 

@@ -133,11 +133,80 @@ pub struct DnsRecord {
     pub ttl: Option<u32>,
 }
 
+/// One explicit recursion-capability probe sent to a selected DNS server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRecursionRequest {
+    /// DNS server host name or address selected by the operator.
+    pub resolver: String,
+    /// DNS service port, normally 53.
+    pub port: u16,
+    /// Public fixed query owner used to request recursion.
+    pub query_name: String,
+    /// Shared resource limits.
+    pub budget: Budget,
+    /// Scope applied before resolving or contacting the selected server.
+    pub scope: ScopeGrant,
+}
+
+/// Safe DNS response-header metadata from one recursion probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRecursionObservation {
+    /// Whether the response copied the recursion-desired flag.
+    pub recursion_desired: DnsFlagState,
+    /// Whether the responding server advertised recursion availability.
+    pub recursion_available: DnsFlagState,
+    /// Numeric DNS response code from the response header.
+    pub response_code: u16,
+    /// Whether the response claimed authority for the queried owner.
+    pub authoritative: DnsFlagState,
+    /// Whether the UDP response was truncated.
+    pub truncated: DnsFlagState,
+    /// Number of answer records declared by the parsed response.
+    pub answer_count: usize,
+    /// Observed round-trip duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Explicit state of one DNS header flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnsFlagState {
+    /// The flag was clear in the parsed header.
+    Unset,
+    /// The flag was set in the parsed header.
+    Set,
+}
+
+impl DnsFlagState {
+    /// Returns whether the parsed flag was set.
+    #[must_use]
+    pub const fn is_set(self) -> bool {
+        matches!(self, Self::Set)
+    }
+}
+
+impl From<bool> for DnsFlagState {
+    fn from(value: bool) -> Self {
+        if value { Self::Set } else { Self::Unset }
+    }
+}
+
 /// DNS resolution boundary.
 #[async_trait]
 pub trait DnsPort: Send + Sync {
     /// Resolves a bounded set of record types.
     async fn query(&self, query: DnsQuery) -> Result<Vec<DnsRecord>, PortError>;
+
+    /// Sends one recursion-desired query to an explicitly selected DNS server.
+    async fn probe_recursion(
+        &self,
+        _request: DnsRecursionRequest,
+    ) -> Result<DnsRecursionObservation, PortError> {
+        Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "DNS recursion probing is unavailable in the configured adapter",
+        ))
+    }
 }
 
 /// HTTP verbs available to scanners.
@@ -325,6 +394,32 @@ pub struct TlsRequest {
     pub scope: ScopeGrant,
 }
 
+/// A validated QUIC handshake request used only to verify HTTP/3 transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicRequest {
+    /// Host name or address used to establish the scoped UDP connection.
+    pub host: String,
+    /// Optional DNS name used for certificate validation.
+    pub server_name: Option<String>,
+    /// UDP service port, normally 443.
+    pub port: u16,
+    /// Shared resource limits.
+    pub budget: Budget,
+    /// Scope applied before resolving or contacting the endpoint.
+    pub scope: ScopeGrant,
+}
+
+/// Safe metadata from a certificate-validating QUIC handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuicObservation {
+    /// Application protocol negotiated inside the QUIC handshake.
+    pub alpn: Option<String>,
+    /// Negotiated QUIC version, when exposed by the boundary.
+    pub version: Option<String>,
+    /// Observed handshake duration in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// Parsed metadata for one validated peer certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsCertificate {
@@ -383,11 +478,19 @@ pub struct TlsObservation {
     pub duration_ms: u64,
 }
 
-/// Certificate-validating TLS boundary.
+/// Certificate-validating TLS and QUIC handshake boundary.
 #[async_trait]
 pub trait TlsPort: Send + Sync {
     /// Connects and performs one validated TLS handshake.
     async fn handshake(&self, request: TlsRequest) -> Result<TlsObservation, PortError>;
+
+    /// Connects and performs one validated QUIC handshake.
+    async fn handshake_quic(&self, _request: QuicRequest) -> Result<QuicObservation, PortError> {
+        Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "QUIC handshake is unavailable in the configured TLS adapter",
+        ))
+    }
 }
 
 /// Allowlisted operating-system command.

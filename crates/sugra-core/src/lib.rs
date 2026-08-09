@@ -14,10 +14,11 @@ pub use engine::{Engine, EngineError, RunEvent, ScannerRegistry};
 pub use options::{OptionError, resolve_options};
 pub use policy::{PolicyDecision, PolicyError, evaluate_policy};
 pub use ports::{
-    Clock, CommandKind, CommandPort, CommandRequest, CommandResponse, DnsPort, DnsQuery, DnsRecord,
-    DnsRecordType, HttpCookie, HttpMethod, HttpPort, HttpRedirect, HttpRedirectDecision,
-    HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse, PortError,
-    PortErrorKind, ProviderPort, ProviderRequest, ProviderResponse, ServiceBundle, TcpPort,
+    Clock, CommandKind, CommandPort, CommandRequest, CommandResponse, DnsFlagState, DnsPort,
+    DnsQuery, DnsRecord, DnsRecordType, DnsRecursionObservation, DnsRecursionRequest, HttpCookie,
+    HttpMethod, HttpPort, HttpRedirect, HttpRedirectDecision, HttpRequest, HttpResponse,
+    LocalInputPort, LocalInputRequest, LocalInputResponse, PortError, PortErrorKind, ProviderPort,
+    ProviderRequest, ProviderResponse, QuicObservation, QuicRequest, ServiceBundle, TcpPort,
     TcpRequest, TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest,
     UdpPort, UdpRequest, UdpResponse,
 };

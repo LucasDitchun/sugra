@@ -22,6 +22,7 @@ pub(crate) struct WebSignals {
     pub(crate) external_script_hosts: Vec<String>,
     pub(crate) external_integration_hosts: Vec<String>,
     pub(crate) external_scripts_without_integrity: usize,
+    pub(crate) static_asset_references: usize,
     pub(crate) forms: usize,
     pub(crate) inputs: usize,
     pub(crate) file_inputs: usize,
@@ -40,13 +41,18 @@ pub(crate) struct WebSignals {
     pub(crate) social_links: usize,
     pub(crate) websocket_references: usize,
     pub(crate) api_references: usize,
+    pub(crate) javascript_api_references: usize,
     pub(crate) dom_sink_markers: usize,
     pub(crate) obfuscation_markers: usize,
     pub(crate) browser_feature_markers: usize,
     pub(crate) captcha_markers: usize,
     pub(crate) cms_markers: usize,
     pub(crate) privacy_markers: usize,
-    pub(crate) cloud_markers: usize,
+    pub(crate) cloud_storage_references: usize,
+    pub(crate) cloud_service_references: usize,
+    pub(crate) bug_bounty_markers: usize,
+    pub(crate) seo_hidden_markers: usize,
+    pub(crate) seo_spam_markers: usize,
     pub(crate) generator: Option<String>,
     pub(crate) text_bytes: usize,
 }
@@ -110,6 +116,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         external_script_hosts,
         external_integration_hosts,
         external_scripts_without_integrity,
+        static_asset_references: static_asset_references(&document),
         forms: count(&document, "form"),
         inputs: count(&document, "input, textarea, select"),
         file_inputs: count(&document, "input[type='file' i]"),
@@ -123,7 +130,7 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
         embedded_objects: count(&document, "object, embed, applet"),
         images: count(&document, "img"),
         lazy_resources: count(&document, "[loading='lazy' i], [data-src], [data-lazy-src]"),
-        tracking_pixels: tracking_pixels(&document),
+        tracking_pixels: tracking_pixels(&document, &response.final_url),
         email_fingerprints: email_fingerprints(&text),
         social_links: link_host_count(&document, &response.final_url, social_host),
         websocket_references: websocket_reference_count(response, &document, &lower),
@@ -137,47 +144,84 @@ pub(crate) fn signals(response: &HttpResponse) -> WebSignals {
                 "application/json",
             ],
         ),
-        dom_sink_markers: executable_marker_count(
-            response,
-            &document,
-            &lower,
-            &[
-                ".innerhtml",
-                "document.write",
-                "eval(",
-                "insertadjacenthtml",
-            ],
-        ),
-        obfuscation_markers: executable_marker_count(
-            response,
-            &document,
-            &lower,
-            &["fromcharcode", "unescape(", "eval(", "atob(", "\\x"],
-        ),
-        browser_feature_markers: marker_count(
-            &lower,
-            &[
-                "postmessage",
-                "localstorage",
-                "geolocation",
-                "serviceworker",
-                "websocket",
-            ],
-        ),
+        javascript_api_references: javascript_api_references(response, &document, &lower),
+        dom_sink_markers: dom_sink_markers(response, &document, &lower),
+        obfuscation_markers: obfuscation_markers(response, &document, &lower),
+        browser_feature_markers: browser_feature_markers(response, &document, &lower),
         captcha_markers: captcha_integrations(&document, &response.final_url),
         cms_markers: cms_markers(&document, &response.final_url),
-        privacy_markers: marker_count(&lower, &["privacy", "cookie consent", "gdpr", "opt-out"]),
-        cloud_markers: marker_count(
-            &lower,
-            &[
-                "amazonaws.com",
-                "storage.googleapis.com",
-                "blob.core.windows.net",
-            ],
+        privacy_markers: privacy_markers(&document, &response.final_url),
+        cloud_storage_references: structured_url_count(
+            &document,
+            &response.final_url,
+            cloud_storage_host,
         ),
+        cloud_service_references: structured_url_count(
+            &document,
+            &response.final_url,
+            cloud_service_host,
+        ),
+        bug_bounty_markers: bug_bounty_markers(response, &document),
+        seo_hidden_markers: seo_hidden_markers(&document),
+        seo_spam_markers: seo_spam_markers(&document),
         generator: recognized_generator(&document),
         text_bytes: document.root_element().text().map(str::len).sum(),
     }
+}
+
+fn javascript_api_references(response: &HttpResponse, document: &Html, lower: &str) -> usize {
+    executable_marker_count(
+        response,
+        document,
+        lower,
+        &["/api/", "/graphql", "fetch(", "xmlhttprequest", "axios."],
+    )
+}
+
+fn dom_sink_markers(response: &HttpResponse, document: &Html, lower: &str) -> usize {
+    executable_marker_count(
+        response,
+        document,
+        lower,
+        &[
+            ".innerhtml",
+            "document.write",
+            "eval(",
+            "insertadjacenthtml",
+        ],
+    )
+}
+
+fn obfuscation_markers(response: &HttpResponse, document: &Html, lower: &str) -> usize {
+    executable_marker_count(
+        response,
+        document,
+        lower,
+        &["fromcharcode", "unescape(", "eval(", "atob(", "\\x"],
+    )
+}
+
+fn browser_feature_markers(response: &HttpResponse, document: &Html, lower: &str) -> usize {
+    executable_marker_count(
+        response,
+        document,
+        lower,
+        &[
+            "htmlcanvaselement",
+            "offscreencanvas",
+            "getcontext(\"webgl",
+            "getcontext('webgl",
+            "audiocontext",
+            "rtcpeerconnection",
+            "navigator.geolocation",
+            "navigator.bluetooth",
+            "navigator.usb",
+            "navigator.serial",
+            "navigator.clipboard",
+            "devicemotionevent",
+            "deviceorientationevent",
+        ],
+    )
 }
 
 /// Builds the redacted evidence projection consumed equally by CLI and TUI.
@@ -259,8 +303,11 @@ pub(crate) fn aggregate_findings(
         "cookie-scope-diff" => cookie_diff(samples),
         "cache-behavior-analyzer" => cache_diff(samples),
         "virtual-host-fuzzer" => virtual_host_diff(samples),
+        "directory-finder" => directory_diff(samples),
+        "hidden-parameter-discovery" => hidden_parameter_diff(samples, options),
         "rate-limit-waf-bypass-test" => rate_limit_observation(samples),
         "multi-language-url-tester" => language_diff(samples),
+        "seo-abuse-detector" => seo_cloaking_diff(samples),
         "carbon-footprint" | "performance-monitoring" | "quality-metrics" => {
             performance_findings(id, samples)
         }
@@ -740,17 +787,275 @@ fn password_get_forms(document: &Html) -> usize {
         .count()
 }
 
-fn tracking_pixels(document: &Html) -> usize {
+fn static_asset_references(document: &Html) -> usize {
+    selector("script[src], img[src], source[src], link[href][rel]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|element| {
+                element.value().name() != "link"
+                    || element.value().attr("rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace().any(|token| {
+                            matches!(
+                                token.to_ascii_lowercase().as_str(),
+                                "stylesheet" | "icon" | "preload" | "modulepreload"
+                            )
+                        })
+                    })
+            })
+            .take(256)
+            .count()
+    })
+}
+
+fn tracking_pixels(document: &Html, base: &Url) -> usize {
     selector("img").map_or(0, |selector| {
         document
             .select(&selector)
             .filter(|image| {
                 let width = image.value().attr("width").unwrap_or_default();
                 let height = image.value().attr("height").unwrap_or_default();
-                matches!((width, height), ("1", "1") | ("0", "0"))
+                if !matches!((width, height), ("1", "1") | ("0", "0")) {
+                    return false;
+                }
+                let source = image.value().attr("src").unwrap_or_default();
+                if source.is_empty() {
+                    return false;
+                }
+                let lower = source.to_ascii_lowercase();
+                matches!((width, height), ("0", "0"))
+                    || ["pixel", "track", "beacon", "collect"]
+                        .iter()
+                        .any(|marker| lower.contains(marker))
+                    || base.join(source).ok().is_some_and(|url| {
+                        url.host_str().is_some_and(|host| {
+                            !host.eq_ignore_ascii_case(base.host_str().unwrap_or_default())
+                        })
+                    })
             })
+            .take(256)
             .count()
     })
+}
+
+fn structured_url_count(document: &Html, base: &Url, predicate: fn(&str) -> bool) -> usize {
+    selector("[href], [src], [data], [action]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter_map(|element| {
+                ["href", "src", "data", "action"]
+                    .iter()
+                    .find_map(|attribute| element.value().attr(attribute))
+            })
+            .filter_map(|value| base.join(value).ok())
+            .filter_map(|url| url.host_str().map(str::to_ascii_lowercase))
+            .filter(|host| predicate(host))
+            .take(256)
+            .count()
+    })
+}
+
+fn cloud_storage_host(host: &str) -> bool {
+    host == "s3.amazonaws.com"
+        || host.ends_with(".s3.amazonaws.com")
+        || host.contains(".s3-") && host.ends_with(".amazonaws.com")
+        || host == "storage.googleapis.com"
+        || host.ends_with(".storage.googleapis.com")
+        || host.ends_with(".blob.core.windows.net")
+        || host.ends_with(".digitaloceanspaces.com")
+}
+
+fn cloud_service_host(host: &str) -> bool {
+    cloud_storage_host(host)
+        || host.ends_with(".amazonaws.com")
+        || host.ends_with(".googleapis.com")
+        || host.ends_with(".azurewebsites.net")
+        || host.ends_with(".cloudflare.com")
+        || host.ends_with(".firebaseio.com")
+        || host.ends_with(".vercel.app")
+        || host.ends_with(".herokuapp.com")
+}
+
+fn privacy_markers(document: &Html, base: &Url) -> usize {
+    selector("a[href], [id], [class]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|element| {
+                let structural = element
+                    .value()
+                    .attr("id")
+                    .into_iter()
+                    .chain(element.value().attr("class"))
+                    .flat_map(str::split_ascii_whitespace)
+                    .any(|token| {
+                        matches!(
+                            token.to_ascii_lowercase().as_str(),
+                            "privacy" | "cookie-consent" | "consent-banner" | "gdpr" | "opt-out"
+                        )
+                    });
+                structural
+                    || element
+                        .value()
+                        .attr("href")
+                        .and_then(|href| base.join(href).ok())
+                        .is_some_and(|url| {
+                            let path = url.path().to_ascii_lowercase();
+                            path.contains("privacy")
+                                || path.contains("cookie-policy")
+                                || path.contains("opt-out")
+                        })
+            })
+            .take(64)
+            .count()
+    })
+}
+
+fn bug_bounty_markers(response: &HttpResponse, document: &Html) -> usize {
+    if !matches!(response.status, 200..=299) {
+        return 0;
+    }
+    let platform_links = selector("a[href]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter_map(|link| link.value().attr("href"))
+            .filter_map(|href| response.final_url.join(href).ok())
+            .filter_map(|url| url.host_str().map(str::to_ascii_lowercase))
+            .filter(|host| {
+                [
+                    "hackerone.com",
+                    "bugcrowd.com",
+                    "intigriti.com",
+                    "yeswehack.com",
+                    "openbugbounty.org",
+                ]
+                .iter()
+                .any(|platform| host == *platform || host.ends_with(&format!(".{platform}")))
+            })
+            .take(16)
+            .count()
+    });
+    platform_links
+        .saturating_add(first_party_disclosure_links(response, document))
+        .saturating_add(security_policy_fields(response))
+}
+
+fn first_party_disclosure_links(response: &HttpResponse, document: &Html) -> usize {
+    const PATHS: &[&str] = &[
+        "/security",
+        "/security/",
+        "/security/vulnerability-disclosure",
+        "/vulnerability-disclosure",
+        "/responsible-disclosure",
+    ];
+    selector("a[href]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|link| {
+                let text = link.text().collect::<String>().to_ascii_lowercase();
+                link.value()
+                    .attr("href")
+                    .and_then(|href| response.final_url.join(href).ok())
+                    .is_some_and(|url| {
+                        url.origin() == response.final_url.origin()
+                            && (PATHS.contains(&url.path())
+                                || text.contains("bug bounty")
+                                || text.contains("vulnerability disclosure")
+                                || text.contains("responsible disclosure"))
+                    })
+            })
+            .take(16)
+            .count()
+    })
+}
+
+fn security_policy_fields(response: &HttpResponse) -> usize {
+    if !matches!(
+        response.final_url.path(),
+        "/.well-known/security.txt" | "/security.txt"
+    ) || response.body.len() > 256 * 1024
+    {
+        return 0;
+    }
+    let Ok(body) = std::str::from_utf8(&response.body) else {
+        return 0;
+    };
+    body.lines()
+        .filter_map(|line| line.strip_suffix('\r').unwrap_or(line).split_once(':'))
+        .filter(|(name, value)| {
+            name.eq_ignore_ascii_case("policy")
+                && Url::parse(value.trim()).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                })
+        })
+        .take(16)
+        .count()
+}
+
+fn seo_hidden_markers(document: &Html) -> usize {
+    selector("[hidden], [style]").map_or(0, |selector| {
+        document
+            .select(&selector)
+            .filter(|element| {
+                element.value().name() != "input"
+                    && (element.value().attr("hidden").is_some()
+                        || element.value().attr("style").is_some_and(|style| {
+                            let compact = style
+                                .chars()
+                                .filter(|character| !character.is_ascii_whitespace())
+                                .collect::<String>()
+                                .to_ascii_lowercase();
+                            [
+                                "display:none",
+                                "visibility:hidden",
+                                "font-size:0",
+                                "opacity:0",
+                                "left:-9999px",
+                            ]
+                            .iter()
+                            .any(|marker| compact.contains(marker))
+                        }))
+            })
+            .take(64)
+            .count()
+    })
+}
+
+fn seo_spam_markers(document: &Html) -> usize {
+    let mut visible = String::new();
+    for node in document.tree.nodes() {
+        let Some(text) = node.value().as_text() else {
+            continue;
+        };
+        let mut parent = node.parent();
+        let mut excluded = false;
+        while let Some(current) = parent {
+            if current.value().as_element().is_some_and(|element| {
+                matches!(element.name(), "script" | "style" | "template" | "noscript")
+            }) {
+                excluded = true;
+                break;
+            }
+            parent = current.parent();
+        }
+        if !excluded {
+            let remaining = (256 * 1024_usize).saturating_sub(visible.len());
+            visible.extend(text.chars().take(remaining));
+            visible.push(' ');
+        }
+        if visible.len() >= 256 * 1024 {
+            break;
+        }
+    }
+    marker_count(
+        &visible.to_ascii_lowercase(),
+        &[
+            "casino",
+            "viagra",
+            "free money",
+            "payday loan",
+            "cheap pills",
+        ],
+    )
+    .min(64)
 }
 
 fn email_fingerprints(text: &str) -> Vec<String> {
@@ -836,13 +1141,6 @@ fn api_findings(
                 evidence,
             )
         }
-        "hidden-parameter-discovery" if signals.hidden_inputs > 0 => one(
-            "hidden-parameters-observed",
-            "Hidden form parameters are present",
-            Severity::Info,
-            Confidence::Confirmed,
-            evidence,
-        ),
         "http-method-enumerator"
             if response
                 .headers
@@ -1004,21 +1302,29 @@ fn detection_findings(
                 evidence,
             )
         }
-        "passive-cve-mapper"
-            if headers.get("server").is_some_and(|server| {
-                server.contains('/') && server.chars().any(char::is_numeric)
-            }) =>
-        {
-            one(
-                "versioned-component-observed",
-                "A versioned component banner is available for CVE correlation",
-                Severity::Info,
-                Confidence::Inferred,
-                evidence,
-            )
-        }
+        "passive-cve-mapper" if known_vulnerable_banner(headers.get("server")) => one(
+            "known-vulnerable-component",
+            "A public banner matches a locally curated vulnerable component version",
+            Severity::High,
+            Confidence::Confirmed,
+            evidence,
+        ),
         _ => Vec::new(),
     }
+}
+
+fn known_vulnerable_banner(server: Option<&String>) -> bool {
+    let Some(server) = server else {
+        return false;
+    };
+    server
+        .split_ascii_whitespace()
+        .map(|token| token.trim_matches(|character: char| matches!(character, '(' | ')' | ';')))
+        .any(|token| {
+            ["apache/2.4.49", "apache/2.4.50", "microsoft-iis/6.0"]
+                .iter()
+                .any(|signature| token.eq_ignore_ascii_case(signature))
+        })
 }
 
 fn exposure_findings(
@@ -1042,37 +1348,87 @@ fn exposure_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "exposed-api-endpoints"
-            if response.status == 200
-                && (signals.api_references > 0
-                    || response
-                        .headers
-                        .get("content-type")
-                        .is_some_and(|value| value.contains("json"))) =>
+        "exposed-api-endpoints" if is_api_endpoint_response(response) => one(
+            "api-surface-observed",
+            "A public API surface is reachable",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ),
+        "cloud-bucket-exposure"
+            if matches!(response.status, 200..=299) && signals.cloud_storage_references > 0 =>
         {
             one(
-                "api-surface-observed",
-                "A public API surface is reachable",
+                "cloud-storage-reference-observed",
+                "A public cloud-storage reference is present",
                 Severity::Info,
-                Confidence::Confirmed,
+                Confidence::Inferred,
                 evidence,
             )
         }
-        "cloud-bucket-exposure" if response.status == 200 && signals.cloud_markers > 0 => one(
-            "cloud-storage-reference-observed",
-            "A public cloud-storage reference is present",
-            Severity::Info,
-            Confidence::Inferred,
-            evidence,
-        ),
-        "cloud-service-enumeration" if response.status == 200 && signals.cloud_markers > 0 => one(
-            "cloud-service-signal-observed",
-            "A public cloud-service signal is present",
-            Severity::Info,
-            Confidence::Inferred,
-            evidence,
-        ),
+        "cloud-service-enumeration"
+            if matches!(response.status, 200..=299) && signals.cloud_service_references > 0 =>
+        {
+            one(
+                "cloud-service-signal-observed",
+                "A public cloud-service signal is present",
+                Severity::Info,
+                Confidence::Inferred,
+                evidence,
+            )
+        }
         _ => Vec::new(),
+    }
+}
+
+fn is_api_endpoint_response(response: &HttpResponse) -> bool {
+    const MAX_API_BYTES: usize = 1_048_576;
+    if !matches!(response.status, 200..=299)
+        || response.body.len() > MAX_API_BYTES
+        || !matches!(
+            response.final_url.path(),
+            "/api" | "/api/v1" | "/swagger" | "/openapi.json"
+        )
+    {
+        return false;
+    }
+    if is_api_schema(&response.body) {
+        return true;
+    }
+    let json_media = response.headers.get("content-type").is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("application/json") || value.contains("+json")
+    });
+    if json_media
+        && serde_json::from_slice::<Value>(&response.body).is_ok_and(|value| is_api_payload(&value))
+    {
+        return true;
+    }
+    if response.final_url.path() != "/swagger" || !is_html_response(response) {
+        return false;
+    }
+    let document = Html::parse_document(&String::from_utf8_lossy(&response.body));
+    selector("script[src], link[href]").is_some_and(|selector| {
+        document.select(&selector).any(|element| {
+            element
+                .value()
+                .attr("src")
+                .or_else(|| element.value().attr("href"))
+                .is_some_and(|value| value.to_ascii_lowercase().contains("swagger-ui"))
+        })
+    })
+}
+
+fn is_api_payload(value: &Value) -> bool {
+    const ERROR_KEYS: &[&str] = &[
+        "code", "detail", "error", "errors", "instance", "message", "status", "title", "type",
+    ];
+    match value {
+        Value::Array(_) => true,
+        Value::Object(object) => {
+            !object.is_empty() && object.keys().any(|key| !ERROR_KEYS.contains(&key.as_str()))
+        }
+        _ => false,
     }
 }
 
@@ -1222,13 +1578,6 @@ fn fuzz_findings(
     evidence: usize,
 ) -> Vec<Finding> {
     match id {
-        "directory-finder" if matches!(response.status, 200..=399) => one(
-            "directory-response-observed",
-            "A candidate directory returned a non-error response",
-            Severity::Info,
-            Confidence::Inferred,
-            evidence,
-        ),
         "open-redirect-finder" if accepted_external_redirect(response) => one(
             "external-open-redirect",
             "The application accepted an external redirect destination",
@@ -1638,7 +1987,7 @@ fn inventory_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Fi
         "static-asset-fingerprinter" => (
             "static-assets-observed",
             "Static assets are available for local fingerprinting",
-            signals.scripts + signals.images,
+            signals.static_asset_references,
         ),
         _ => return Vec::new(),
     };
@@ -1655,7 +2004,6 @@ fn metadata_findings(
     signals: &WebSignals,
     evidence: usize,
 ) -> Vec<Finding> {
-    let lower = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
     match id {
         "server-info"
             if response
@@ -1706,18 +2054,13 @@ fn metadata_findings(
             Confidence::Confirmed,
             evidence,
         ),
-        "bug-bounty-program-finder"
-            if response.status == 200
-                && (lower.contains("bug bounty") || lower.contains("vulnerability disclosure")) =>
-        {
-            one(
-                "disclosure-program-observed",
-                "A vulnerability disclosure or bug bounty program is referenced",
-                Severity::Info,
-                Confidence::Confirmed,
-                evidence,
-            )
-        }
+        "bug-bounty-program-finder" if signals.bug_bounty_markers > 0 => one(
+            "disclosure-program-observed",
+            "A vulnerability disclosure or bug bounty program is referenced",
+            Severity::Info,
+            Confidence::Confirmed,
+            evidence,
+        ),
         "security-txt" | "security-contact-gap-finder"
             if response.status == 200 && has_valid_security_contact(&response.body) =>
         {
@@ -1993,7 +2336,7 @@ fn risk_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Finding
             Severity::Info,
             Confidence::Inferred,
         )),
-        "javascript-file-analyzer" if signals.api_references > 0 => Some((
+        "javascript-file-analyzer" if signals.javascript_api_references > 0 => Some((
             "javascript-api-reference-observed",
             "Client code contains API endpoint references",
             Severity::Info,
@@ -2005,12 +2348,14 @@ fn risk_findings(id: &str, signals: &WebSignals, evidence: usize) -> Vec<Finding
             Severity::Low,
             Confidence::Inferred,
         )),
-        "seo-abuse-detector" if signals.hidden_inputs > 20 => Some((
-            "seo-hidden-content-signal",
-            "The document contains an unusually large hidden-input surface",
-            Severity::Info,
-            Confidence::Unknown,
-        )),
+        "seo-abuse-detector" if signals.seo_hidden_markers > 0 && signals.seo_spam_markers > 0 => {
+            Some((
+                "seo-hidden-content-signal",
+                "The document combines hidden presentation with common SEO-spam language",
+                Severity::Medium,
+                Confidence::Inferred,
+            ))
+        }
         "third-party-script-risk-profiler" if signals.external_scripts_without_integrity > 0 => {
             Some((
                 "external-script-without-integrity",
@@ -2099,6 +2444,84 @@ fn cache_diff(samples: &[WebSample]) -> Vec<Finding> {
     }
 }
 
+fn directory_diff(samples: &[WebSample]) -> Vec<Finding> {
+    let Some(control) = samples.first() else {
+        return Vec::new();
+    };
+    if samples.iter().skip(1).any(|candidate| {
+        candidate.status != 404
+            && matches!(candidate.status, 200..=403)
+            && (candidate.status != control.status || candidate.body_sha256 != control.body_sha256)
+    }) {
+        aggregate_one(
+            "directory-response-observed",
+            "A candidate path differs from the deterministic not-found control",
+            Severity::Info,
+            Confidence::Inferred,
+            samples,
+        )
+    } else {
+        Vec::new()
+    }
+}
+
+fn hidden_parameter_diff(samples: &[WebSample], options: &BTreeMap<String, Value>) -> Vec<Finding> {
+    let Some(baseline) = samples.first() else {
+        return Vec::new();
+    };
+    let threshold = options
+        .get("threshold")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(50);
+    let mut candidates = BTreeMap::<&str, Vec<&WebSample>>::new();
+    for sample in samples.iter().skip(1) {
+        let group = sample
+            .label
+            .rsplit_once('-')
+            .map_or(sample.label.as_str(), |(group, _)| group);
+        candidates.entry(group).or_default().push(sample);
+    }
+    let changed = candidates.values().any(|group| {
+        group.len() >= 2
+            && group.iter().all(|candidate| {
+                candidate.status != baseline.status
+                    || candidate.bytes.abs_diff(baseline.bytes) > threshold
+                    || candidate.body_sha256 != baseline.body_sha256
+            })
+    });
+    if changed {
+        aggregate_one(
+            "hidden-parameter-response-differs",
+            "A bounded parameter probe consistently changed the public response",
+            Severity::Info,
+            Confidence::Inferred,
+            samples,
+        )
+    } else {
+        Vec::new()
+    }
+}
+
+fn seo_cloaking_diff(samples: &[WebSample]) -> Vec<Finding> {
+    if samples.len() < 2 {
+        return Vec::new();
+    }
+    let browser = &samples[0];
+    let crawler = &samples[1];
+    if browser.status != crawler.status || browser.bytes.abs_diff(crawler.bytes) > 5_000 {
+        aggregate_one(
+            "seo-cloaking-signal",
+            "Browser and crawler user agents received materially different public responses",
+            Severity::Medium,
+            Confidence::Inferred,
+            samples,
+        )
+    } else {
+        Vec::new()
+    }
+}
+
 fn virtual_host_diff(samples: &[WebSample]) -> Vec<Finding> {
     let Some(baseline) = samples.first() else {
         return Vec::new();
@@ -2123,7 +2546,7 @@ fn rate_limit_observation(samples: &[WebSample]) -> Vec<Finding> {
         && samples.iter().all(|sample| sample.status != 429)
         && samples
             .iter()
-            .all(|sample| !sample.headers.iter().any(|name| name.contains("ratelimit")))
+            .all(|sample| !sample.headers.iter().any(|name| is_rate_limit_header(name)))
     {
         aggregate_one(
             "rate-limit-not-observed",
@@ -2137,8 +2560,23 @@ fn rate_limit_observation(samples: &[WebSample]) -> Vec<Finding> {
     }
 }
 
+fn is_rate_limit_header(name: &str) -> bool {
+    matches!(
+        name,
+        "ratelimit"
+            | "ratelimit-limit"
+            | "ratelimit-policy"
+            | "ratelimit-remaining"
+            | "ratelimit-reset"
+            | "retry-after"
+            | "x-ratelimit-limit"
+            | "x-ratelimit-remaining"
+            | "x-ratelimit-reset"
+    )
+}
+
 fn language_diff(samples: &[WebSample]) -> Vec<Finding> {
-    let statuses: BTreeSet<_> = samples.iter().map(|sample| sample.status).collect();
+    let statuses: BTreeSet<_> = samples.iter().map(|sample| sample.status / 100).collect();
     if statuses.len() > 1 {
         aggregate_one(
             "locale-status-varies",
@@ -2154,11 +2592,18 @@ fn language_diff(samples: &[WebSample]) -> Vec<Finding> {
 
 fn performance_findings(id: &str, samples: &[WebSample]) -> Vec<Finding> {
     let triggered = match id {
-        "carbon-footprint" => samples.iter().map(|sample| sample.bytes).sum::<usize>() > 1_048_576,
+        "carbon-footprint" => {
+            samples
+                .iter()
+                .fold(0_usize, |total, sample| total.saturating_add(sample.bytes))
+                > 1_048_576
+        }
         "performance-monitoring" => samples.iter().any(|sample| sample.duration_ms > 2_000),
-        "quality-metrics" => samples
-            .iter()
-            .any(|sample| sample.status >= 400 || sample.bytes == 0 || sample.redirect_count > 5),
+        "quality-metrics" => samples.iter().any(|sample| {
+            sample.status >= 400
+                || (sample.bytes == 0 && !matches!(sample.status, 204 | 205 | 304))
+                || sample.redirect_count > 5
+        }),
         _ => false,
     };
     if !triggered {
@@ -3376,6 +3821,147 @@ mod tests {
     }
 
     #[test]
+    fn executable_risk_signals_ignore_documentation_and_data_scripts() {
+        let prose = response(
+            r#"<p>Documentation: navigator.geolocation and fetch('/api/users').</p>
+            <script type="application/json">{"code":"navigator.usb; fetch('/api/private')"}</script>"#,
+        );
+        let prose_signals = signals(&prose);
+        assert_eq!(prose_signals.browser_feature_markers, 0);
+        assert_eq!(prose_signals.javascript_api_references, 0);
+        assert!(finding_keys("html5-feature-abuse-detector", &prose).is_empty());
+        assert!(finding_keys("javascript-file-analyzer", &prose).is_empty());
+
+        let executable = response(
+            r"<script>navigator.geolocation.getCurrentPosition(run); fetch('/api/users');</script>",
+        );
+        assert!(signals(&executable).browser_feature_markers > 0);
+        assert!(signals(&executable).javascript_api_references > 0);
+    }
+
+    #[test]
+    fn public_metadata_detectors_require_structured_signals() {
+        let prose = response(
+            "<p>Documentation mentions bug bounty, s3.amazonaws.com and application/json.</p>",
+        );
+        assert!(finding_keys("bug-bounty-program-finder", &prose).is_empty());
+        assert!(finding_keys("cloud-bucket-exposure", &prose).is_empty());
+        assert!(finding_keys("exposed-api-endpoints", &prose).is_empty());
+
+        let program = response(
+            r#"<a href="https://hackerone.com/example">Security program</a>
+            <a href="https://assets.s3.amazonaws.com/public/file">asset</a>"#,
+        );
+        assert_eq!(
+            finding_keys("bug-bounty-program-finder", &program),
+            BTreeSet::from(["disclosure-program-observed".into()])
+        );
+        assert_eq!(
+            finding_keys("cloud-bucket-exposure", &program),
+            BTreeSet::from(["cloud-storage-reference-observed".into()])
+        );
+
+        let mut api = response(r#"{"items":[]}"#);
+        api.final_url = Url::parse("https://example.test/api")
+            .unwrap_or_else(|error| unreachable!("valid fixture URL: {error}"));
+        api.headers
+            .insert("content-type".into(), "application/json".into());
+        assert_eq!(
+            finding_keys("exposed-api-endpoints", &api),
+            BTreeSet::from(["api-surface-observed".into()])
+        );
+    }
+
+    #[test]
+    fn inventory_and_cve_signals_reject_superficial_markup() {
+        let inline =
+            response(r#"<script>const x = 1;</script><img alt="no source" width="1" height="1">"#);
+        assert_eq!(signals(&inline).static_asset_references, 0);
+        assert_eq!(signals(&inline).tracking_pixels, 0);
+        assert!(finding_keys("static-asset-fingerprinter", &inline).is_empty());
+        assert!(finding_keys("pixel-tracker-finder", &inline).is_empty());
+
+        let assets = response(
+            r#"<script src="/app.js"></script><img src="https://metrics.example.net/pixel.gif" width="1" height="1">"#,
+        );
+        assert!(signals(&assets).static_asset_references > 0);
+        assert_eq!(signals(&assets).tracking_pixels, 1);
+
+        let mut banner = response("");
+        banner
+            .headers
+            .insert("server".into(), "Apache/2.4.49".into());
+        assert_eq!(
+            finding_keys("passive-cve-mapper", &banner),
+            BTreeSet::from(["known-vulnerable-component".into()])
+        );
+        banner
+            .headers
+            .insert("server".into(), "Example/2026.1".into());
+        assert!(finding_keys("passive-cve-mapper", &banner).is_empty());
+    }
+
+    #[test]
+    fn controlled_fuzzing_requires_a_meaningful_response_difference() {
+        let control = sample("directory-control".into(), &response("same wildcard"));
+        let wildcard = sample("directory-0".into(), &response("same wildcard"));
+        assert!(directory_diff(&[control.clone(), wildcard]).is_empty());
+
+        let mut candidate = response("real directory");
+        candidate.status = 403;
+        let candidate = sample("directory-1".into(), &candidate);
+        assert_eq!(
+            directory_diff(&[control.clone(), candidate])[0].key,
+            "directory-response-observed"
+        );
+
+        let mut redirect = response("");
+        redirect.status = 302;
+        let redirect = sample("directory-redirect".into(), &redirect);
+        assert_eq!(
+            directory_diff(&[control.clone(), redirect])[0].key,
+            "directory-response-observed"
+        );
+
+        let baseline = sample("parameter-baseline".into(), &response("baseline"));
+        let first = sample("parameter-0-0".into(), &response("changed one"));
+        let second = sample("parameter-0-1".into(), &response("changed two"));
+        assert_eq!(
+            hidden_parameter_diff(&[baseline.clone(), first, second], &BTreeMap::new())[0].key,
+            "hidden-parameter-response-differs"
+        );
+        let same = sample("parameter-0-0".into(), &response("baseline"));
+        let mixed = sample("parameter-0-1".into(), &response("changed"));
+        assert!(
+            hidden_parameter_diff(&[baseline.clone(), same, mixed], &BTreeMap::new()).is_empty()
+        );
+        assert!(hidden_parameter_diff(&[baseline], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn seo_detection_requires_hidden_spam_or_a_material_crawler_difference() {
+        let safe = response(
+            r#"<script>const example = "casino viagra";</script><input type="hidden" value="safe">"#,
+        );
+        assert!(finding_keys("seo-abuse-detector", &safe).is_empty());
+
+        let hidden_spam = response(
+            r#"<div style="display: none">casino viagra free money</div><p>normal page</p>"#,
+        );
+        assert_eq!(
+            finding_keys("seo-abuse-detector", &hidden_spam),
+            BTreeSet::from(["seo-hidden-content-signal".into()])
+        );
+
+        let browser = sample("seo-browser".into(), &response("short"));
+        let crawler = sample("seo-crawler".into(), &response(&"x".repeat(5_100)));
+        assert_eq!(
+            seo_cloaking_diff(&[browser, crawler])[0].key,
+            "seo-cloaking-signal"
+        );
+    }
+
+    #[test]
     fn favicon_fingerprint_requires_icon_content() {
         let mut icon = response("");
         icon.final_url = Url::parse("https://example.test/favicon.ico")
@@ -3413,5 +3999,85 @@ mod tests {
             aggregate_findings("quality-metrics", &[empty], &BTreeMap::new())[0].key,
             "quality-signal-observed"
         );
+
+        let mut no_content = response("");
+        no_content.status = 204;
+        let no_content = sample("no-content".into(), &no_content);
+        assert!(aggregate_findings("quality-metrics", &[no_content], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn aggregate_http_metadata_uses_exact_protocol_semantics() {
+        let mut ordinary = response("ordinary");
+        ordinary
+            .headers
+            .insert("x-not-ratelimit-documentation".into(), "present".into());
+        let samples = (0..3)
+            .map(|index| sample(format!("rate-{index}"), &ordinary))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rate_limit_observation(&samples)[0].key,
+            "rate-limit-not-observed"
+        );
+
+        ordinary.headers.insert("retry-after".into(), "60".into());
+        let rate_limited = (0..3)
+            .map(|index| sample(format!("limited-{index}"), &ordinary))
+            .collect::<Vec<_>>();
+        assert!(rate_limit_observation(&rate_limited).is_empty());
+
+        let mut created = response("created");
+        created.status = 201;
+        let same_class = [
+            sample("ok".into(), &response("ok")),
+            sample("created".into(), &created),
+        ];
+        assert!(language_diff(&same_class).is_empty());
+
+        let mut missing = response("missing");
+        missing.status = 404;
+        let different_classes = [same_class[0].clone(), sample("missing".into(), &missing)];
+        assert_eq!(
+            language_diff(&different_classes)[0].key,
+            "locale-status-varies"
+        );
+
+        let mut huge = sample("huge".into(), &response("bounded"));
+        huge.bytes = usize::MAX;
+        assert_eq!(
+            performance_findings("carbon-footprint", &[huge.clone(), huge])[0].key,
+            "large-transfer-sample"
+        );
+    }
+
+    #[test]
+    fn api_endpoint_rejects_error_only_json_envelopes() {
+        let mut error = response(r#"{"error":"route not found","status":404}"#);
+        error.final_url = Url::parse("https://example.test/api")
+            .unwrap_or_else(|failure| unreachable!("valid fixture URL: {failure}"));
+        error
+            .headers
+            .insert("content-type".into(), "application/json".into());
+        assert!(finding_keys("exposed-api-endpoints", &error).is_empty());
+
+        error.body = br#"{"items":[]}"#.to_vec();
+        assert_eq!(
+            finding_keys("exposed-api-endpoints", &error),
+            BTreeSet::from(["api-surface-observed".into()])
+        );
+    }
+
+    #[test]
+    fn bug_bounty_detection_accepts_structured_first_party_disclosure_links() {
+        let disclosure = response(
+            r#"<main><a href="/responsible-disclosure">Responsible disclosure</a></main>"#,
+        );
+        assert_eq!(
+            finding_keys("bug-bounty-program-finder", &disclosure),
+            BTreeSet::from(["disclosure-program-observed".into()])
+        );
+
+        let generic = response(r#"<main><a href="/about">Security team</a></main>"#);
+        assert!(finding_keys("bug-bounty-program-finder", &generic).is_empty());
     }
 }

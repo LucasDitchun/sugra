@@ -5,9 +5,11 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sugra_domain::{Confidence, Severity};
 
 const MAX_PROVIDER_RECORDS: usize = 10_000;
+const MAX_PROVIDER_RECORDS_U64: u64 = 10_000;
 
 /// Optional operator-owned reference data used by a provider analyzer.
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +275,40 @@ pub(crate) enum ProviderSummary {
         /// Total email mentions reported across the bounded paste records.
         email_mentions: u64,
     },
+    /// HIBP breach observations reduced to aggregate account and record counts.
+    HibpBreaches {
+        /// Accounts or domain aliases with at least one structurally valid breach record.
+        affected_accounts: usize,
+        /// Structurally valid bounded breach records.
+        records: usize,
+    },
+    /// Cloudflare Radar rank details without retaining the queried domain.
+    DomainRanking {
+        /// Current ordered rank when one is available.
+        rank: Option<u64>,
+        /// Whether the provider supplied an unordered ranking bucket.
+        bucket_present: bool,
+        /// Bounded category records.
+        categories: usize,
+    },
+    /// SSL Labs endpoint-grade counts without endpoint addresses or report details.
+    ExternalTlsAssessment {
+        /// Whether the provider reports a completed assessment.
+        ready: bool,
+        /// Structurally valid bounded endpoint grades.
+        endpoints: usize,
+        /// Endpoints with an A or B grade.
+        strong_endpoints: usize,
+        /// Endpoints with a material weak/error grade.
+        weak_endpoints: usize,
+    },
+    /// One geolocation provider reduced to a comparison-safe country digest.
+    GeolocationSource {
+        /// SHA-256 of the normalized country code, when one is available.
+        country_sha256: Option<String>,
+        /// Whether the provider supplied a valid coordinate pair.
+        coordinates_present: bool,
+    },
 }
 
 /// Finding independent of result evidence indexing.
@@ -310,7 +346,10 @@ pub(crate) fn analyze_provider_response(
         "rdap" if matches!(scanner_id, "asn-lookup" | "rdap-lookup") => {
             Some(analyze_rdap(scanner_id, response))
         }
-        "shodan" if scanner_id == "associated-hosts" => Some(analyze_shodan_host(response)),
+        "shodan" if matches!(scanner_id, "associated-hosts" | "shodan") => {
+            Some(analyze_shodan_host(scanner_id, response))
+        }
+        "censys" if scanner_id == "censys" => Some(analyze_censys(response)),
         "crtsh" if scanner_id == "certificate-authority-recon" => {
             Some(analyze_certificate_authorities(response))
         }
@@ -318,7 +357,16 @@ pub(crate) fn analyze_provider_response(
             scanner_id, response, baseline,
         )),
         "urlscan" => Some(analyze_urlscan(scanner_id, response)),
+        "ripestat" if scanner_id == "ip-reputation-trending" => {
+            Some(analyze_blocklist_reputation(scanner_id, response))
+        }
+        "ripestat" if scanner_id == "geo-ip-spoof-detection" => {
+            Some(analyze_geolocation_source(response, true))
+        }
         "ripestat" => Some(analyze_ripestat(scanner_id, response)),
+        "ipinfo" if scanner_id == "geo-ip-spoof-detection" => {
+            Some(analyze_geolocation_source(response, false))
+        }
         "ipinfo"
             if matches!(
                 scanner_id,
@@ -329,13 +377,76 @@ pub(crate) fn analyze_provider_response(
         }
         "pagespeed" => Some(analyze_pagespeed(scanner_id, response)),
         "cloudflare-doh" | "google-doh" => Some(analyze_doh(response)),
-        "virustotal" | "abuseipdb" | "urlhaus" | "otx" => {
-            Some(analyze_reputation(scanner_id, response))
-        }
+        "virustotal" | "abuseipdb" => Some(analyze_reputation(scanner_id, response)),
+        "urlhaus" => Some(analyze_urlhaus(scanner_id, response)),
+        "otx" => Some(analyze_otx(scanner_id, response)),
         "hibp" if scanner_id == "dark-web-monitoring" => Some(analyze_hibp_stealer_logs(response)),
         "hibp" if scanner_id == "pastebin-monitoring" => Some(analyze_hibp_pastes(response)),
+        "hibp" if matches!(scanner_id, "breached-credentials-lookup" | "data-leak") => {
+            Some(analyze_hibp_breaches(response))
+        }
+        "cloudflare-radar" if scanner_id == "global-ranking" => Some(analyze_ranking(response)),
+        "ssllabs" if scanner_id == "ssl-labs-report" => Some(analyze_ssl_labs(response)),
         _ => None,
     }
+}
+
+fn analyze_geolocation_source(response: &Value, ripestat: bool) -> ProviderAnalysis {
+    let country = if ripestat {
+        response
+            .pointer("/data/located_resources/0/location")
+            .or_else(|| response.pointer("/data/country"))
+            .and_then(Value::as_str)
+    } else {
+        response
+            .pointer("/geo/country_code")
+            .or_else(|| response.pointer("/geo/country"))
+            .or_else(|| response.get("country"))
+            .and_then(Value::as_str)
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_ascii_uppercase);
+    let country_sha256 = country
+        .as_deref()
+        .map(|value| hex::encode(Sha256::digest(value.as_bytes())));
+    let coordinates_present = if ripestat {
+        response
+            .pointer("/data/located_resources/0/latitude")
+            .and_then(Value::as_f64)
+            .zip(
+                response
+                    .pointer("/data/located_resources/0/longitude")
+                    .and_then(Value::as_f64),
+            )
+            .is_some_and(valid_coordinate_pair)
+    } else {
+        response
+            .pointer("/geo/latitude")
+            .or_else(|| response.get("latitude"))
+            .and_then(Value::as_f64)
+            .zip(
+                response
+                    .pointer("/geo/longitude")
+                    .or_else(|| response.get("longitude"))
+                    .and_then(Value::as_f64),
+            )
+            .is_some_and(valid_coordinate_pair)
+    };
+    ProviderAnalysis {
+        summary: ProviderSummary::GeolocationSource {
+            country_sha256,
+            coordinates_present,
+        },
+        findings: Vec::new(),
+    }
+}
+
+fn valid_coordinate_pair((latitude, longitude): (f64, f64)) -> bool {
+    latitude.is_finite()
+        && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
 }
 
 fn analyze_wayback(response: &Value) -> ProviderAnalysis {
@@ -519,7 +630,7 @@ fn analyze_rdap(scanner_id: &str, response: &Value) -> ProviderAnalysis {
     }
 }
 
-fn analyze_shodan_host(response: &Value) -> ProviderAnalysis {
+fn analyze_shodan_host(scanner_id: &str, response: &Value) -> ProviderAnalysis {
     let mut hostnames = BTreeSet::new();
     let mut domains = BTreeSet::new();
     let mut ips = BTreeSet::new();
@@ -550,6 +661,7 @@ fn analyze_shodan_host(response: &Value) -> ProviderAnalysis {
     let mut records = 0_usize;
     for service in response
         .get("data")
+        .or_else(|| response.get("matches"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -569,12 +681,41 @@ fn analyze_shodan_host(response: &Value) -> ProviderAnalysis {
         if let Some(ip) = service.get("ip_str").and_then(Value::as_str) {
             ips.insert(ip.to_owned());
         }
+        hostnames.extend(
+            service
+                .get("hostnames")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(128)
+                .map(str::to_ascii_lowercase),
+        );
+        if let Some(ip) = service
+            .get("ip_str")
+            .or_else(|| service.get("ip"))
+            .and_then(Value::as_str)
+        {
+            ips.insert(ip.to_owned());
+        }
     }
-    let observed = !hostnames.is_empty() || !domains.is_empty();
+    let observed = if scanner_id == "shodan" {
+        records > 0 || !hostnames.is_empty() || !domains.is_empty() || !ips.is_empty()
+    } else {
+        !hostnames.is_empty() || !domains.is_empty() || ips.len() > 1
+    };
     let findings = observed
         .then_some(ProviderFinding {
-            key: "associated-hosts-observed",
-            title: "The provider returned associated host observations",
+            key: if scanner_id == "shodan" {
+                "host-intelligence-observed"
+            } else {
+                "associated-hosts-observed"
+            },
+            title: if scanner_id == "shodan" {
+                "Shodan returned bounded host intelligence observations"
+            } else {
+                "The provider returned associated host observations"
+            },
             severity: Severity::Info,
             confidence: Confidence::Confirmed,
         })
@@ -589,6 +730,89 @@ fn analyze_shodan_host(response: &Value) -> ProviderAnalysis {
             open_ports: ports.len(),
         },
         findings,
+    }
+}
+
+fn analyze_censys(response: &Value) -> ProviderAnalysis {
+    let envelope = response.get("result").unwrap_or(response);
+    let asset = envelope
+        .get("web")
+        .or_else(|| envelope.get("host"))
+        .unwrap_or(envelope);
+    let mut hostnames = BTreeSet::new();
+    let mut domains = BTreeSet::new();
+    let mut ips = BTreeSet::new();
+    let mut ports = BTreeSet::new();
+    if let Some(hostname) = asset
+        .get("hostname")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        hostnames.insert(hostname.to_ascii_lowercase());
+    }
+    if let Some(ip) = asset
+        .get("ip")
+        .or_else(|| asset.get("ip_address"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        ips.insert(ip.to_owned());
+    }
+    if let Some(port) = asset
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+    {
+        ports.insert(port);
+    }
+    let records = asset
+        .get("endpoints")
+        .or_else(|| asset.get("services"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .inspect(|record| {
+            if let Some(port) = record
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+            {
+                ports.insert(port);
+            }
+            if let Some(hostname) = record
+                .get("hostname")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                hostnames.insert(hostname.to_ascii_lowercase());
+            }
+        })
+        .count();
+    domains.extend(
+        asset
+            .get("domains")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(MAX_PROVIDER_RECORDS)
+            .map(str::to_ascii_lowercase),
+    );
+    let observed = records > 0 || !hostnames.is_empty() || !ips.is_empty() || !ports.is_empty();
+    ProviderAnalysis {
+        summary: ProviderSummary::HostIntelligence {
+            records,
+            unique_hostnames: hostnames.len(),
+            unique_domains: domains.len(),
+            unique_ips: ips.len(),
+            open_ports: ports.len(),
+        },
+        findings: info_finding(
+            observed,
+            "host-intelligence-observed",
+            "Censys returned bounded Internet asset observations",
+        ),
     }
 }
 
@@ -637,7 +861,9 @@ fn analyze_hibp_pastes(response: &Value) -> ProviderAnalysis {
             continue;
         }
         pastes += 1;
-        email_mentions = email_mentions.saturating_add(email_count);
+        email_mentions = email_mentions
+            .saturating_add(email_count)
+            .min(MAX_PROVIDER_RECORDS_U64);
     }
     let findings = if pastes > 0 {
         vec![ProviderFinding {
@@ -655,6 +881,133 @@ fn analyze_hibp_pastes(response: &Value) -> ProviderAnalysis {
             email_mentions,
         },
         findings,
+    }
+}
+
+fn analyze_hibp_breaches(response: &Value) -> ProviderAnalysis {
+    let (affected_accounts, records) = if let Some(breaches) = response.as_array() {
+        let records = breaches
+            .iter()
+            .take(MAX_PROVIDER_RECORDS)
+            .filter(|breach| {
+                breach
+                    .get("Name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty())
+            })
+            .count();
+        (usize::from(records > 0), records)
+    } else if let Some(accounts) = response.as_object() {
+        let mut affected_accounts = 0_usize;
+        let mut records = 0_usize;
+        for breaches in accounts.values().take(MAX_PROVIDER_RECORDS) {
+            let valid = breaches
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|breach| {
+                    breach.as_str().is_some_and(|name| !name.trim().is_empty())
+                        || breach
+                            .get("Name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.trim().is_empty())
+                })
+                .take(MAX_PROVIDER_RECORDS.saturating_sub(records))
+                .count();
+            affected_accounts += usize::from(valid > 0);
+            records += valid;
+            if records == MAX_PROVIDER_RECORDS {
+                break;
+            }
+        }
+        (affected_accounts, records)
+    } else {
+        (0, 0)
+    };
+    ProviderAnalysis {
+        summary: ProviderSummary::HibpBreaches {
+            affected_accounts,
+            records,
+        },
+        findings: (records > 0)
+            .then_some(ProviderFinding {
+                key: "breach-observations-present",
+                title: "HIBP returned bounded breach observations for the authorized target",
+                severity: Severity::High,
+                confidence: Confidence::Confirmed,
+            })
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn analyze_ranking(response: &Value) -> ProviderAnalysis {
+    let details = response
+        .pointer("/result/details_0")
+        .or_else(|| response.get("details_0"))
+        .unwrap_or(response);
+    let rank = details
+        .get("rank")
+        .and_then(Value::as_u64)
+        .filter(|rank| *rank > 0);
+    let bucket_present = details
+        .get("bucket")
+        .and_then(Value::as_str)
+        .is_some_and(|bucket| !bucket.trim().is_empty());
+    let categories = bounded_array_len(details.get("categories"));
+    ProviderAnalysis {
+        summary: ProviderSummary::DomainRanking {
+            rank,
+            bucket_present,
+            categories,
+        },
+        findings: info_finding(
+            rank.is_some() || bucket_present,
+            "domain-ranking-observed",
+            "Cloudflare Radar returned a public domain ranking observation",
+        ),
+    }
+}
+
+fn analyze_ssl_labs(response: &Value) -> ProviderAnalysis {
+    let ready = response
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("ready"));
+    let mut endpoints = 0_usize;
+    let mut strong_endpoints = 0_usize;
+    let mut weak_endpoints = 0_usize;
+    for grade in response
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter_map(|endpoint| endpoint.get("grade").and_then(Value::as_str))
+    {
+        endpoints += 1;
+        if matches!(grade, "A+" | "A" | "A-" | "B") {
+            strong_endpoints += 1;
+        } else if matches!(grade, "C" | "D" | "E" | "F" | "T" | "M") {
+            weak_endpoints += 1;
+        }
+    }
+    ProviderAnalysis {
+        summary: ProviderSummary::ExternalTlsAssessment {
+            ready,
+            endpoints,
+            strong_endpoints,
+            weak_endpoints,
+        },
+        findings: (weak_endpoints > 0)
+            .then_some(ProviderFinding {
+                key: "external-tls-grade-risk",
+                title: "The external TLS assessment reported a weak endpoint grade",
+                severity: Severity::Medium,
+                confidence: Confidence::Confirmed,
+            })
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -1221,18 +1574,63 @@ fn analyze_reputation(scanner_id: &str, response: &Value) -> ProviderAnalysis {
         .or_else(|| response.get("abuseConfidenceScore"))
         .and_then(Value::as_u64)
         .and_then(|score| u8::try_from(score.min(100)).ok());
+    reputation_analysis(
+        scanner_id,
+        malicious,
+        suspicious,
+        harmless,
+        undetected,
+        abuse_confidence,
+    )
+}
+
+fn analyze_urlhaus(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    let malicious = response
+        .get("urls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter(|url| url.as_object().is_some())
+        .count();
+    let malicious = u64::try_from(malicious).unwrap_or(MAX_PROVIDER_RECORDS_U64);
+    reputation_analysis(scanner_id, malicious, 0, 0, 0, None)
+}
+
+fn analyze_otx(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    let suspicious = response
+        .pointer("/pulse_info/count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .min(MAX_PROVIDER_RECORDS_U64);
+    reputation_analysis(scanner_id, 0, suspicious, 0, 0, None)
+}
+
+fn analyze_blocklist_reputation(scanner_id: &str, response: &Value) -> ProviderAnalysis {
+    let data = response.get("data").unwrap_or(response);
+    let malicious = data
+        .get("blocklists")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_PROVIDER_RECORDS)
+        .filter(|entry| entry.get("listed").and_then(Value::as_bool) == Some(true))
+        .count();
+    let malicious = u64::try_from(malicious).unwrap_or(MAX_PROVIDER_RECORDS_U64);
+    reputation_analysis(scanner_id, malicious, 0, 0, 0, None)
+}
+
+fn reputation_analysis(
+    scanner_id: &str,
+    malicious: u64,
+    suspicious: u64,
+    harmless: u64,
+    undetected: u64,
+    abuse_confidence: Option<u8>,
+) -> ProviderAnalysis {
     let risky =
         malicious > 0 || suspicious > 0 || abuse_confidence.is_some_and(|score| score >= 50);
-    let findings = if risky
-        && matches!(
-            scanner_id,
-            "domain-reputation-check"
-                | "ip-reputation-check"
-                | "ip-reputation-trending"
-                | "malware-phishing"
-                | "threat-feed-correlator"
-                | "virustotal-scan"
-        ) {
+    let findings = if risky && reputation_scanner(scanner_id) {
         vec![ProviderFinding {
             key: "provider-reputation-risk",
             title: "A configured reputation source returned a material risk signal",
@@ -1254,8 +1652,25 @@ fn analyze_reputation(scanner_id: &str, response: &Value) -> ProviderAnalysis {
     }
 }
 
+fn reputation_scanner(scanner_id: &str) -> bool {
+    matches!(
+        scanner_id,
+        "domain-reputation-check"
+            | "ip-reputation-check"
+            | "ip-reputation-trending"
+            | "js-malware-scanner"
+            | "malware-phishing"
+            | "threat-feed-correlator"
+            | "virustotal-scan"
+    )
+}
+
 fn count(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or_default()
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .min(MAX_PROVIDER_RECORDS_U64)
 }
 
 fn analyze_urlscan(scanner_id: &str, response: &Value) -> ProviderAnalysis {
@@ -2040,7 +2455,7 @@ mod tests {
             pastes.summary,
             ProviderSummary::HibpPastes {
                 pastes: 2,
-                email_mentions: u64::MAX,
+                email_mentions: MAX_PROVIDER_RECORDS_U64,
             }
         );
 

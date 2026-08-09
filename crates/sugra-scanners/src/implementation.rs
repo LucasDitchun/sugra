@@ -14,9 +14,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sugra_core::{
     Catalog, CommandKind, CommandRequest, CommandResponse, DnsQuery, DnsRecord, DnsRecordType,
-    HttpMethod, HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, PortError,
-    PortErrorKind, ProviderRequest, ProviderResponse, ScanContext, ScanError, ScanErrorKind,
-    Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation, TlsRequest, UdpRequest,
+    DnsRecursionRequest, HttpMethod, HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest,
+    PortError, PortErrorKind, ProviderRequest, ProviderResponse, QuicRequest, ScanContext,
+    ScanError, ScanErrorKind, Scanner, ScannerRegistry, ServiceBundle, TcpRequest, TlsObservation,
+    TlsRequest, UdpRequest,
 };
 use sugra_domain::{
     Confidence, Diagnostic, Evidence, ExecutionStatus, Finding, ScanRequest, ScanResult,
@@ -27,9 +28,9 @@ use url::Url;
 use crate::catalog_data::definitions;
 use crate::definition::{BuiltinError, Builtins, Operation, ScannerDefinition};
 use crate::dns_analysis::{
-    dkim_selector_owners, dns_sla_availability_finding, dnssec_findings, dual_stack_finding,
-    email_config_findings, scanner_findings as dns_scanner_findings, summarize_dns_evidence,
-    ttl_finding, typosquat_resolution_finding,
+    dkim_selector_owners, dns_recursion_findings, dns_sla_availability_finding, dnssec_findings,
+    dual_stack_finding, email_config_findings, scanner_findings as dns_scanner_findings,
+    summarize_dns_evidence, ttl_finding, typosquat_resolution_finding,
 };
 use crate::network_analysis::{
     NetworkAnalysisError, UdpProbe, analyze_dns_transfer_response,
@@ -46,10 +47,11 @@ use crate::provider_plan::{
 };
 use crate::semantics::{Analyzer, BoundaryFamily, SemanticProfile, profile_for};
 use crate::tls_analysis::{
-    TlsAnalysisError, TlsSemanticError, analyze_http2_http3_checker,
+    TlsAnalysisError, TlsSemanticError, analyze_http2_http3_checker, analyze_http3_checker,
     analyze_network_certificate_inventory, analyze_pinning, analyze_ssl_chain, analyze_ssl_expiry,
     analyze_tls_cipher_suites, analyze_tls_handshake as analyze_tls_handshake_semantics,
-    analyze_tls_security_config, analyze_tls_session_resumption_map, summarize_tls_evidence,
+    analyze_tls_security_config, analyze_tls_session_resumption_map, summarize_quic_evidence,
+    summarize_tls_evidence,
 };
 use crate::web::{WebProbe, discovered, plan_for, should_sample};
 use crate::web_analysis::{
@@ -342,6 +344,9 @@ impl BuiltinScanner {
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
         let id = self.descriptor.id.as_str();
+        if id == "recursive-nameserver-leak-test" {
+            return self.scan_dns_recursion(request, context).await;
+        }
         let plan = dns_query_plan(id, &request.target, request)?;
         let attempted_samples = plan.len().min(request.budget.max_requests);
         let mut evidence = Vec::new();
@@ -411,6 +416,133 @@ impl BuiltinScanner {
                 evidence.len(),
                 attempted_samples,
             ));
+        }
+        Ok(ScanResult {
+            status: completion_status(&diagnostics),
+            findings,
+            evidence,
+            diagnostics,
+        })
+    }
+
+    async fn scan_dns_recursion(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        if request.budget.max_requests < 2 {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidInput,
+                "DNS recursion discovery requires at least two requests",
+            ));
+        }
+        let domain = dns_name(&request.target)?;
+        let records = self
+            .services
+            .dns
+            .query(DnsQuery {
+                name: domain.clone(),
+                record_types: vec![DnsRecordType::Ns],
+                budget: request.budget,
+            })
+            .await
+            .map_err(scan_error_from_port)?;
+        let resolvers = authoritative_nameservers(&domain, &records);
+        if resolvers.is_empty() {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidResponse,
+                "no authoritative nameserver was discovered",
+            ));
+        }
+        self.probe_authoritative_nameservers(request, context, resolvers)
+            .await
+    }
+
+    async fn probe_authoritative_nameservers(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+        resolvers: Vec<String>,
+    ) -> Result<ScanResult, ScanError> {
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut first_error = None;
+        let mut authorized = 0_usize;
+        for resolver in resolvers {
+            if context.cancellation.is_cancelled() {
+                if evidence.is_empty() {
+                    return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+                }
+                return Ok(cancelled_network_result(evidence, findings, diagnostics));
+            }
+            let target = Target::parse(TargetKind::Domain, &resolver).map_err(|_| {
+                ScanError::new(
+                    ScanErrorKind::InvalidResponse,
+                    "authoritative nameserver is invalid",
+                )
+            })?;
+            if !request.scope.allows(&target) {
+                diagnostics.push(Diagnostic {
+                    kind: "out-of-scope".into(),
+                    message: "a discovered nameserver is outside the declared scope".into(),
+                });
+                continue;
+            }
+            if authorized >= request.budget.max_requests.saturating_sub(1) {
+                diagnostics.push(Diagnostic {
+                    kind: "budget-exhausted".into(),
+                    message: "additional authorized nameservers were omitted by the request budget"
+                        .into(),
+                });
+                break;
+            }
+            authorized += 1;
+            match self
+                .services
+                .dns
+                .probe_recursion(DnsRecursionRequest {
+                    resolver: resolver.clone(),
+                    port: 53,
+                    query_name: "sugra-recursion-probe.invalid".into(),
+                    budget: request.budget,
+                    scope: request.scope.clone(),
+                })
+                .await
+            {
+                Ok(observation) => {
+                    let index = evidence.len();
+                    findings.extend(dns_recursion_findings(&observation, index));
+                    evidence.push(Evidence {
+                        kind: "dns-recursion-observation".into(),
+                        source: format!("{resolver}:53"),
+                        observation: serde_json::to_value(observation).map_err(|_| {
+                            ScanError::new(
+                                ScanErrorKind::Internal,
+                                "DNS recursion observation serialization failed",
+                            )
+                        })?,
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(scan_error_from_port(error.clone()));
+                    }
+                    diagnostics.push(protocol_diagnostic("dns-recursion", error));
+                }
+            }
+        }
+        if evidence.is_empty() {
+            if authorized == 0 {
+                return Err(ScanError::new(
+                    ScanErrorKind::PolicyDenied,
+                    "discovered nameservers are outside the declared scope",
+                ));
+            }
+            return Err(first_error.unwrap_or_else(|| {
+                ScanError::new(ScanErrorKind::Transport, "all DNS recursion probes failed")
+            }));
         }
         Ok(ScanResult {
             status: completion_status(&diagnostics),
@@ -531,6 +663,9 @@ impl BuiltinScanner {
         request: &ScanRequest,
         context: &ScanContext,
     ) -> Result<ScanResult, ScanError> {
+        if analyzer == Analyzer::TlsProtocol {
+            return self.scan_http_protocols(request, context).await;
+        }
         let (host, port) = tls_endpoint(&request.target)?;
         let observation = self
             .services
@@ -575,6 +710,107 @@ impl BuiltinScanner {
             }],
             findings,
         ))
+    }
+
+    async fn scan_http_protocols(
+        &self,
+        request: &ScanRequest,
+        context: &ScanContext,
+    ) -> Result<ScanResult, ScanError> {
+        let (host, port) = tls_endpoint(&request.target)?;
+        let server_name = None::<String>;
+        let mut evidence = Vec::new();
+        let mut findings = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut first_error = None;
+
+        let tls_result = self
+            .services
+            .tls
+            .handshake(TlsRequest {
+                host: host.clone(),
+                server_name: server_name.clone(),
+                port,
+                budget: request.budget,
+                scope: request.scope.clone(),
+            })
+            .await;
+        match tls_result {
+            Ok(observation) => {
+                let index = evidence.len();
+                findings.extend(
+                    analyze_http2_http3_checker(&observation, index)
+                        .map_err(scan_error_from_tls_semantic)?,
+                );
+                evidence.push(Evidence {
+                    kind: "tls-handshake".into(),
+                    source: format!("{host}:{port}/tcp"),
+                    observation: serde_json::to_value(
+                        summarize_tls_evidence(&observation)
+                            .map_err(scan_error_from_tls_semantic)?,
+                    )
+                    .map_err(|_| {
+                        ScanError::new(ScanErrorKind::Internal, "TLS evidence serialization failed")
+                    })?,
+                    observed_at: context.clock.now(),
+                });
+            }
+            Err(error) => {
+                first_error = Some(scan_error_from_port(error.clone()));
+                diagnostics.push(protocol_diagnostic("tls", error));
+            }
+        }
+
+        if context.cancellation.is_cancelled() {
+            if evidence.is_empty() {
+                return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+            }
+            return Ok(cancelled_network_result(evidence, findings, diagnostics));
+        }
+        if request.budget.max_requests >= 2 {
+            let quic_result = self
+                .services
+                .tls
+                .handshake_quic(QuicRequest {
+                    host: host.clone(),
+                    server_name,
+                    port,
+                    budget: request.budget,
+                    scope: request.scope.clone(),
+                })
+                .await;
+            match quic_result {
+                Ok(observation) => {
+                    let index = evidence.len();
+                    findings.extend(analyze_http3_checker(&observation, index));
+                    evidence.push(Evidence {
+                        kind: "quic-handshake".into(),
+                        source: format!("{host}:{port}/udp"),
+                        observation: serde_json::to_value(summarize_quic_evidence(&observation))
+                            .map_err(|_| {
+                                ScanError::new(
+                                    ScanErrorKind::Internal,
+                                    "QUIC evidence serialization failed",
+                                )
+                            })?,
+                        observed_at: context.clock.now(),
+                    });
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(scan_error_from_port(error.clone()));
+                    }
+                    diagnostics.push(protocol_diagnostic("quic", error));
+                }
+            }
+        } else {
+            diagnostics.push(Diagnostic {
+                kind: "budget-exhausted".into(),
+                message: "QUIC handshake omitted by the request budget".into(),
+            });
+        }
+
+        finish_http_protocol_scan(evidence, findings, diagnostics, first_error)
     }
 
     async fn scan_providers(
@@ -635,6 +871,20 @@ impl BuiltinScanner {
                     .into(),
             });
         }
+        if scanner_id == "geo-ip-spoof-detection" {
+            let scheduled: BTreeSet<_> = calls
+                .iter()
+                .take(request.budget.max_requests)
+                .map(|call| call.provider)
+                .collect();
+            if !(scheduled.contains("ripestat") && scheduled.contains("ipinfo")) {
+                diagnostics.push(Diagnostic {
+                    kind: "provider-coverage-gap".into(),
+                    message: "geolocation comparison requires two independent provider sources"
+                        .into(),
+                });
+            }
+        }
         let expected_issuers: Vec<_> = request
             .options
             .get("expected_issuers")
@@ -644,6 +894,12 @@ impl BuiltinScanner {
             .filter_map(Value::as_str)
             .collect();
         for call in calls.into_iter().take(request.budget.max_requests) {
+            if context.cancellation.is_cancelled() {
+                if evidence.is_empty() {
+                    return Err(ScanError::new(ScanErrorKind::Cancelled, "scan cancelled"));
+                }
+                return Ok(cancelled_network_result(evidence, findings, diagnostics));
+            }
             let response = self.query_provider_call(request, call).await;
             match response {
                 Ok(response) => {
@@ -664,9 +920,14 @@ impl BuiltinScanner {
                 }
                 Err(error) => diagnostics.push(Diagnostic {
                     kind: format!("{:?}", error.kind).to_ascii_lowercase(),
-                    message: error.message,
+                    message: provider_failure_message(scanner_id, error.message),
                 }),
             }
+        }
+        if scanner_id == "geo-ip-spoof-detection"
+            && let Some(finding) = geolocation_mismatch_finding(&evidence)
+        {
+            findings.push(finding);
         }
         if evidence.is_empty() {
             let message = diagnostics
@@ -1468,6 +1729,60 @@ fn nameserver_metadata_is_empty(summary: &ProviderSummary) -> bool {
     )
 }
 
+fn provider_failure_message(scanner_id: &str, boundary_message: String) -> String {
+    if matches!(
+        scanner_id,
+        "breached-credentials-lookup"
+            | "censys"
+            | "dark-web-monitoring"
+            | "data-leak"
+            | "dns-over-https"
+            | "domain-shadowing-detector"
+            | "geo-ip-spoof-detection"
+            | "global-ranking"
+            | "ip-reputation-trending"
+            | "js-malware-scanner"
+            | "malware-phishing"
+            | "pastebin-monitoring"
+            | "shodan"
+            | "ssl-labs-report"
+            | "threat-feed-correlator"
+            | "virustotal-scan"
+    ) {
+        "provider query failed".into()
+    } else {
+        boundary_message
+    }
+}
+
+fn geolocation_mismatch_finding(evidence: &[Evidence]) -> Option<Finding> {
+    let sources = evidence
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let summary = &item.observation;
+            (summary.get("kind").and_then(Value::as_str) == Some("geolocation-source"))
+                .then(|| {
+                    summary
+                        .get("country_sha256")
+                        .and_then(Value::as_str)
+                        .map(|country| (index, country))
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if sources.len() < 2 || sources.iter().all(|(_, country)| *country == sources[0].1) {
+        return None;
+    }
+    Some(Finding {
+        key: "geolocation-source-mismatch".into(),
+        title: "Independent providers returned conflicting geolocation countries".into(),
+        severity: Severity::Medium,
+        confidence: Confidence::Confirmed,
+        evidence: sources.into_iter().map(|(index, _)| index).collect(),
+    })
+}
+
 fn provider_observation(
     scanner_id: &str,
     provider: &str,
@@ -1582,6 +1897,30 @@ fn dns_name(target: &Target) -> Result<String, ScanError> {
             "scanner requires a DNS-capable target",
         )),
     }
+}
+
+fn authoritative_nameservers(domain: &str, records: &[DnsRecord]) -> Vec<String> {
+    let owner = domain.trim_end_matches('.');
+    records
+        .iter()
+        .filter(|record| {
+            record.record_type == DnsRecordType::Ns
+                && record
+                    .name
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(owner)
+        })
+        .filter_map(|record| {
+            let host = record
+                .value
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            Target::parse(TargetKind::Domain, &host).ok().map(|_| host)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn reverse_name(address: std::net::IpAddr) -> String {
@@ -2059,8 +2398,8 @@ fn provider_calls(
     options: &BTreeMap<String, Value>,
     budget: sugra_domain::Budget,
 ) -> Result<Vec<ProviderCall>, ScanError> {
-    if matches!(id, "dark-web-monitoring" | "pastebin-monitoring") {
-        validate_secret_reference_option(options, "hibp_key")?;
+    if let Some((option, secret_env)) = provider_secret_option(id) {
+        validate_fixed_secret_reference_option(options, option, secret_env)?;
     }
     let plan_options = provider_plan_options(id, options)?;
     if let Some(plan) = provider_plan::plan_for(id, target.kind(), &plan_options)
@@ -2113,10 +2452,10 @@ fn provider_calls(
             })
             .collect());
     }
-    if let Some(calls) = provider_registry_calls(id, target, options) {
+    if let Some(calls) = provider_registry_calls(id, target, options)? {
         return Ok(calls);
     }
-    provider_intelligence_calls(id, target, options).ok_or_else(|| {
+    provider_intelligence_calls(id, target).ok_or_else(|| {
         ScanError::new(
             ScanErrorKind::DependencyUnavailable,
             "provider integration is not configured",
@@ -2124,21 +2463,24 @@ fn provider_calls(
     })
 }
 
-fn validate_secret_reference_option(
+fn provider_secret_option(scanner_id: &str) -> Option<(&'static str, &'static str)> {
+    match scanner_id {
+        "dark-web-monitoring" | "pastebin-monitoring" => Some(("hibp_key", "HIBP_API_KEY")),
+        "domain-reputation-check" => Some(("vt_key", "VIRUSTOTAL_API_KEY")),
+        "performance-monitoring" => Some(("key", "GOOGLE_API_KEY")),
+        _ => None,
+    }
+}
+
+fn validate_fixed_secret_reference_option(
     options: &BTreeMap<String, Value>,
     key: &str,
+    expected: &str,
 ) -> Result<(), ScanError> {
     let Some(value) = options.get(key) else {
         return Ok(());
     };
-    let valid = value.as_str().is_some_and(|reference| {
-        !reference.is_empty()
-            && reference.len() <= 128
-            && reference
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    });
-    if valid {
+    if value.as_str() == Some(expected) {
         Ok(())
     } else {
         Err(ScanError::new(
@@ -2188,13 +2530,9 @@ fn provider_plan_options(
                 .insert(ProviderName::Shodan, "SHODAN_API_KEY".into());
         }
         "domain-reputation-check" => {
-            let virus_total = options
-                .get("vt_key")
-                .and_then(Value::as_str)
-                .unwrap_or("VIRUSTOTAL_API_KEY");
             projected
                 .secret_refs
-                .insert(ProviderName::VirusTotal, virus_total.into());
+                .insert(ProviderName::VirusTotal, "VIRUSTOTAL_API_KEY".into());
             projected
                 .secret_refs
                 .insert(ProviderName::UrlHaus, "URLHAUS_AUTH_KEY".into());
@@ -2205,10 +2543,10 @@ fn provider_plan_options(
                 .insert(ProviderName::AbuseIpDb, "ABUSEIPDB_API_KEY".into());
         }
         "performance-monitoring" => {
-            if let Some(value) = options.get("key").and_then(Value::as_str) {
+            if options.contains_key("key") {
                 projected
                     .secret_refs
-                    .insert(ProviderName::PageSpeed, value.into());
+                    .insert(ProviderName::PageSpeed, "GOOGLE_API_KEY".into());
             }
         }
         "ip-info" | "network-timezone-detection" | "server-location" => {
@@ -2325,17 +2663,22 @@ fn provider_registry_calls(
     id: &str,
     target: &Target,
     options: &BTreeMap<String, Value>,
-) -> Option<Vec<ProviderCall>> {
-    match id {
+) -> Result<Option<Vec<ProviderCall>>, ScanError> {
+    Ok(match id {
         "dns-over-https" => {
-            let mut providers: Vec<_> = options
-                .get("providers")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .filter_map(doh_provider)
-                .collect();
+            let configured = options.get("providers").and_then(Value::as_array);
+            let mut providers = Vec::new();
+            for value in configured.into_iter().flatten() {
+                let Some(provider) = value.as_str().and_then(doh_provider) else {
+                    return Err(ScanError::new(
+                        ScanErrorKind::InvalidInput,
+                        "DNS-over-HTTPS provider is not supported",
+                    ));
+                };
+                if !providers.contains(&provider) {
+                    providers.push(provider);
+                }
+            }
             if providers.is_empty() {
                 providers.extend(["cloudflare-doh", "google-doh"]);
             }
@@ -2361,14 +2704,10 @@ fn provider_registry_calls(
         }
         "rpki-route-validity-check" => Some(vec![provider_call("ripestat", "rpki-history", None)]),
         _ => None,
-    }
+    })
 }
 
-fn provider_intelligence_calls(
-    id: &str,
-    target: &Target,
-    options: &BTreeMap<String, Value>,
-) -> Option<Vec<ProviderCall>> {
+fn provider_intelligence_calls(id: &str, target: &Target) -> Option<Vec<ProviderCall>> {
     match id {
         "attack-surface-delta" => Some(vec![
             provider_call("crtsh", "query", None),
@@ -2382,7 +2721,11 @@ fn provider_intelligence_calls(
         }
         "shodan" => Some(vec![provider_call(
             "shodan",
-            "host",
+            if matches!(target, Target::Ip(_)) {
+                "host"
+            } else {
+                "search"
+            },
             Some("SHODAN_API_KEY"),
         )]),
         "censys" => Some(vec![provider_call(
@@ -2412,8 +2755,8 @@ fn provider_intelligence_calls(
             },
             Some("HIBP_API_KEY"),
         )]),
-        "dark-web-monitoring" => Some(vec![hibp_provider_call("stealer-logs-domain", options)]),
-        "pastebin-monitoring" => Some(vec![hibp_provider_call("paste-account", options)]),
+        "dark-web-monitoring" => Some(vec![hibp_provider_call("stealer-logs-domain")]),
+        "pastebin-monitoring" => Some(vec![hibp_provider_call("paste-account")]),
         "ssl-labs-report" => Some(vec![provider_call("ssllabs", "analyze", None)]),
         "global-ranking" => Some(vec![provider_call(
             "cloudflare-radar",
@@ -2453,20 +2796,8 @@ fn provider_intelligence_calls(
     }
 }
 
-fn hibp_provider_call(operation: &'static str, options: &BTreeMap<String, Value>) -> ProviderCall {
-    ProviderCall {
-        provider: "hibp",
-        operation,
-        secret_env: Some(
-            options
-                .get("hibp_key")
-                .and_then(Value::as_str)
-                .unwrap_or("HIBP_API_KEY")
-                .to_owned(),
-        ),
-        strategy: None,
-        controls: ProviderControls::default(),
-    }
+fn hibp_provider_call(operation: &'static str) -> ProviderCall {
+    provider_call("hibp", operation, Some("HIBP_API_KEY"))
 }
 
 fn provider_query(
@@ -2568,6 +2899,10 @@ fn provider_query(
         "censys" if call.operation == "webproperty" => {
             BTreeMap::from([("target".into(), Value::String(format!("{host}:443")))])
         }
+        "shodan" if call.operation == "search" => BTreeMap::from([
+            ("query".into(), Value::String(format!("hostname:{host}"))),
+            ("minify".into(), Value::String("true".into())),
+        ]),
         _ => BTreeMap::from([("target".into(), Value::String(host))]),
     }
 }
@@ -3575,6 +3910,35 @@ fn push_network_diagnostic(
     });
 }
 
+fn protocol_diagnostic(transport: &str, error: PortError) -> Diagnostic {
+    Diagnostic {
+        kind: format!("{transport}-{:?}", error.kind).to_ascii_lowercase(),
+        message: error.message,
+    }
+}
+
+fn finish_http_protocol_scan(
+    evidence: Vec<Evidence>,
+    findings: Vec<Finding>,
+    diagnostics: Vec<Diagnostic>,
+    first_error: Option<ScanError>,
+) -> Result<ScanResult, ScanError> {
+    if evidence.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            ScanError::new(
+                ScanErrorKind::DependencyUnavailable,
+                "HTTP protocol observations are unavailable",
+            )
+        }));
+    }
+    Ok(ScanResult {
+        status: completion_status(&diagnostics),
+        findings,
+        evidence,
+        diagnostics,
+    })
+}
+
 fn usize_option(options: &BTreeMap<String, Value>, key: &str, fallback: usize) -> usize {
     options
         .get(key)
@@ -3686,11 +4050,12 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use sugra_core::{
-        Clock, CommandPort, CommandResponse, DnsPort, DnsQuery, DnsRecord, DnsRecordType, HttpPort,
-        HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse,
-        PortError, ProviderPort, ProviderRequest, ProviderResponse, TcpPort, TcpRequest,
-        TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest,
-        UdpPort, UdpRequest, UdpResponse,
+        Clock, CommandPort, CommandResponse, DnsFlagState, DnsPort, DnsQuery, DnsRecord,
+        DnsRecordType, DnsRecursionObservation, DnsRecursionRequest, HttpPort, HttpRequest,
+        HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse, PortError,
+        ProviderPort, ProviderRequest, ProviderResponse, QuicObservation, QuicRequest, TcpPort,
+        TcpRequest, TcpResponse, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort,
+        TlsRequest, UdpPort, UdpRequest, UdpResponse,
     };
     use sugra_domain::{Budget, ScanRequest, ScopeGrant, ScopeRule, Target, TargetKind};
     use time::OffsetDateTime;
@@ -3716,16 +4081,32 @@ mod tests {
                 .first()
                 .copied()
                 .unwrap_or(DnsRecordType::A);
+            let value = match record_type {
+                DnsRecordType::Ns => query.name.clone(),
+                DnsRecordType::Aaaa => "2001:db8::1".into(),
+                _ => "192.0.2.1".into(),
+            };
             Ok(vec![DnsRecord {
                 name: query.name,
                 record_type,
-                value: if record_type == DnsRecordType::Aaaa {
-                    "2001:db8::1".into()
-                } else {
-                    "192.0.2.1".into()
-                },
+                value,
                 ttl: Some(300),
             }])
+        }
+
+        async fn probe_recursion(
+            &self,
+            _request: DnsRecursionRequest,
+        ) -> Result<DnsRecursionObservation, PortError> {
+            Ok(DnsRecursionObservation {
+                recursion_desired: DnsFlagState::Set,
+                recursion_available: DnsFlagState::Unset,
+                response_code: 5,
+                authoritative: DnsFlagState::Unset,
+                truncated: DnsFlagState::Unset,
+                answer_count: 0,
+                duration_ms: 1,
+            })
         }
     }
 
@@ -3903,6 +4284,17 @@ mod tests {
                 alpn: Some("h2".into()),
                 certificate_sha256: vec!["00".repeat(32)],
                 certificates: Vec::new(),
+                duration_ms: 1,
+            })
+        }
+
+        async fn handshake_quic(
+            &self,
+            _request: QuicRequest,
+        ) -> Result<QuicObservation, PortError> {
+            Ok(QuicObservation {
+                alpn: Some("h3".into()),
+                version: Some("1".into()),
                 duration_ms: 1,
             })
         }
@@ -4107,8 +4499,12 @@ mod tests {
 
         let result = scanner.scan(&request, &context).await?;
 
-        assert_eq!(result.evidence.len(), 1);
-        assert_eq!(result.evidence[0].source, "https://example.com/from-file");
+        assert_eq!(result.evidence.len(), 2);
+        assert_eq!(
+            result.evidence[0].source,
+            "https://example.com/.well-known/sugra-directory-control-not-found"
+        );
+        assert_eq!(result.evidence[1].source, "https://example.com/from-file");
         assert!(
             result
                 .evidence
@@ -4466,13 +4862,13 @@ mod tests {
         let dark = provider_calls(
             "dark-web-monitoring",
             &domain,
-            &BTreeMap::from([("hibp_key".into(), json!("CUSTOM_HIBP_KEY"))]),
+            &BTreeMap::from([("hibp_key".into(), json!("HIBP_API_KEY"))]),
             Budget::DEFAULT,
         )?;
         assert_eq!(dark.len(), 1);
         assert_eq!(dark[0].provider, "hibp");
         assert_eq!(dark[0].operation, "stealer-logs-domain");
-        assert_eq!(dark[0].secret_env.as_deref(), Some("CUSTOM_HIBP_KEY"));
+        assert_eq!(dark[0].secret_env.as_deref(), Some("HIBP_API_KEY"));
 
         let email = Target::parse(TargetKind::Email, "security@example.com")?;
         let pastes = provider_calls(
@@ -4485,6 +4881,66 @@ mod tests {
         assert_eq!(pastes[0].provider, "hibp");
         assert_eq!(pastes[0].operation, "paste-account");
         assert_eq!(pastes[0].secret_env.as_deref(), Some("HIBP_API_KEY"));
+        Ok(())
+    }
+
+    #[test]
+    fn hibp_secret_option_rejects_arbitrary_environment_variable_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let raw_secret = "AWS_SECRET_ACCESS_KEY";
+        let result = provider_calls(
+            "dark-web-monitoring",
+            &domain,
+            &BTreeMap::from([("hibp_key".into(), json!(raw_secret))]),
+            Budget::DEFAULT,
+        );
+
+        let Err(error) = result else {
+            return Err("arbitrary HIBP secret reference must fail".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::InvalidInput);
+        assert!(!error.message.contains(raw_secret));
+        Ok(())
+    }
+
+    #[test]
+    fn virustotal_secret_option_rejects_arbitrary_environment_variable_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let domain = Target::parse(TargetKind::Domain, "example.com")?;
+        let raw_secret = "AWS_SECRET_ACCESS_KEY";
+        let result = provider_calls(
+            "domain-reputation-check",
+            &domain,
+            &BTreeMap::from([("vt_key".into(), json!(raw_secret))]),
+            Budget::DEFAULT,
+        );
+
+        let Err(error) = result else {
+            return Err("arbitrary VirusTotal secret reference must fail".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::InvalidInput);
+        assert!(!error.message.contains(raw_secret));
+        Ok(())
+    }
+
+    #[test]
+    fn pagespeed_secret_option_rejects_arbitrary_environment_variable_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = Target::parse(TargetKind::Url, "https://example.com")?;
+        let raw_secret = "AWS_SECRET_ACCESS_KEY";
+        let result = provider_calls(
+            "performance-monitoring",
+            &target,
+            &BTreeMap::from([("key".into(), json!(raw_secret))]),
+            Budget::DEFAULT,
+        );
+
+        let Err(error) = result else {
+            return Err("arbitrary PageSpeed secret reference must fail".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::InvalidInput);
+        assert!(!error.message.contains(raw_secret));
         Ok(())
     }
 
@@ -4732,10 +5188,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let target = Target::parse(TargetKind::Domain, "example.com")?;
         let options = BTreeMap::from([
-            (
-                "providers".into(),
-                json!(["google", "unconfigured", "cloudflare"]),
-            ),
+            ("providers".into(), json!(["google", "cloudflare"])),
             ("qtype".into(), json!("AAAA")),
         ]);
         let calls = provider_calls("dns-over-https", &target, &options, Budget::DEFAULT)?;
@@ -4747,6 +5200,15 @@ mod tests {
             assert_eq!(query.get("name"), Some(&json!("example.com")));
             assert_eq!(query.get("type"), Some(&json!("AAAA")));
         }
+        let unsupported = BTreeMap::from([
+            ("providers".into(), json!(["unconfigured"])),
+            ("qtype".into(), json!("AAAA")),
+        ]);
+        let Err(error) = provider_calls("dns-over-https", &target, &unsupported, Budget::DEFAULT)
+        else {
+            return Err("unsupported DoH provider became an executable call".into());
+        };
+        assert_eq!(error.kind, ScanErrorKind::InvalidInput);
         assert!(
             validate_scanner_controls(
                 "dns-over-https",

@@ -1,17 +1,20 @@
 //! Certificate-validating Rustls handshake boundary.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha256};
 use sugra_core::{
-    PortError, PortErrorKind, TlsCertificate, TlsHandshakeKind, TlsObservation, TlsPort, TlsRequest,
+    PortError, PortErrorKind, QuicObservation, QuicRequest, TlsCertificate, TlsHandshakeKind,
+    TlsObservation, TlsPort, TlsRequest,
 };
 use sugra_domain::{Target, TargetKind};
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::TlsConnector;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -22,12 +25,19 @@ pub enum TlsAdapterError {
     /// No usable native trust anchors were loaded.
     #[error("no native TLS trust anchors are available")]
     NoTrustAnchors,
+    /// Native TLS settings could not be converted into a QUIC client.
+    #[error("native TLS settings are incompatible with QUIC")]
+    InvalidQuicConfig,
+    /// The selected crypto provider could not construct safe protocol defaults.
+    #[error("native TLS protocol settings are invalid")]
+    InvalidProtocolConfig,
 }
 
 /// Rustls client using native trust anchors and mandatory verification.
 #[derive(Clone)]
 pub struct RustlsTls {
     connector: TlsConnector,
+    quic_config: quinn::ClientConfig,
 }
 
 impl RustlsTls {
@@ -44,12 +54,24 @@ impl RustlsTls {
         if added == 0 {
             return Err(TlsAdapterError::NoTrustAnchors);
         }
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| TlsAdapterError::InvalidProtocolConfig)?
+            .with_root_certificates(roots.clone())
             .with_no_client_auth();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let mut quic_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| TlsAdapterError::InvalidProtocolConfig)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        quic_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto =
+            QuicClientConfig::try_from(quic_tls).map_err(|_| TlsAdapterError::InvalidQuicConfig)?;
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
+            quic_config: quinn::ClientConfig::new(Arc::new(quic_crypto)),
         })
     }
 }
@@ -134,6 +156,86 @@ impl TlsPort for RustlsTls {
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
+
+    async fn handshake_quic(&self, request: QuicRequest) -> Result<QuicObservation, PortError> {
+        let target = request
+            .host
+            .parse()
+            .map(Target::Ip)
+            .or_else(|_| Target::parse(TargetKind::Domain, &request.host))
+            .map_err(|_| PortError::new(PortErrorKind::InvalidResponse, "QUIC host is invalid"))?;
+        if !request.scope.allows(&target) {
+            return Err(PortError::new(
+                PortErrorKind::OutOfScope,
+                "QUIC host is outside the declared scope",
+            ));
+        }
+        let validation_name = request
+            .server_name
+            .clone()
+            .unwrap_or_else(|| request.host.clone());
+        ServerName::try_from(validation_name.clone()).map_err(|_| {
+            PortError::new(
+                PortErrorKind::InvalidResponse,
+                "QUIC server name is invalid",
+            )
+        })?;
+        let remote = tokio::time::timeout(
+            request.budget.timeout(),
+            lookup_host((request.host.as_str(), request.port)),
+        )
+        .await
+        .map_err(|_| PortError::new(PortErrorKind::Timeout, "QUIC lookup timed out"))?
+        .map_err(|_| PortError::new(PortErrorKind::Transport, "QUIC lookup failed"))?
+        .next()
+        .ok_or_else(|| PortError::new(PortErrorKind::Transport, "QUIC host has no address"))?;
+        let bind_address = match remote {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_address).map_err(|_| {
+            PortError::new(
+                PortErrorKind::Unavailable,
+                "QUIC client socket is unavailable",
+            )
+        })?;
+        endpoint.set_default_client_config(self.quic_config.clone());
+        let started = Instant::now();
+        let connecting = endpoint.connect(remote, &validation_name).map_err(|_| {
+            PortError::new(
+                PortErrorKind::InvalidResponse,
+                "QUIC connection request is invalid",
+            )
+        })?;
+        let connection = tokio::time::timeout(request.budget.timeout(), connecting)
+            .await
+            .map_err(|_| PortError::new(PortErrorKind::Timeout, "QUIC handshake timed out"))?
+            .map_err(|_| PortError::new(PortErrorKind::Transport, "QUIC handshake failed"))?;
+        let handshake = connection
+            .handshake_data()
+            .ok_or_else(|| {
+                PortError::new(
+                    PortErrorKind::InvalidResponse,
+                    "QUIC handshake metadata is unavailable",
+                )
+            })?
+            .downcast::<HandshakeData>()
+            .map_err(|_| {
+                PortError::new(
+                    PortErrorKind::InvalidResponse,
+                    "QUIC handshake metadata has an unexpected type",
+                )
+            })?;
+        let alpn = handshake
+            .protocol
+            .map(|protocol| String::from_utf8_lossy(&protocol).into_owned());
+        connection.close(0_u32.into(), b"");
+        Ok(QuicObservation {
+            alpn,
+            version: None,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
 }
 
 fn certificate_metadata(der: &[u8]) -> Result<TlsCertificate, PortError> {
@@ -181,6 +283,10 @@ fn certificate_metadata(der: &[u8]) -> Result<TlsCertificate, PortError> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::UdpSocket;
+
+    use quinn::crypto::rustls::QuicServerConfig;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
     use sugra_domain::{Budget, ScopeGrant};
 
     use super::*;
@@ -195,12 +301,31 @@ mod tests {
         }
     }
 
+    fn quic_request(
+        host: &str,
+        server_name: Option<&str>,
+        port: u16,
+        scope: ScopeGrant,
+    ) -> QuicRequest {
+        QuicRequest {
+            host: host.into(),
+            server_name: server_name.map(str::to_owned),
+            port,
+            budget: Budget {
+                timeout_ms: 50,
+                ..Budget::default()
+            },
+            scope,
+        }
+    }
+
     #[tokio::test]
     async fn invalid_hosts_scope_and_server_names_fail_before_connecting()
     -> Result<(), Box<dyn std::error::Error>> {
         let tls = match RustlsTls::native() {
             Ok(tls) => tls,
             Err(TlsAdapterError::NoTrustAnchors) => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
         let allowed = Target::parse(TargetKind::Domain, "example.com")?;
         let other = Target::parse(TargetKind::Domain, "other.example")?;
@@ -240,6 +365,111 @@ mod tests {
             return Err("invalid server name was accepted".into());
         };
         assert_eq!(invalid_name.kind, PortErrorKind::InvalidResponse);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_boundary_validates_scope_and_attempts_a_real_udp_handshake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tls = match RustlsTls::native() {
+            Ok(tls) => tls,
+            Err(TlsAdapterError::NoTrustAnchors) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let target = Target::parse(TargetKind::Ip, "127.0.0.1")?;
+        let other = Target::parse(TargetKind::Ip, "127.0.0.2")?;
+        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        drop(socket);
+
+        let Err(out_of_scope) = tls
+            .handshake_quic(quic_request(
+                "127.0.0.1",
+                Some("localhost"),
+                port,
+                ScopeGrant::exact(&other, false, time::OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("out-of-scope QUIC host was accepted".into());
+        };
+        assert_eq!(out_of_scope.kind, PortErrorKind::OutOfScope);
+
+        let Err(attempted) = tls
+            .handshake_quic(quic_request(
+                "127.0.0.1",
+                Some("localhost"),
+                port,
+                ScopeGrant::exact(&target, false, time::OffsetDateTime::UNIX_EPOCH),
+            ))
+            .await
+        else {
+            return Err("unused local UDP port unexpectedly completed QUIC".into());
+        };
+        assert!(matches!(
+            attempted.kind,
+            PortErrorKind::Timeout | PortErrorKind::Transport
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_boundary_completes_a_trusted_handshake_and_negotiates_h3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let certificate = certified_key.cert.der().clone();
+        let private_key = PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key.into())?;
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server_crypto = QuicServerConfig::try_from(server_tls)
+            .map_err(|_| std::io::Error::other("test QUIC server TLS configuration is invalid"))?;
+        let server_endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )?;
+        let server_address = server_endpoint.local_addr()?;
+        let server_handshake = tokio::spawn(async move {
+            let Some(incoming) = server_endpoint.accept().await else {
+                return false;
+            };
+            incoming.await.is_ok()
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate)?;
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth();
+        let mut quic_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        quic_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto = QuicClientConfig::try_from(quic_tls)
+            .map_err(|_| std::io::Error::other("test QUIC client TLS configuration is invalid"))?;
+        let tls = RustlsTls {
+            connector: TlsConnector::from(Arc::new(client_tls)),
+            quic_config: quinn::ClientConfig::new(Arc::new(quic_crypto)),
+        };
+
+        let target = Target::parse(TargetKind::Ip, "127.0.0.1")?;
+        let mut request = quic_request(
+            "127.0.0.1",
+            Some("localhost"),
+            server_address.port(),
+            ScopeGrant::exact(&target, false, time::OffsetDateTime::UNIX_EPOCH),
+        );
+        request.budget.timeout_ms = 2_000;
+        let observation = tls.handshake_quic(request).await?;
+
+        assert!(server_handshake.await?);
+        assert_eq!(observation.alpn.as_deref(), Some("h3"));
         Ok(())
     }
 

@@ -147,6 +147,7 @@ fn resource_plan(
             false,
             max_pages,
         ),
+        "seo-abuse-detector" => seo_plan(base, max_pages),
         _ => return exposure_plan(id, base, options, max_pages),
     };
     Some(plan)
@@ -186,7 +187,7 @@ fn exposure_plan(
             false,
             max_pages,
         ),
-        "directory-finder" => paths_plan(base, wordlist_paths(options), false, max_pages),
+        "directory-finder" => directory_plan(base, options, max_pages),
         "file-upload-surface-finder" => paths_plan(
             base,
             vec!["/".into(), "/upload".into(), "/uploads".into()],
@@ -445,6 +446,26 @@ fn repeated_plan(base: &Url, repetitions: usize, max_pages: usize) -> WebPlan {
     )
 }
 
+fn directory_plan(base: &Url, options: &BTreeMap<String, Value>, max_pages: usize) -> WebPlan {
+    let mut paths = vec!["/.well-known/sugra-directory-control-not-found".into()];
+    paths.extend(wordlist_paths(options));
+    paths_plan(base, paths, false, max_pages)
+}
+
+fn seo_plan(base: &Url, max_pages: usize) -> WebPlan {
+    let mut browser = WebProbe::get("seo-browser", base.clone());
+    browser.headers.insert(
+        "user-agent".into(),
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".into(),
+    );
+    let mut crawler = WebProbe::get("seo-crawler", base.clone());
+    crawler.headers.insert(
+        "user-agent".into(),
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +https://www.google.com/bot.html)".into(),
+    );
+    web_plan(vec![browser, crawler], false, max_pages)
+}
+
 fn parameter_plan(base: &Url, options: &BTreeMap<String, Value>, max_pages: usize) -> WebPlan {
     let mut names = option_strings(options, "params")
         .map(|(_, value)| value)
@@ -453,6 +474,15 @@ fn parameter_plan(base: &Url, options: &BTreeMap<String, Value>, max_pages: usiz
     if names.is_empty() {
         names = vec!["debug".into(), "preview".into()];
     }
+    let values = option_strings(options, "test_values")
+        .map(|(_, value)| value)
+        .filter(|value| safe_parameter_value(value))
+        .collect::<Vec<_>>();
+    let values = if values.is_empty() {
+        vec!["sugra-check".into(), "1".into()]
+    } else {
+        values
+    };
     let parameter_limit = integer_option(options, "max_params", 25)
         .max(1)
         .min(max_pages.saturating_sub(1));
@@ -460,18 +490,21 @@ fn parameter_plan(base: &Url, options: &BTreeMap<String, Value>, max_pages: usiz
         return web_plan(Vec::new(), false, max_pages);
     };
     let mut probes = vec![WebProbe::get("parameter-baseline", root.clone())];
-    probes.extend(
-        names
-            .into_iter()
-            .take(parameter_limit)
-            .enumerate()
-            .map(|(index, name)| {
-                let mut url = root.clone();
-                url.query_pairs_mut().append_pair(&name, "sugra-check");
-                WebProbe::get(format!("parameter-{index}:{name}"), url)
-            }),
-    );
+    for (parameter_index, name) in names.into_iter().take(parameter_limit).enumerate() {
+        for (value_index, value) in values.iter().enumerate() {
+            let mut url = root.clone();
+            url.query_pairs_mut().append_pair(&name, value);
+            probes.push(WebProbe::get(
+                format!("parameter-{parameter_index}-{value_index}"),
+                url,
+            ));
+        }
+    }
     web_plan(probes, false, max_pages)
+}
+
+fn safe_parameter_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
 fn redirect_plan(base: &Url, max_pages: usize) -> WebPlan {
@@ -1022,7 +1055,11 @@ mod tests {
 
         assert_eq!(
             urls,
-            vec!["https://example.com/admin", "https://example.com/api"]
+            vec![
+                "https://example.com/.well-known/sugra-directory-control-not-found",
+                "https://example.com/admin",
+                "https://example.com/api"
+            ]
         );
         Ok(())
     }
@@ -1125,6 +1162,28 @@ mod tests {
         )
         .ok_or("performance plan is missing")?;
         assert_eq!(performance.probes.len(), 3);
+
+        let seo = plan_for(
+            "seo-abuse-detector",
+            &base,
+            &BTreeMap::new(),
+            Budget::DEFAULT,
+            &scope,
+        )
+        .ok_or("SEO plan is missing")?;
+        assert_eq!(seo.probes.len(), 2);
+        assert!(
+            seo.probes[0]
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value.contains("Chrome/") && !value.contains("compatible;"))
+        );
+        assert!(
+            seo.probes[1]
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value.contains("Googlebot/"))
+        );
         Ok(())
     }
 }

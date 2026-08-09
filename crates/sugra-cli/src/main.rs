@@ -18,7 +18,7 @@ use sugra_core::{
 };
 use sugra_domain::{
     Budget, Capability, LegacyId, RunReport, ScanRequest, ScannerDescriptor, ScannerId, ScopeGrant,
-    Target, TargetKind,
+    ScopeRule, Target, TargetKind,
 };
 use sugra_scanners::{Builtins, build_builtins};
 use thiserror::Error;
@@ -136,6 +136,13 @@ struct ScanArgs {
     /// Explicitly authorize active HTTP, fuzzing, protocol, and local-command capabilities.
     #[arg(long)]
     authorize_active: bool,
+    /// Additional DNS host explicitly included in active scope; may be repeated.
+    #[arg(
+        long = "allow-host",
+        value_name = "HOST",
+        requires = "authorize_active"
+    )]
+    allow_hosts: Vec<String>,
     /// Per-scanner timeout in milliseconds.
     #[arg(long, default_value_t = Budget::DEFAULT.timeout_ms)]
     timeout_ms: u64,
@@ -715,7 +722,8 @@ async fn run_scan(concurrency: usize, arguments: ScanArgs) -> Result<(), CliErro
         options,
         budget,
         arguments.authorize_active,
-    );
+        &arguments.allow_hosts,
+    )?;
     let engine = engine_for(builtins.registry, clock, concurrency)?;
     let report = engine
         .execute(vec![request], CancellationToken::new(), None)
@@ -763,7 +771,8 @@ async fn run_preset(
                 ..Budget::default()
             },
             authorize_active,
-        ));
+            &[],
+        )?);
     }
     if requests.is_empty() {
         return Err(CliError::EmptyPreset { preset });
@@ -879,14 +888,28 @@ fn request_for(
     options: BTreeMap<String, serde_json::Value>,
     budget: Budget,
     authorized: bool,
-) -> ScanRequest {
-    ScanRequest {
+    allow_hosts: &[String],
+) -> Result<ScanRequest, CliError> {
+    let mut scope = ScopeGrant::exact(&target, authorized, OffsetDateTime::now_utc());
+    for raw in allow_hosts {
+        let Target::Domain(host) = Target::parse(TargetKind::Domain, raw)? else {
+            unreachable!("domain parser returned a non-domain target")
+        };
+        if !scope
+            .rules
+            .iter()
+            .any(|rule| matches!(rule, ScopeRule::Host(value) if value == &host))
+        {
+            scope.rules.push(ScopeRule::Host(host));
+        }
+    }
+    Ok(ScanRequest {
         scanner_id: descriptor.id.clone(),
-        scope: ScopeGrant::exact(&target, authorized, OffsetDateTime::now_utc()),
+        scope,
         target,
         options,
         budget,
-    }
+    })
 }
 
 fn preset_matches(preset: Preset, descriptor: &ScannerDescriptor) -> bool {
@@ -935,6 +958,45 @@ mod tests {
     fn cli_contract_is_parseable_without_a_subcommand() {
         let cli = Cli::try_parse_from(["sugra"]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn active_scan_accepts_explicit_additional_host_scope() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cli = Cli::try_parse_from([
+            "sugra",
+            "scan",
+            "recursive-nameserver-leak-test",
+            "example.com",
+            "--authorize-active",
+            "--allow-host",
+            "ns1.example.net",
+        ])?;
+        let Some(Command::Scan(arguments)) = cli.command else {
+            return Err("scan command was not parsed".into());
+        };
+        assert_eq!(arguments.allow_hosts, ["ns1.example.net"]);
+
+        let descriptor = fixture_catalog()?
+            .iter()
+            .next()
+            .cloned()
+            .ok_or("fixture descriptor is missing")?;
+        let target = Target::parse(TargetKind::Domain, "example.com")?;
+        let request = request_for(
+            &descriptor,
+            target,
+            BTreeMap::new(),
+            Budget::default(),
+            true,
+            &arguments.allow_hosts,
+        )?;
+        assert!(
+            request
+                .scope
+                .allows(&Target::parse(TargetKind::Domain, "ns1.example.net")?)
+        );
+        Ok(())
     }
 
     #[test]

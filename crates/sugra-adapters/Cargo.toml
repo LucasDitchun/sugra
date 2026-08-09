@@ -17,6 +17,7 @@ async-trait.workspace = true
 hickory-resolver.workspace = true
 http.workspace = true
 hex.workspace = true
+quinn.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
@@ -32,6 +33,9 @@ tokio-rustls.workspace = true
 tracing.workspace = true
 url.workspace = true
 x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

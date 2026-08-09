@@ -121,6 +121,7 @@ fn endpoint_for(request: &ProviderRequest) -> Result<Url, PortError> {
             ("rdap", "domain") => ("https://rdap.org/domain", &[]),
             ("rdap", "ip") => ("https://rdap.org/ip", &[]),
             ("shodan", "host") => ("https://api.shodan.io/shodan/host", &[]),
+            ("shodan", "search") => ("https://api.shodan.io/shodan/host/search", &[]),
             ("virustotal", "domain") => ("https://www.virustotal.com/api/v3/domains", &[]),
             ("virustotal", "ip") => ("https://www.virustotal.com/api/v3/ip_addresses", &[]),
             ("hibp", "account") => ("https://haveibeenpwned.com/api/v3/breachedaccount", &[]),
@@ -630,6 +631,29 @@ mod tests {
             headers.get("authorization").map(String::as_str),
             Some("Bearer fixture-token")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shodan_search_uses_the_allowlisted_search_endpoint_and_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut endpoint = endpoint_for(&request(
+            "shodan",
+            "search",
+            BTreeMap::from([
+                ("query".into(), json!("hostname:example.com")),
+                ("minify".into(), json!("true")),
+            ]),
+        ))?;
+        assert_eq!(endpoint.path(), "/shodan/host/search");
+        inject_secret("shodan", &mut endpoint, &mut BTreeMap::new(), "fixture")?;
+        let pairs: BTreeMap<_, _> = endpoint.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("query").map(String::as_str),
+            Some("hostname:example.com")
+        );
+        assert_eq!(pairs.get("minify").map(String::as_str), Some("true"));
+        assert_eq!(pairs.get("key").map(String::as_str), Some("fixture"));
         Ok(())
     }
 

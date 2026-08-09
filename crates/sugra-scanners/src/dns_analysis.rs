@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde_json::{Value, json};
-use sugra_core::{DnsRecord, DnsRecordType};
+use sugra_core::{DnsRecord, DnsRecordType, DnsRecursionObservation};
 use sugra_domain::{Confidence, Finding, Severity};
 use thiserror::Error;
 
@@ -57,6 +57,31 @@ pub(crate) fn summarize_dns_evidence(
         "minimum_ttl": minimum_ttl,
         "maximum_ttl": maximum_ttl,
     })
+}
+
+/// Reports recursion exposure only when a complete response both echoes RD
+/// and advertises RA with a successful or negative recursive resolution.
+#[must_use]
+pub(crate) fn dns_recursion_findings(
+    observation: &DnsRecursionObservation,
+    evidence: usize,
+) -> Vec<Finding> {
+    let recursive_response = observation.recursion_desired.is_set()
+        && observation.recursion_available.is_set()
+        && !observation.authoritative.is_set()
+        && !observation.truncated.is_set()
+        && matches!(observation.response_code, 0 | 3);
+    if recursive_response {
+        vec![finding(
+            "dns-recursion-exposed",
+            "The selected DNS server completed a recursive query",
+            Severity::Medium,
+            Confidence::Confirmed,
+            evidence,
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Typed failures raised while constructing bounded DKIM query owners.
