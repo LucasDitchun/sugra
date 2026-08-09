@@ -123,12 +123,25 @@ fn screen(
     Ok((rows.join("\n"), color_used))
 }
 
+fn portable_snapshot(contents: &str) -> String {
+    contents.lines().collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn snapshot_comparisons_normalize_platform_line_endings() {
+    assert_eq!(portable_snapshot("first\r\nsecond\r\n"), "first\nsecond");
+    assert_eq!(portable_snapshot("first\nsecond\n"), "first\nsecond");
+}
+
 #[test]
 fn dashboard_snapshot_is_structured_and_actionable() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = fixture_catalog()?;
     let mut app = App::with_color(&catalog, false);
     let (snapshot, _) = screen(&mut app, 96, 28)?;
-    assert_eq!(snapshot, include_str!("snapshots/dashboard.txt").trim_end());
+    assert_eq!(
+        snapshot,
+        portable_snapshot(include_str!("snapshots/dashboard.txt"))
+    );
     assert!(snapshot.contains("SECURITY OPERATIONS CONSOLE"));
     assert!(snapshot.contains("DASHBOARD"));
     assert!(snapshot.contains('2'));
@@ -314,7 +327,7 @@ fn small_terminal_has_safe_fallback() -> Result<(), Box<dyn std::error::Error>> 
     let (small, _) = screen(&mut app, 60, 18)?;
     assert_eq!(
         small,
-        include_str!("snapshots/small-terminal.txt").trim_end()
+        portable_snapshot(include_str!("snapshots/small-terminal.txt"))
     );
     assert!(small.contains("[!] TERMINAL TOO SMALL"));
     assert!(small.contains("Minimum: 72x22"));
