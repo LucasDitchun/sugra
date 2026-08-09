@@ -2877,7 +2877,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sugra-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hex",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "serde",
@@ -2925,7 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hex",
@@ -2945,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ipnet",
  "serde",
@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-scanner-contracts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-scanners"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2995,7 +2995,7 @@ dependencies = [
 
 [[package]]
 name = "sugra-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "ratatui",
