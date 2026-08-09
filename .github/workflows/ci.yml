@@ -94,7 +94,7 @@ jobs:
       - name: Print coverage summary
         run: cargo llvm-cov report --summary-only
       - name: Upload LCOV report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: lcov-report
           path: lcov.info
