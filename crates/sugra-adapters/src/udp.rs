@@ -44,12 +44,15 @@ impl UdpPort for TokioUdp {
             .await
             .map_err(|_| PortError::new(PortErrorKind::Timeout, "UDP send timed out"))?
             .map_err(|_| PortError::new(PortErrorKind::Transport, "UDP send failed"))?;
-        let mut bytes = vec![0_u8; request.budget.max_response_bytes.min(65_507)];
+        // Windows reports `WSAEMSGSIZE` when the receive buffer is smaller than
+        // the datagram, while Unix truncates it. Receive one protocol-bounded
+        // datagram and apply the caller's evidence budget consistently below.
+        let mut bytes = vec![0_u8; 65_507];
         let received = tokio::time::timeout(request.budget.timeout(), socket.recv(&mut bytes))
             .await
             .map_err(|_| PortError::new(PortErrorKind::Timeout, "UDP response timed out"))?
             .map_err(|_| PortError::new(PortErrorKind::Transport, "UDP receive failed"))?;
-        bytes.truncate(received);
+        bytes.truncate(received.min(request.budget.max_response_bytes));
         Ok(UdpResponse {
             endpoint,
             bytes,
