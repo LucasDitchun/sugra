@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use serde_json::json;
 use sugra_core::{
-    Clock, CommandPort, CommandRequest, CommandResponse, DnsPort, DnsQuery, DnsRecord,
-    DnsRecordType, HttpPort, HttpRequest, HttpResponse, LocalInputPort, LocalInputRequest,
-    LocalInputResponse, PortError, PortErrorKind, ProviderPort, ProviderRequest, ProviderResponse,
-    ScanContext, ServiceBundle, TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsHandshakeKind,
+    Clock, CommandPort, CommandRequest, CommandResponse, DnsFlagState, DnsPort, DnsQuery,
+    DnsRecord, DnsRecordType, DnsRecursionObservation, DnsRecursionRequest, HttpPort, HttpRequest,
+    HttpResponse, LocalInputPort, LocalInputRequest, LocalInputResponse, PortError, PortErrorKind,
+    ProviderPort, ProviderRequest, ProviderResponse, QuicObservation, QuicRequest, ScanContext,
+    ServiceBundle, TcpPort, TcpRequest, TcpResponse, TlsCertificate, TlsHandshakeKind,
     TlsObservation, TlsPort, TlsRequest, UdpPort, UdpRequest, UdpResponse, resolve_options,
 };
 use sugra_domain::{Budget, RunId, ScanRequest, ScannerDescriptor, ScopeGrant, Target, TargetKind};
@@ -211,6 +212,22 @@ impl DnsPort for FakeDns {
         self.0.record(Boundary::Dns)?;
         Ok(dns_records(self.0.fixture, &query))
     }
+
+    async fn probe_recursion(
+        &self,
+        _request: DnsRecursionRequest,
+    ) -> Result<DnsRecursionObservation, PortError> {
+        self.0.record(Boundary::Dns)?;
+        Ok(DnsRecursionObservation {
+            recursion_desired: DnsFlagState::Set,
+            recursion_available: DnsFlagState::Unset,
+            response_code: 5,
+            authoritative: DnsFlagState::Unset,
+            truncated: DnsFlagState::Unset,
+            answer_count: 0,
+            duration_ms: 1,
+        })
+    }
 }
 
 fn dns_records(fixture: Fixture, query: &DnsQuery) -> Vec<DnsRecord> {
@@ -221,6 +238,9 @@ fn dns_records(fixture: Fixture, query: &DnsQuery) -> Vec<DnsRecord> {
         ttl,
     };
     match fixture {
+        Fixture::Generic if query.record_types.contains(&DnsRecordType::Ns) => {
+            vec![record(DnsRecordType::Ns, &query.name, Some(300))]
+        }
         Fixture::DnssecComplete => vec![
             record(DnsRecordType::Ds, "12345 13 2 digest", Some(300)),
             record(DnsRecordType::Dnskey, "257 3 13 public-key", Some(300)),
@@ -445,6 +465,15 @@ impl TlsPort for FakeTls {
                 public_key_algorithm: "1.2.840.113549.1.1.1".into(),
                 is_ca: Some(false),
             }],
+            duration_ms: 1,
+        })
+    }
+
+    async fn handshake_quic(&self, _request: QuicRequest) -> Result<QuicObservation, PortError> {
+        self.0.record(Boundary::Tls)?;
+        Ok(QuicObservation {
+            alpn: Some("h3".into()),
+            version: Some("1".into()),
             duration_ms: 1,
         })
     }
