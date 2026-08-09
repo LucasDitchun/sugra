@@ -1,18 +1,20 @@
 name: Release promotion
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, closed]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
-  group: release-promotion-${{ github.event.pull_request.number }}
+  group: release-promotion-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
   policy:
     name: Release policy
-    if: github.event.action != 'closed' && github.event.pull_request.draft == false
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,10 +40,7 @@ jobs:
 
   publish:
     name: Dispatch cargo-dist release
-    if: >-
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'develop'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       actions: write
