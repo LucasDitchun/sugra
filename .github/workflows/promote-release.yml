@@ -1,0 +1,70 @@
+name: Release promotion
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: release-promotion-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  policy:
+    name: Release policy
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the develop release train
+        env:
+          RELEASE_HEAD: ${{ github.head_ref }}
+        run: |
+          if [[ "$RELEASE_HEAD" != "develop" ]]; then
+            echo "Only the develop release train may target main."
+            exit 1
+          fi
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch release references
+        run: git fetch --force origin main develop --tags
+      - name: Test and verify the proposed release
+        run: |
+          python3 .github/scripts/test_release_train.py
+          python3 .github/scripts/release_train.py verify --base-ref origin/main
+          cargo metadata --locked --format-version 1 > /dev/null
+
+  publish:
+    name: Dispatch cargo-dist release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Fetch release tags
+        run: git fetch --force origin main --tags
+      - name: Verify the merged version
+        id: release
+        run: |
+          previous_tag="$(git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [[ -z "$previous_tag" ]]; then
+            echo "No previous semantic release tag was found."
+            exit 1
+          fi
+          python3 .github/scripts/release_train.py verify \
+            --base-ref "$previous_tag" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Dispatch the cargo-dist release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main --field tag="$RELEASE_TAG"

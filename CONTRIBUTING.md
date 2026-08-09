@@ -68,6 +68,10 @@ Validate all external input at those boundaries and never include credentials in
 Use a conventional commit subject such as `feat: add DNS CAA inspection` or
 `fix: preserve redirect scope`. Keep commits focused and avoid unrelated formatting changes.
 
+The repository's default branch is `main`, which is release-only and changes exclusively through
+the draft release train from `develop`. Open feature, fix, documentation, dependency, and CI pull
+requests explicitly against `develop`. Do not open ordinary pull requests against `main`.
+
 A pull request should explain:
 
 - what changed and why;
@@ -77,3 +81,22 @@ A pull request should explain:
 
 Maintainers may ask for a changelog entry when a change affects users. Reviews focus on correctness,
 safety, deterministic behavior, platform compatibility, and maintainability.
+
+## Releases and versioning
+
+The draft `develop` to `main` pull request accumulates accepted changes without publishing each
+feature separately. When a batch is ready, a maintainer runs the **Prepare release** workflow on
+`develop`. The workflow calculates the next version, updates `Cargo.toml`, `Cargo.lock`, and
+`CHANGELOG.md`, and dispatches fresh CI, security, and cargo-dist dry-run checks. The pull request
+remains a draft until a maintainer deliberately marks it ready.
+
+Before 1.0.0, Sugra follows this ZeroVer policy:
+
+- backward-compatible feature and fix batches increment patch once, regardless of commit count;
+- breaking API, schema, or architecture batches increment minor;
+- maintainers may explicitly select patch, minor, or major for an exceptional release.
+
+Starting at 1.0.0, automatic calculation follows standard semantic versioning: fixes increment
+patch, compatible features increment minor, and breaking changes increment major. Merging the
+release train is the only supported mutation of `main`; it automatically dispatches the generated
+cargo-dist workflow, which creates the tag, GitHub Release, installers, checksums, and archives.
