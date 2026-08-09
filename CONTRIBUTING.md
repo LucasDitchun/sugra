@@ -68,9 +68,9 @@ Validate all external input at those boundaries and never include credentials in
 Use a conventional commit subject such as `feat: add DNS CAA inspection` or
 `fix: preserve redirect scope`. Keep commits focused and avoid unrelated formatting changes.
 
-Open feature, fix, documentation, dependency, and CI pull requests against `develop`. The `main`
-branch is release-only and changes exclusively through the draft release train from `develop`.
-Do not open ordinary pull requests against `main`.
+The repository's default branch is `main`, which is release-only and changes exclusively through
+the draft release train from `develop`. Open feature, fix, documentation, dependency, and CI pull
+requests explicitly against `develop`. Do not open ordinary pull requests against `main`.
 
 A pull request should explain:
 
